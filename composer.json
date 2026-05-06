@@ -1,0 +1,36 @@
+{
+    "name": "ols/php-fts",
+    "description": "A self-contained full-text search engine in pure PHP. No extensions, no external services, no dependencies. Trigram indexing, BM25+IDF scoring, filters. Ideal for shared hosting and small VPS.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": [
+        "search",
+        "full-text search",
+        "fts",
+        "trigram",
+        "bm25",
+        "inverted index",
+        "shared hosting",
+        "no dependencies"
+    ],
+    "authors": [
+        {
+            "name": "Olivier",
+            "role": "Developer"
+        }
+    ],
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ols\\PhpFts\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ols\\PhpFts\\Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "stable"
+}

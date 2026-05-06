@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SearchEngine Demo — Footwear & Fashion</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&display=swap" rel="stylesheet" />
+
+  <style>
+    /* -----------------------------------------------------------------------
+       Reset & Base
+    ----------------------------------------------------------------------- */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #f7f6f3;
+      --surface:   #ffffff;
+      --border:    #e8e6e1;
+      --ink:       #1a1a1a;
+      --ink-muted: #6b6b6b;
+      --accent:    #1a1a2e;
+      --accent-lt: #eeeef5;
+      --promo:     #c0392b;
+      --promo-bg:  #fdf0ef;
+      --radius:    10px;
+      --shadow:    0 2px 12px rgba(0,0,0,.07);
+      --sidebar-w: 248px;
+      --transition: .18s ease;
+    }
+
+    html { font-size: 15px; }
+
+    body {
+      font-family: 'DM Sans', sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+    }
+
+    /* -----------------------------------------------------------------------
+       Header
+    ----------------------------------------------------------------------- */
+    .header {
+      background: var(--accent);
+      padding: 0 32px;
+      display: flex;
+      align-items: center;
+      gap: 32px;
+      height: 64px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 2px 16px rgba(0,0,0,.18);
+    }
+
+    .logo {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: 1.45rem;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      letter-spacing: .02em;
+    }
+
+    .logo span {
+      opacity: .5;
+      font-weight: 400;
+    }
+
+    .search-wrap {
+      flex: 1;
+      max-width: 560px;
+      position: relative;
+    }
+
+    .search-wrap input {
+      width: 100%;
+      padding: 10px 44px 10px 16px;
+      border-radius: 8px;
+      border: none;
+      background: rgba(255,255,255,.12);
+      color: #fff;
+      font-family: 'DM Sans', sans-serif;
+      font-size: .95rem;
+      outline: none;
+      transition: background var(--transition);
+    }
+
+    .search-wrap input::placeholder { color: rgba(255,255,255,.45); }
+    .search-wrap input:focus { background: rgba(255,255,255,.2); }
+
+    .search-icon {
+      position: absolute;
+      right: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: rgba(255,255,255,.5);
+      pointer-events: none;
+    }
+
+    /* -----------------------------------------------------------------------
+       Layout
+    ----------------------------------------------------------------------- */
+    .layout {
+      display: flex;
+      align-items: flex-start;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 28px 24px;
+      gap: 24px;
+    }
+
+    /* -----------------------------------------------------------------------
+       Sidebar
+    ----------------------------------------------------------------------- */
+    .sidebar {
+      width: var(--sidebar-w);
+      flex-shrink: 0;
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      padding: 20px;
+      position: sticky;
+      top: 88px;
+    }
+
+    .sidebar-title {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      margin-bottom: 16px;
+    }
+
+    .facet-group { margin-bottom: 20px; }
+
+    .facet-group:last-child { margin-bottom: 0; }
+
+    .facet-label {
+      font-size: .78rem;
+      font-weight: 600;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+      margin-bottom: 8px;
+      display: block;
+    }
+
+    .facet-sep {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 16px 0;
+    }
+
+    /* Checkboxes */
+    .facet-option {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 0;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .facet-option input[type="checkbox"] { display: none; }
+
+    .facet-check {
+      width: 16px;
+      height: 16px;
+      border: 1.5px solid var(--border);
+      border-radius: 4px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all var(--transition);
+      background: var(--surface);
+    }
+
+    .facet-option input:checked + .facet-check {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .facet-option input:checked + .facet-check::after {
+      content: '';
+      width: 8px;
+      height: 5px;
+      border-left: 2px solid #fff;
+      border-bottom: 2px solid #fff;
+      transform: rotate(-45deg) translateY(-1px);
+      display: block;
+    }
+
+    .facet-name {
+      font-size: .875rem;
+      color: var(--ink);
+      flex: 1;
+    }
+
+    .facet-count {
+      font-size: .75rem;
+      color: var(--ink-muted);
+      background: var(--bg);
+      padding: 1px 6px;
+      border-radius: 10px;
+    }
+
+    /* Promo toggle */
+    .promo-toggle {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      cursor: pointer;
+      user-select: none;
+      padding: 6px 0;
+    }
+
+    .toggle-track {
+      width: 34px;
+      height: 20px;
+      background: var(--border);
+      border-radius: 10px;
+      position: relative;
+      transition: background var(--transition);
+      flex-shrink: 0;
+    }
+
+    .toggle-track::after {
+      content: '';
+      position: absolute;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #fff;
+      top: 3px;
+      left: 3px;
+      transition: transform var(--transition);
+      box-shadow: 0 1px 3px rgba(0,0,0,.2);
+    }
+
+    .promo-toggle.active .toggle-track { background: var(--promo); }
+    .promo-toggle.active .toggle-track::after { transform: translateX(14px); }
+
+    .promo-toggle-label {
+      font-size: .875rem;
+      color: var(--ink);
+    }
+
+    .promo-toggle-count {
+      font-size: .75rem;
+      color: var(--promo);
+      font-weight: 500;
+    }
+
+    /* Price slider */
+    .price-values {
+      display: flex;
+      justify-content: space-between;
+      font-size: .82rem;
+      color: var(--ink-muted);
+      margin-bottom: 10px;
+    }
+
+    .price-values strong { color: var(--ink); font-weight: 500; }
+
+    .slider-wrap {
+      position: relative;
+      height: 20px;
+      display: flex;
+      align-items: center;
+    }
+
+    .slider-track {
+      position: absolute;
+      width: 100%;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+    }
+
+    .slider-fill {
+      position: absolute;
+      height: 4px;
+      background: var(--accent);
+      border-radius: 2px;
+    }
+
+    .slider-wrap input[type="range"] {
+      position: absolute;
+      width: 100%;
+      height: 4px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: transparent;
+      pointer-events: none;
+    }
+
+    .slider-wrap input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--accent);
+      pointer-events: all;
+      cursor: pointer;
+      border: 2px solid #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25);
+      transition: transform var(--transition);
+    }
+
+    .slider-wrap input[type="range"]::-webkit-slider-thumb:hover {
+      transform: scale(1.15);
+    }
+
+    .slider-wrap input[type="range"]::-moz-range-thumb {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      background: var(--accent);
+      pointer-events: all;
+      cursor: pointer;
+      border: 2px solid #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25);
+    }
+
+    /* Clear filters */
+    .clear-btn {
+      display: none;
+      width: 100%;
+      padding: 9px;
+      margin-top: 4px;
+      background: none;
+      border: 1.5px solid var(--border);
+      border-radius: 7px;
+      color: var(--ink-muted);
+      font-family: 'DM Sans', sans-serif;
+      font-size: .82rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+
+    .clear-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .clear-btn.visible { display: block; }
+
+    /* -----------------------------------------------------------------------
+       Main content
+    ----------------------------------------------------------------------- */
+    .main { flex: 1; min-width: 0; }
+
+    /* Active filters */
+    .active-filters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+      min-height: 0;
+    }
+
+    .filter-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px 5px 12px;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 20px;
+      font-size: .78rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity var(--transition);
+      animation: chipIn .15s ease;
+    }
+
+    @keyframes chipIn {
+      from { transform: scale(.85); opacity: 0; }
+      to   { transform: scale(1);   opacity: 1; }
+    }
+
+    .filter-chip:hover { opacity: .8; }
+
+    .filter-chip svg { width: 12px; height: 12px; }
+
+    /* Toolbar */
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px;
+    }
+
+    .result-count {
+      font-size: .85rem;
+      color: var(--ink-muted);
+    }
+
+    .result-count strong { color: var(--ink); }
+
+    /* -----------------------------------------------------------------------
+       Product grid
+    ----------------------------------------------------------------------- */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+      gap: 18px;
+    }
+
+    .card {
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      transition: box-shadow var(--transition), transform var(--transition);
+      animation: cardIn .22s ease both;
+    }
+
+    @keyframes cardIn {
+      from { opacity: 0; transform: translateY(10px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .card:hover {
+      box-shadow: var(--shadow);
+      transform: translateY(-2px);
+    }
+
+    .card-img {
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      display: block;
+      background: var(--bg);
+    }
+
+    .card-body { padding: 12px 14px 14px; }
+
+    .card-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+
+    .card-category {
+      font-size: .68rem;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      color: var(--ink-muted);
+    }
+
+    .card-gender {
+      font-size: .68rem;
+      color: var(--ink-muted);
+      background: var(--bg);
+      padding: 2px 7px;
+      border-radius: 10px;
+    }
+
+    .card-name {
+      font-size: .9rem;
+      font-weight: 500;
+      color: var(--ink);
+      line-height: 1.35;
+      margin-bottom: 10px;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+
+    .card-price { display: flex; align-items: baseline; gap: 8px; }
+
+    .price-final {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    .price-final.discounted { color: var(--promo); }
+
+    .price-original {
+      font-size: .8rem;
+      color: var(--ink-muted);
+      text-decoration: line-through;
+    }
+
+    .promo-badge {
+      display: inline-block;
+      padding: 2px 7px;
+      background: var(--promo-bg);
+      color: var(--promo);
+      border-radius: 4px;
+      font-size: .7rem;
+      font-weight: 600;
+      margin-left: auto;
+    }
+
+    /* -----------------------------------------------------------------------
+       States
+    ----------------------------------------------------------------------- */
+    .state-empty {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 72px 24px;
+      color: var(--ink-muted);
+    }
+
+    .state-empty svg {
+      width: 48px;
+      height: 48px;
+      opacity: .25;
+      margin-bottom: 16px;
+    }
+
+    .state-empty p { font-size: .95rem; }
+
+    .state-initial {
+      text-align: center;
+      padding: 80px 24px;
+      color: var(--ink-muted);
+    }
+
+    .state-initial .big-icon {
+      font-family: 'Cormorant Garamond', serif;
+      font-size: 4rem;
+      color: var(--border);
+      line-height: 1;
+      margin-bottom: 12px;
+    }
+
+    .state-initial p { font-size: .95rem; }
+    .state-initial em { color: var(--ink); font-style: normal; font-weight: 500; }
+
+    /* Skeleton */
+    .skeleton { animation: shimmer 1.4s infinite linear; }
+
+    @keyframes shimmer {
+      0%   { opacity: 1; }
+      50%  { opacity: .45; }
+      100% { opacity: 1; }
+    }
+
+    .skel-card {
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+
+    .skel-img {
+      width: 100%;
+      aspect-ratio: 1;
+      background: var(--bg);
+    }
+
+    .skel-body { padding: 12px 14px 14px; }
+
+    .skel-line {
+      height: 10px;
+      background: var(--bg);
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<header class="header">
+  <div class="logo">Search<span>Engine</span> &mdash; Demo</div>
+  <div class="search-wrap">
+    <input type="text" id="searchInput" placeholder="Search sneakers, boots, sandals…" autocomplete="off" />
+    <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+    </svg>
+  </div>
+</header>
+
+<!-- Layout -->
+<div class="layout">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-title">Filters</div>
+
+    <!-- Category -->
+    <div class="facet-group">
+      <span class="facet-label">Category</span>
+      <div id="facetCategory"></div>
+    </div>
+
+    <hr class="facet-sep" />
+
+    <!-- Brand -->
+    <div class="facet-group">
+      <span class="facet-label">Brand</span>
+      <div id="facetBrand"></div>
+    </div>
+
+    <hr class="facet-sep" />
+
+    <!-- Gender -->
+    <div class="facet-group">
+      <span class="facet-label">Gender</span>
+      <div id="facetGender"></div>
+    </div>
+
+    <hr class="facet-sep" />
+
+    <!-- Price -->
+    <div class="facet-group">
+      <span class="facet-label">Price</span>
+      <div class="price-values">
+        <span>From <strong id="priceMinLabel">$0</strong></span>
+        <span>To <strong id="priceMaxLabel">$1000</strong></span>
+      </div>
+      <div class="slider-wrap">
+        <div class="slider-track"></div>
+        <div class="slider-fill" id="sliderFill"></div>
+        <input type="range" id="sliderMin" min="0" max="1000" value="0" step="1" />
+        <input type="range" id="sliderMax" min="0" max="1000" value="1000" step="1" />
+      </div>
+    </div>
+
+    <hr class="facet-sep" />
+
+    <!-- Promo -->
+    <div class="facet-group">
+      <span class="facet-label">Sale</span>
+      <div class="promo-toggle" id="promoToggle">
+        <div class="toggle-track"></div>
+        <span class="promo-toggle-label">On sale only</span>
+        <span class="promo-toggle-count" id="promoCount"></span>
+      </div>
+    </div>
+
+    <hr class="facet-sep" />
+
+    <button class="clear-btn" id="clearBtn">✕ Clear all filters</button>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <div class="active-filters" id="activeFilters"></div>
+    <div class="toolbar">
+      <div class="result-count" id="resultCount"></div>
+    </div>
+    <div id="results"></div>
+  </main>
+
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+//  State
+// ---------------------------------------------------------------------------
+const state = {
+  q:        '',
+  filters: {
+    category: [],
+    brand:    [],
+    gender:   null,
+    promo:    false,
+    priceMin: null,
+    priceMax: null,
+  },
+  results:   [],
+  facets:    {},
+  total:     0,
+  loading:   false,
+  // absolute price bounds (from first search without price filter)
+  bounds:    { min: 0, max: 1000 },
+  boundsSet: false,
+};
+
+// ---------------------------------------------------------------------------
+//  Fetch
+// ---------------------------------------------------------------------------
+let debounceTimer = null;
+
+function scheduleSearch(delay = 320) {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(doSearch, delay);
+}
+
+async function doSearch() {
+  if (!state.q.trim()) {
+    renderInitial();
+    return;
+  }
+
+  state.loading = true;
+  renderSkeleton();
+
+  const body = { q: state.q };
+  if (state.filters.category.length) body.category  = state.filters.category;
+  if (state.filters.brand.length)    body.brand      = state.filters.brand;
+  if (state.filters.gender)          body.gender     = state.filters.gender;
+  if (state.filters.promo)           body.promo      = true;
+  if (state.filters.priceMin !== null) body.price_min = state.filters.priceMin;
+  if (state.filters.priceMax !== null) body.price_max = state.filters.priceMax;
+
+  try {
+    const res  = await fetch('search.php', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(body),
+    });
+    const data = await res.json();
+
+    state.results = data.results  ?? [];
+    state.facets  = data.facets   ?? {};
+    state.total   = data.total    ?? 0;
+
+    // Set absolute price bounds once (first search, no price filter)
+    if (!state.boundsSet && state.facets.price) {
+      state.bounds.min = Math.floor(state.facets.price.min);
+      state.bounds.max = Math.ceil(state.facets.price.max);
+      state.boundsSet  = true;
+      initSlider();
+    }
+
+  } catch (e) {
+    console.error(e);
+    state.results = [];
+    state.total   = 0;
+  }
+
+  state.loading = false;
+  render();
+}
+
+// ---------------------------------------------------------------------------
+//  Render
+// ---------------------------------------------------------------------------
+function render() {
+  renderActiveFilters();
+  renderResultCount();
+  renderFacets();
+  renderProducts();
+  renderClearBtn();
+  renderSliderFill();
+}
+
+function renderInitial() {
+  document.getElementById('results').innerHTML = `
+    <div class="state-initial">
+      <div class="big-icon">&#x1F45F;</div>
+      <p>Type to search — try <em>sneaker</em>, <em>boot</em> or a brand name.</p>
+    </div>`;
+  document.getElementById('resultCount').textContent = '';
+  document.getElementById('activeFilters').innerHTML = '';
+  document.getElementById('facetCategory').innerHTML = '';
+  document.getElementById('facetBrand').innerHTML    = '';
+  document.getElementById('facetGender').innerHTML   = '';
+  document.getElementById('promoCount').textContent  = '';
+  document.getElementById('clearBtn').classList.remove('visible');
+}
+
+function renderSkeleton() {
+  const grid = document.createElement('div');
+  grid.className = 'grid skeleton';
+  for (let i = 0; i < 8; i++) {
+    grid.innerHTML += `
+      <div class="skel-card">
+        <div class="skel-img"></div>
+        <div class="skel-body">
+          <div class="skel-line" style="width:50%;height:8px"></div>
+          <div class="skel-line" style="width:90%"></div>
+          <div class="skel-line" style="width:70%"></div>
+          <div class="skel-line" style="width:40%;height:12px;margin-top:4px"></div>
+        </div>
+      </div>`;
+  }
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('results').appendChild(grid);
+}
+
+function renderResultCount() {
+  const el = document.getElementById('resultCount');
+  el.innerHTML = state.total > 0
+    ? `<strong>${state.total}</strong> result${state.total > 1 ? 's' : ''} found`
+    : '';
+}
+
+function renderProducts() {
+  const el = document.getElementById('results');
+
+  if (!state.results.length) {
+    el.innerHTML = `
+      <div class="grid">
+        <div class="state-empty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <p>No results — try a different search or loosen your filters.</p>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+
+  state.results.forEach((p, i) => {
+    const hasPromo    = p.promo !== null && p.promo !== undefined;
+    const finalPrice  = hasPromo ? p.price * (1 + p.promo / 100) : p.price;
+    const fmtFinal    = '$' + finalPrice.toFixed(2);
+    const fmtOriginal = hasPromo ? '$' + p.price.toFixed(2) : '';
+
+    grid.innerHTML += `
+      <div class="card" style="animation-delay:${i * 25}ms">
+        <img class="card-img" src="${p.image}" alt="${escHtml(p.name)}" loading="lazy" />
+        <div class="card-body">
+          <div class="card-meta">
+            <span class="card-category">${escHtml(p.category)}</span>
+            <span class="card-gender">${escHtml(p.gender)}</span>
+          </div>
+          <div class="card-name">${escHtml(p.name)}</div>
+          <div class="card-price">
+            <span class="price-final ${hasPromo ? 'discounted' : ''}">${fmtFinal}</span>
+            ${hasPromo ? `<span class="price-original">${fmtOriginal}</span>
+                          <span class="promo-badge">${p.promo}%</span>` : ''}
+          </div>
+        </div>
+      </div>`;
+  });
+
+  el.innerHTML = '';
+  el.appendChild(grid);
+}
+
+// ---------------------------------------------------------------------------
+//  Facets
+// ---------------------------------------------------------------------------
+function renderFacets() {
+  renderCheckboxFacet('facetCategory', 'category', state.facets.category ?? {});
+  renderCheckboxFacet('facetBrand',    'brand',    state.facets.brand    ?? {});
+  renderCheckboxFacet('facetGender',   'gender',   state.facets.gender   ?? {}, true);
+  renderPromoFacet();
+  renderSliderFacet();
+}
+
+function renderCheckboxFacet(elId, filterKey, counts, singleSelect = false) {
+  const el = document.getElementById(elId);
+  if (!Object.keys(counts).length) { el.innerHTML = ''; return; }
+
+  el.innerHTML = Object.entries(counts).map(([val, count]) => {
+    const active = singleSelect
+      ? state.filters[filterKey] === val
+      : state.filters[filterKey].includes(val);
+    return `
+      <label class="facet-option">
+        <input type="checkbox" data-filter="${filterKey}" data-value="${escHtml(val)}"
+               data-single="${singleSelect}" ${active ? 'checked' : ''} />
+        <span class="facet-check"></span>
+        <span class="facet-name">${escHtml(val)}</span>
+        <span class="facet-count">${count}</span>
+      </label>`;
+  }).join('');
+
+  el.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('change', onFacetChange);
+  });
+}
+
+function renderPromoFacet() {
+  const toggle = document.getElementById('promoToggle');
+  const count  = document.getElementById('promoCount');
+  toggle.classList.toggle('active', state.filters.promo);
+  const n = state.facets.promo?.on_sale ?? 0;
+  count.textContent = n ? `(${n})` : '';
+}
+
+function renderSliderFacet() {
+  // Update label only — slider inputs are managed separately
+  const pf = state.facets.price;
+  if (!pf) return;
+  const lo = state.filters.priceMin ?? state.bounds.min;
+  const hi = state.filters.priceMax ?? state.bounds.max;
+  document.getElementById('priceMinLabel').textContent = '$' + lo.toFixed(0);
+  document.getElementById('priceMaxLabel').textContent = '$' + hi.toFixed(0);
+}
+
+function renderSliderFill() {
+  const min  = state.bounds.min;
+  const max  = state.bounds.max;
+  const lo   = state.filters.priceMin ?? min;
+  const hi   = state.filters.priceMax ?? max;
+  const range = max - min || 1;
+  const left  = ((lo - min) / range) * 100;
+  const right = ((hi - min) / range) * 100;
+  document.getElementById('sliderFill').style.left  = left  + '%';
+  document.getElementById('sliderFill').style.width = (right - left) + '%';
+  document.getElementById('priceMinLabel').textContent = '$' + lo.toFixed(0);
+  document.getElementById('priceMaxLabel').textContent = '$' + hi.toFixed(0);
+}
+
+// ---------------------------------------------------------------------------
+//  Active filter chips
+// ---------------------------------------------------------------------------
+function renderActiveFilters() {
+  const el   = document.getElementById('activeFilters');
+  const chips = [];
+
+  state.filters.category.forEach(v => chips.push({ label: v, action: () => removeArrayFilter('category', v) }));
+  state.filters.brand.forEach(v    => chips.push({ label: v, action: () => removeArrayFilter('brand', v) }));
+  if (state.filters.gender) chips.push({ label: state.filters.gender, action: () => { state.filters.gender = null; scheduleSearch(0); } });
+  if (state.filters.promo)  chips.push({ label: 'On sale', action: () => { state.filters.promo = false; document.getElementById('promoToggle').classList.remove('active'); scheduleSearch(0); } });
+  if (state.filters.priceMin !== null || state.filters.priceMax !== null) {
+    const lo = state.filters.priceMin ?? state.bounds.min;
+    const hi = state.filters.priceMax ?? state.bounds.max;
+    chips.push({ label: `$${lo.toFixed(0)} – $${hi.toFixed(0)}`, action: () => resetPriceFilter() });
+  }
+
+  el.innerHTML = chips.map((c, i) => `
+    <span class="filter-chip" data-idx="${i}">
+      ${escHtml(c.label)}
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <path d="M18 6 6 18M6 6l12 12"/>
+      </svg>
+    </span>`).join('');
+
+  el.querySelectorAll('.filter-chip').forEach(chip => {
+    chip.addEventListener('click', () => chips[+chip.dataset.idx].action());
+  });
+}
+
+function renderClearBtn() {
+  const hasFilters = state.filters.category.length || state.filters.brand.length ||
+    state.filters.gender || state.filters.promo ||
+    state.filters.priceMin !== null || state.filters.priceMax !== null;
+  document.getElementById('clearBtn').classList.toggle('visible', !!hasFilters);
+}
+
+// ---------------------------------------------------------------------------
+//  Filter mutations
+// ---------------------------------------------------------------------------
+function onFacetChange(e) {
+  const { filter, value, single } = e.target.dataset;
+  const checked = e.target.checked;
+
+  if (single === 'true') {
+    state.filters[filter] = checked ? value : null;
+  } else {
+    if (checked) {
+      if (!state.filters[filter].includes(value)) state.filters[filter].push(value);
+    } else {
+      state.filters[filter] = state.filters[filter].filter(v => v !== value);
+    }
+  }
+  scheduleSearch(0);
+}
+
+function removeArrayFilter(key, val) {
+  state.filters[key] = state.filters[key].filter(v => v !== val);
+  scheduleSearch(0);
+}
+
+function clearAllFilters() {
+  state.filters.category = [];
+  state.filters.brand    = [];
+  state.filters.gender   = null;
+  state.filters.promo    = false;
+  resetPriceFilter(false);
+  scheduleSearch(0);
+}
+
+function resetPriceFilter(search = true) {
+  state.filters.priceMin = null;
+  state.filters.priceMax = null;
+  document.getElementById('sliderMin').value = state.bounds.min;
+  document.getElementById('sliderMax').value = state.bounds.max;
+  renderSliderFill();
+  if (search) scheduleSearch(0);
+}
+
+// ---------------------------------------------------------------------------
+//  Price slider
+// ---------------------------------------------------------------------------
+function initSlider() {
+  const sliderMin = document.getElementById('sliderMin');
+  const sliderMax = document.getElementById('sliderMax');
+
+  sliderMin.min   = state.bounds.min;
+  sliderMin.max   = state.bounds.max;
+  sliderMin.value = state.bounds.min;
+  sliderMax.min   = state.bounds.min;
+  sliderMax.max   = state.bounds.max;
+  sliderMax.value = state.bounds.max;
+
+  renderSliderFill();
+}
+
+let sliderTimer = null;
+
+document.getElementById('sliderMin').addEventListener('input', function () {
+  const max = +document.getElementById('sliderMax').value;
+  if (+this.value > max) this.value = max;
+  state.filters.priceMin = +this.value <= state.bounds.min ? null : +this.value;
+  renderSliderFill();
+  clearTimeout(sliderTimer);
+  sliderTimer = setTimeout(() => scheduleSearch(0), 400);
+});
+
+document.getElementById('sliderMax').addEventListener('input', function () {
+  const min = +document.getElementById('sliderMin').value;
+  if (+this.value < min) this.value = min;
+  state.filters.priceMax = +this.value >= state.bounds.max ? null : +this.value;
+  renderSliderFill();
+  clearTimeout(sliderTimer);
+  sliderTimer = setTimeout(() => scheduleSearch(0), 400);
+});
+
+// ---------------------------------------------------------------------------
+//  Event listeners
+// ---------------------------------------------------------------------------
+document.getElementById('searchInput').addEventListener('input', function () {
+  state.q = this.value;
+  state.boundsSet = false;  // reset bounds on new query
+  state.filters.priceMin = null;
+  state.filters.priceMax = null;
+  scheduleSearch();
+});
+
+document.getElementById('promoToggle').addEventListener('click', function () {
+  state.filters.promo = !state.filters.promo;
+  scheduleSearch(0);
+});
+
+document.getElementById('clearBtn').addEventListener('click', clearAllFilters);
+
+// ---------------------------------------------------------------------------
+//  Utils
+// ---------------------------------------------------------------------------
+function escHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ---------------------------------------------------------------------------
+//  Init
+// ---------------------------------------------------------------------------
+renderInitial();
+</script>
+</body>
+</html>
