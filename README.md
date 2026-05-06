@@ -1,5 +1,10 @@
 # php-fts
 
+![Packagist Version](https://img.shields.io/packagist/v/ols/php-fts)
+![PHP Version](https://img.shields.io/packagist/dependency-v/ols/php-fts/php)
+![License](https://img.shields.io/github/license/olivier-ls/php-fts)
+![Downloads](https://img.shields.io/packagist/dt/ols/php-fts)
+
 A self-contained full-text search engine written in pure PHP.  
 No extensions. No external services. No dependencies. Just files.
 
