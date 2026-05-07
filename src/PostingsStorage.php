@@ -42,9 +42,12 @@ class PostingsStorage
      */
     public function open(string $path): void
     {
-        $isNew = !file_exists($path);
+        $this->handle = @fopen($path, 'r+b');
+        $isNew = ($this->handle === false);
 
-        $this->handle = fopen($path, $isNew ? 'w+b' : 'r+b');
+        if ($isNew) {
+            $this->handle = fopen($path, 'w+b');
+        }
 
         if ($this->handle === false) {
             throw new RuntimeException("Unable to open file: $path");

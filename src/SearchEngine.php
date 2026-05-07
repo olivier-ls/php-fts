@@ -161,10 +161,19 @@ class SearchEngine
      *                              'and' and 'or' are optional but at least one must be present.
      *                              'and' + 'or': all and conditions AND at least one or must pass.
      *
-     * @return array<array{docId: int, score: float, document: array}>
+     * @param bool   $highlight        Whether to include highlighted excerpts in results (default: false)
+     * @param array  $highlightOptions Highlighting configuration:
+     *                                 [
+     *                                   'tags'    => ['<mark>', '</mark>'],  // open/close tags
+     *                                   'excerpt' => true,                   // true = extract a window around the match
+     *                                                                        // false = full field with matched words wrapped
+     *                                   'window'  => 5,                      // words of context on each side (excerpt mode only)
+     *                                 ]
+     *
+     * @return array<array{docId: int, score: float, document: array, highlights?: array}>
      * @throws RuntimeException
      */
-    public function search(string $query, int $limit = 20, int $maxCandidates = 5000, array $boosts = [], array $filters = []): array
+    public function search(string $query, int $limit = 20, int $maxCandidates = 5000, array $boosts = [], array $filters = [], bool $highlight = false, array $highlightOptions = []): array
     {
         $this->assertOpen();
 
@@ -227,11 +236,17 @@ class SearchEngine
                 continue;
             }
 
-            $results[] = [
+            $result = [
                 'docId'    => $docId,
                 'score'    => $this->computeScore($document, $queryTrigrams, $entry['trigramCount'], $avgdl, $boosts),
                 'document' => $document,
             ];
+
+            if ($highlight) {
+                $result['highlights'] = $this->buildHighlights($document, $queryTrigrams, $highlightOptions);
+            }
+
+            $results[] = $result;
 
             $i++;
         }
@@ -365,7 +380,9 @@ class SearchEngine
             $files = ['documents.bin', 'postings.bin', 'trigrams.bin', 'tombstones.bin'];
 
             foreach ($files as $file) {
-                rename($tmpDir . '/' . $file, $this->directory . '/' . $file);
+                if (!rename($tmpDir . '/' . $file, $this->directory . '/' . $file)) {
+                    throw new RuntimeException("Unable to rename $file — index may be partially corrupted");
+                }
             }
 
             rmdir($tmpDir);
@@ -788,6 +805,103 @@ class SearchEngine
         }
 
         return [];
+    }
+
+    // -------------------------------------------------------------------------
+    // Private methods — highlighting
+    // -------------------------------------------------------------------------
+
+    /**
+     * Builds highlighted excerpts for all string fields of a document.
+     *
+     * For each string field, words whose trigrams overlap with the query trigrams
+     * are wrapped with the configured open/close tags.
+     *
+     * Two modes (controlled by $options['excerpt']):
+     *   - excerpt: true  — returns a window of N words around the first match,
+     *                       with "…" if the field is truncated
+     *   - excerpt: false — returns the full field content with matched words wrapped
+     *
+     * @param array  $document      Full document
+     * @param array  $queryTrigrams Query trigrams (from tokenizer->tokenize($query))
+     * @param array  $options       Highlighting options (tags, excerpt, window)
+     * @return array<string, string> ['field' => 'highlighted text', ...]
+     */
+    private function buildHighlights(array $document, array $queryTrigrams, array $options): array
+    {
+        $openTag    = $options['tags'][0]  ?? '<mark>';
+        $closeTag   = $options['tags'][1]  ?? '</mark>';
+        $excerptMode = $options['excerpt'] ?? true;
+        $window     = max(1, (int) ($options['window'] ?? 5));
+
+        $querySet   = array_flip($queryTrigrams);
+        $highlights = [];
+
+        foreach ($document as $field => $value) {
+            if (!is_string($value) || $value === '') {
+                continue;
+            }
+
+            // Split on whitespace, preserving original words
+            $words = preg_split('/\s+/', trim($value));
+
+            if (empty($words)) {
+                continue;
+            }
+
+            // Identify matched positions and build the processed word list
+            $matchedPositions = [];
+            $processedWords   = [];
+
+            foreach ($words as $i => $word) {
+                $wordTrigrams = $this->tokenizer->tokenize($word);
+                $hasMatch     = false;
+
+                foreach ($wordTrigrams as $trigram) {
+                    if (isset($querySet[$trigram])) {
+                        $hasMatch = true;
+                        break;
+                    }
+                }
+
+                $processedWords[$i] = $hasMatch ? $openTag . $word . $closeTag : $word;
+
+                if ($hasMatch) {
+                    $matchedPositions[] = $i;
+                }
+            }
+
+            // No match in this field — skip it
+            if (empty($matchedPositions)) {
+                continue;
+            }
+
+            if (!$excerptMode) {
+                // Full field with all matched words wrapped
+                $highlights[$field] = implode(' ', $processedWords);
+                continue;
+            }
+
+            // Excerpt mode: window around the first matched word
+            $center = $matchedPositions[0];
+            $start  = max(0, $center - $window);
+            $end    = min(count($words) - 1, $center + $window);
+
+            $slice = array_slice($processedWords, $start, $end - $start + 1);
+            $text  = implode(' ', $slice);
+
+            if ($start > 0) {
+                $text = '…' . $text;
+            }
+
+            if ($end < count($words) - 1) {
+                $text .= '…';
+            }
+
+            $highlights[$field] = $text;
+        }
+
+        return $highlights;
     }
 
     private function assertOpen(): void

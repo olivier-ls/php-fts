@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.0] — 2025-XX-XX
+## [1.1.0] — 2025-05-07
+
+### Added
+- Highlighting support in `SearchEngine::search()` via two new optional parameters: `bool $highlight = false` and `array $highlightOptions = []`
+  - No overhead when `$highlight = false` (default behavior unchanged)
+  - Available options: `tags` (open/close wrapping tags), `excerpt` (extract a snippet or return full text), `window` (number of context words around each match)
+  - When enabled, results include a `highlights` field containing one entry per string field of the document
+
+---
+
+## [1.0.1] — 2025-05-07
+
+### Fixed
+- Unicode normalization is now applied before transliteration in `Tokenizer::normalize()`
+  - If `ext-intl` is available, NFC normalization is performed via `Normalizer::normalize()`, with a fallback to the original string if it fails
+  - Otherwise, combining diacritical marks are stripped across all Unicode blocks (U+0300–U+036F, U+1AB0–U+1AFF, U+1DC0–U+1DFF, U+20D0–U+20FF)
+  - Fixes a bug where NFD-encoded input such as `fête` was tokenized as `fe te` instead of `fete`
+  - Applies to both indexing and search, as both go through `Tokenizer::normalize()`
+- Corrected `Þ` / `þ` (Thorn) transliteration from `B` / `b` to `Th` / `th`
+- Corrected `ð` (Eth, lowercase) transliteration from `o` to `d`
+- Added common ligature mappings to `CHAR_MAP`: `ﬁ`→`fi`, `ﬀ`→`ff`, `ﬂ`→`fl`, `ﬃ`→`ffi`, `ﬄ`→`ffl`, `ﬅ`→`st`, `ﬆ`→`st`
+- Fixed a TOCTOU race condition in `open()` in `DocumentStorage`, `PostingsStorage`, and `TombstoneStorage` — replaced the two-step `file_exists()` + `fopen()` pattern with a direct `r+b` open attempt, falling back to `w+b` only if the file does not exist; eliminates the window between check and open during which another process could have created the file
+- Fixed an unchecked `rename()` call in `SearchEngine::compact()` — if renaming a file fails, an exception is now thrown immediately rather than letting the loop continue; prevents ending up with a partially overwritten index with no error reported
+
+---
+
+## [1.0.0] — 2025-05-06
 
 ### Added
 - Full-text search engine with trigram indexing

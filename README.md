@@ -31,6 +31,22 @@ If you don't — or if you'd rather not — php-fts gives you solid full-text se
 
 ---
 
+## Language support
+
+php-fts is designed for **Western Latin languages** (French, English, Spanish, German, Portuguese, Italian, Dutch, and similar).
+
+The tokenizer normalizes input by transliterating accented characters and common diacritics to their ASCII equivalents (`é`→`e`, `ü`→`u`, `ñ`→`n`, etc.), then indexes the result as trigrams.
+
+**This approach has limitations you should be aware of:**
+
+- **Non-Latin scripts** — Cyrillic, Arabic, CJK (Chinese, Japanese, Korean), Hebrew, Thai, and others are not supported. Characters outside the handled ranges are dropped during normalization, which means documents in those scripts will not be searchable.
+- **Some Latin languages** — Languages with more complex orthographies, such as Turkish, may not normalize correctly. For example, the Turkish dotless `ı` or the `ğ` are not handled.
+- **Unicode normalization** — Real-world input sometimes contains characters in NFD or NFKD form (e.g. diacritics encoded as separate combining characters). php-fts handles this: if the `ext-intl` extension is available, NFC normalization is applied before transliteration. Otherwise, combining diacritical marks are stripped directly. Either way, `fête` (NFD) is correctly indexed as `fete`.
+
+If your content is primarily in Western European languages and ASCII-compatible, php-fts will work well. For multilingual or non-Latin content, a dedicated search engine with proper Unicode support is a better fit.
+
+---
+
 ## Features
 
 - **Full-text search** with trigram indexing — tolerant to typos and partial matches
@@ -54,6 +70,7 @@ If you don't — or if you'd rather not — php-fts gives you solid full-text se
 
 - PHP **8.1** or higher
 - Read/write access to a directory for index files
+- `ext-intl` — optional, but recommended for robust Unicode normalization
 
 ---
 
@@ -141,11 +158,13 @@ Supported field types: `string`, `int`, `float`, `bool`, `array` of strings.
 
 ```php
 $results = $engine->search(
-    query:         'leather shoe',
-    limit:         20,
-    maxCandidates: 5000,
-    boosts:        ['title' => 3.0, 'description' => 1.0],
-    filters:       [...],
+    query:            'leather shoe',
+    limit:            20,
+    maxCandidates:    5000,
+    boosts:           ['title' => 3.0, 'description' => 1.0],
+    filters:          [...],
+    highlight:        false,
+    highlightOptions: [],
 );
 ```
 
@@ -160,6 +179,23 @@ Each result:
 ```
 
 The `score` field is available on every result and can be used to build facet counts, custom sorting, or relevance thresholds.
+
+### Highlighting
+
+Pass `highlight: true` to get a `highlights` field on each result, containing one snippet per string field. No overhead when disabled (default).
+
+```php
+$results = $engine->search('leather shoe', highlight: true, highlightOptions: [
+    'tags'    => ['<mark>', '</mark>'],  // wrapping tags (default: ['<mark>', '</mark>'])
+    'excerpt' => true,                  // return a snippet instead of the full field (default: true)
+    'window'  => 5,                     // number of context words around each match (default: 5)
+]);
+
+// $results[0]['highlights']['description']
+// => "…elegant city shoe in soft <mark>leather</mark>…"
+```
+
+When `excerpt` is `false`, the full field value is returned with all matches wrapped in the specified tags.
 
 ### Filters
 
