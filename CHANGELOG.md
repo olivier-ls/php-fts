@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.1] — 2025-05-07
+## [1.0.1] — 2026-05-07
 
 ### Fixed
 - Unicode normalization is now applied before transliteration in `Tokenizer::normalize()`
@@ -33,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.0.0] — 2025-05-06
+## [1.0.0] — 2026-05-06
 
 ### Added
 - Full-text search engine with trigram indexing
