@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.1] — 2026-05-13
+
+### Fixed
+- Extended `CHAR_MAP` in `Tokenizer` with Turkish-specific characters:
+  - `İ` (U+0130) and `ı` (U+0131) — uppercase I with dot and lowercase dotless i — both mapped to `i`
+  - `Ğ` / `ğ` (U+011E / U+011F) — mapped to `g`
+  - `Ş` / `ş` (U+015E / U+015F) — mapped to `s`
+
+---
+
 ## [1.1.0] — 2026-05-07
 
 ### Added

@@ -55,6 +55,13 @@ class Tokenizer
         // Ligatures courantes (NFKD compatibility decomposition)
         'ﬁ' => 'fi', 'ﬀ' => 'ff', 'ﬂ' => 'fl',
         'ﬃ' => 'ffi', 'ﬄ' => 'ffl', 'ﬅ' => 'st', 'ﬆ' => 'st',
+        // Turc
+        'İ' => 'I',   // U+0130 — uppercase I with dot (Turkish)
+        'ı' => 'i',   // U+0131 — lowercase dotless i (Turkish)
+        'Ğ' => 'G',   // U+011E
+        'ğ' => 'g',   // U+011F
+        'Ş' => 'S',   // U+015E
+        'ş' => 's',   // U+015F
     ];
 
     /**
