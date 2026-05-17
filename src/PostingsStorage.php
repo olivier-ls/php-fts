@@ -129,6 +129,60 @@ class PostingsStorage
     }
 
     /**
+     * Appends multiple doc_ids to a trigram's list in one operation.
+     *
+     * Designed for insertBulk(): instead of calling append() N times per trigram,
+     * all doc_ids collected during the bulk are written in a single pass.
+     *
+     * - If there is enough capacity → in-place write of all ids (one fwrite)
+     * - Otherwise → read existing ids, merge, reallocate once with a generous capacity
+     *
+     * @param int[]  $newDocIds  Doc_ids to add
+     * @param int    $offset     Current offset in postings.bin (0 = not yet allocated)
+     * @param int    $capacity   Current allocated capacity
+     * @param int    $count      Current number of written doc_ids
+     * @return array{offset: int, capacity: int, count: int}
+     * @throws RuntimeException
+     */
+    public function appendBatch(array $newDocIds, int $offset, int $capacity, int $count): array
+    {
+        $this->assertOpen();
+
+        $toAdd = count($newDocIds);
+
+        if ($toAdd === 0) {
+            return ['offset' => $offset, 'capacity' => $capacity, 'count' => $count];
+        }
+
+        // First allocation for this trigram
+        if ($offset === 0) {
+            $newCapacity = max(self::INITIAL_CAPACITY, (int) ceil($toAdd * self::GROWTH_FACTOR));
+            return $this->allocate($newDocIds, $newCapacity);
+        }
+
+        $this->assertOffset($offset);
+
+        // Enough capacity — in-place write of all ids in one fwrite
+        if ($count + $toAdd <= $capacity) {
+            fseek($this->handle, $offset + $count * self::ID_SIZE);
+            fwrite($this->handle, pack('V*', ...$newDocIds));
+
+            return [
+                'offset'   => $offset,
+                'capacity' => $capacity,
+                'count'    => $count + $toAdd,
+            ];
+        }
+
+        // Not enough space — read existing, merge, reallocate once
+        $existing    = $this->read($offset, $count);
+        $merged      = array_merge($existing, $newDocIds);
+        $newCapacity = (int) ceil(($capacity + $toAdd) * self::GROWTH_FACTOR);
+
+        return $this->allocate($merged, $newCapacity);
+    }
+
+    /**
      * Properly closes the file.
      */
     public function close(): void
@@ -156,16 +210,13 @@ class PostingsStorage
         $offset = ftell($this->handle);
         $count  = count($docIds);
 
-        // Write doc_ids
-        foreach ($docIds as $id) {
-            fwrite($this->handle, pack('V', $id));
-        }
-
-        // Padding for remaining capacity
+        // All doc_ids + padding in one single fwrite
+        $data    = pack('V*', ...$docIds);
         $padding = $capacity - $count;
         if ($padding > 0) {
-            fwrite($this->handle, str_repeat("\x00", $padding * self::ID_SIZE));
+            $data .= str_repeat("\x00", $padding * self::ID_SIZE);
         }
+        fwrite($this->handle, $data);
 
         return [
             'offset'   => $offset,

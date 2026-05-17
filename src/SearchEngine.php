@@ -50,6 +50,11 @@ class SearchEngine
      * Opens all files from a directory.
      * Creates the directory and files if they do not exist.
      *
+     * If a bulk sentinel file is found (.bulk_in_progress), it means a previous
+     * insertBulk() was interrupted before flushing the index to disk.
+     * The sentinel is removed and compact() is run automatically to rebuild a
+     * consistent index from the documents already written to documents.bin.
+     *
      * @throws RuntimeException
      */
     public function open(string $directory, int $lockTimeout = 5): void
@@ -68,6 +73,16 @@ class SearchEngine
         $this->trigrams->open($this->directory   . '/trigrams.bin');
 
         $this->open = true;
+
+        // Auto-recovery: a leftover sentinel means insertBulk() crashed before
+        // flushing trigrams and postings. Remove it first so that the compact()
+        // call below — which internally calls open() — does not loop.
+        $sentinel = $this->sentinelPath();
+
+        if (file_exists($sentinel)) {
+            @unlink($sentinel);
+            $this->compact();
+        }
     }
 
     /**
@@ -86,6 +101,17 @@ class SearchEngine
     /**
      * Inserts multiple documents under a single lock.
      *
+     * Bulk optimisations over repeated insert() calls:
+     *   - DocumentStorage : persistHeaderStats() deferred → 1 write at the end
+     *   - TrigramIndex    : set() skips disk writes → 1 sequential flush (~810 KB)
+     *   - PostingsStorage : doc_ids accumulated per trigram → 1 appendBatch() per unique trigram
+     *
+     * Crash safety:
+     *   A sentinel file (.bulk_in_progress) is written before any data hits the disk
+     *   and removed only on success. If the process dies mid-bulk, the next open()
+     *   detects the sentinel, removes it, and runs compact() to rebuild a consistent
+     *   index from the documents already persisted in documents.bin.
+     *
      * @return int[] doc_ids
      * @throws RuntimeException
      */
@@ -94,11 +120,57 @@ class SearchEngine
         $this->assertOpen();
 
         return $this->lock->withLock(function () use ($documents): array {
-            $docIds = [];
+            $docIds          = [];
+            $pendingPostings = []; // trigram => [docId, ...]
 
+            // Write the sentinel before any data hits the disk.
+            // It is removed only on success — if the process dies before that,
+            // open() will detect it and trigger compact() automatically.
+            $sentinel = $this->sentinelPath();
+            file_put_contents($sentinel, (string) getmypid());
+
+            $this->documents->beginBulk();
+            $this->trigrams->beginBulk();
+
+            // Phase 1: write documents + accumulate postings per trigram
             foreach ($documents as $document) {
-                $docIds[] = $this->doInsert($document);
+                $trigramList  = $this->extractTrigrams($document);
+                $trigramCount = count($trigramList);
+                $docId        = $this->documents->write($document, $trigramCount);
+                $docIds[]     = $docId;
+
+                foreach ($trigramList as $trigram) {
+                    $pendingPostings[$trigram][] = $docId;
+                }
             }
+
+            // Phase 2: flush postings — 1 appendBatch() per unique trigram
+            foreach ($pendingPostings as $trigram => $batchDocIds) {
+                $trigram  = (string) $trigram; // PHP casts numeric string keys to int ("123" → 123)
+                $entry    = $this->trigrams->get($trigram);
+                $newEntry = $this->postings->appendBatch(
+                    $batchDocIds,
+                    $entry['offset'],
+                    $entry['capacity'],
+                    $entry['count']
+                );
+
+                if ($newEntry !== $entry) {
+                    $this->trigrams->set(
+                        $trigram,
+                        $newEntry['offset'],
+                        $newEntry['capacity'],
+                        $newEntry['count']
+                    );
+                }
+            }
+
+            // Phase 3: single-pass disk flush for each component
+            $this->documents->endBulk(); // 1 fseek + fwrite to documents.bin header
+            $this->trigrams->flush();    // 1 sequential fwrite of ~810 KB to trigrams.bin
+
+            // Everything is safely on disk — remove the sentinel
+            @unlink($sentinel);
 
             return $docIds;
         });
@@ -331,11 +403,18 @@ class SearchEngine
             $newTrigrams->open($tmpDir   . '/trigrams.bin');
             $newTombstones->open($tmpDir . '/tombstones.bin');
 
-            $tombstones = $this->tombstones;
+            $tombstones      = $this->tombstones;
+            $pendingPostings = []; // trigram => [docId, ...]
 
+            $newDocs->beginBulk();
+            $newTrigrams->beginBulk();
+
+            // Phase 1: iterate documents, write them, accumulate postings per trigram.
+            // Same batch strategy as insertBulk(): no individual fseek/fwrite per trigram,
+            // no cascading reallocations in the freshly created postings.bin.
             $this->documents->iterate(
                 function (int $offset, array $document, int $trigramCount) use (
-                    $newDocs, $newPostings, $newTrigrams, $tombstones
+                    $newDocs, $tombstones, &$pendingPostings
                 ): void {
                     if ($tombstones->isDeleted($offset)) {
                         return;
@@ -346,25 +425,35 @@ class SearchEngine
                     $newDocId     = $newDocs->write($document, $trigramCount);
 
                     foreach ($trigramList as $trigram) {
-                        $e        = $newTrigrams->get($trigram);
-                        $newEntry = $newPostings->append(
-                            $newDocId,
-                            $e['offset'],
-                            $e['capacity'],
-                            $e['count']
-                        );
-
-                        if ($newEntry !== $e) {
-                            $newTrigrams->set(
-                                $trigram,
-                                $newEntry['offset'],
-                                $newEntry['capacity'],
-                                $newEntry['count']
-                            );
-                        }
+                        $pendingPostings[$trigram][] = $newDocId;
                     }
                 }
             );
+
+            // Phase 2: flush postings — 1 appendBatch() per unique trigram, no reallocation churn.
+            foreach ($pendingPostings as $trigram => $batchDocIds) {
+                $trigram  = (string) $trigram; // PHP casts numeric string keys to int ("123" → 123)
+                $entry    = $newTrigrams->get($trigram);
+                $newEntry = $newPostings->appendBatch(
+                    $batchDocIds,
+                    $entry['offset'],
+                    $entry['capacity'],
+                    $entry['count']
+                );
+
+                if ($newEntry !== $entry) {
+                    $newTrigrams->set(
+                        $trigram,
+                        $newEntry['offset'],
+                        $newEntry['capacity'],
+                        $newEntry['count']
+                    );
+                }
+            }
+
+            // Phase 3: single-pass disk flush for each component
+            $newDocs->endBulk();    // 1 fseek + fwrite to documents.bin header
+            $newTrigrams->flush();  // 1 sequential fwrite of ~810 KB to trigrams.bin
 
             $newDocs->close();
             $newPostings->close();
@@ -909,5 +998,14 @@ class SearchEngine
         if (!$this->open) {
             throw new RuntimeException("Engine is not open. Call open() first.");
         }
+    }
+
+    /**
+     * Returns the path of the bulk sentinel file.
+     * Presence of this file on disk means a previous insertBulk() did not complete.
+     */
+    private function sentinelPath(): string
+    {
+        return $this->directory . '/.bulk_in_progress';
     }
 }

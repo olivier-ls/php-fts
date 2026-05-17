@@ -46,6 +46,41 @@ class TrigramIndex
      */
     private array $entries = [];
 
+    /** When true, set() skips individual disk writes. Flushed via flush(). */
+    private bool $bulkMode = false;
+
+    /**
+     * Activates bulk mode: set() only updates memory, no fseek/fwrite per trigram.
+     * Call flush() to persist all changes in one sequential write.
+     */
+    public function beginBulk(): void
+    {
+        $this->bulkMode = true;
+    }
+
+    /**
+     * Ends bulk mode and rewrites the entire entries block in one sequential
+     * fwrite (~810 KB). Far cheaper than N individual seeks.
+     *
+     * @throws RuntimeException
+     */
+    public function flush(): void
+    {
+        $this->bulkMode = false;
+        $this->assertOpen();
+
+        $buffer = '';
+
+        foreach ($this->entries as $entry) {
+            $lo      = $entry['offset'] & 0xFFFFFFFF;
+            $hi      = ($entry['offset'] >> 32) & 0xFFFFFFFF;
+            $buffer .= pack('VVV', $lo, $hi, $entry['capacity']) . pack('V', $entry['count']);
+        }
+
+        fseek($this->handle, self::HEADER_SIZE);
+        fwrite($this->handle, $buffer);
+    }
+
     /**
      * Opens the file.
      * Creates it with 50 653 zero entries if it does not exist.
@@ -98,19 +133,21 @@ class TrigramIndex
         $this->assertOpen();
         $index = $this->trigramToIndex($trigram);
 
-        // In-memory update
+        // In-memory update — always
         $this->entries[$index] = [
             'offset'   => $offset,
             'capacity' => $capacity,
             'count'    => $count,
         ];
 
-        // Disk write at the exact position
+        // Disk write — skipped in bulk mode (flush() handles it in one shot)
+        if ($this->bulkMode) {
+            return;
+        }
+
         $position = self::HEADER_SIZE + $index * self::ENTRY_SIZE;
         fseek($this->handle, $position);
 
-        // uint64 in little-endian: PHP has no portable pack('Q') on 32-bit
-        // Split into two uint32
         $lo = $offset & 0xFFFFFFFF;
         $hi = ($offset >> 32) & 0xFFFFFFFF;
         fwrite($this->handle, pack('VVV', $lo, $hi, $capacity) . pack('V', $count));

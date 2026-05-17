@@ -1,10 +1,5 @@
 # php-fts
 
-![Packagist Version](https://img.shields.io/packagist/v/ols/php-fts)
-![PHP Version](https://img.shields.io/packagist/dependency-v/ols/php-fts/php)
-![License](https://img.shields.io/github/license/olivier-ls/php-fts)
-![Downloads](https://img.shields.io/packagist/dt/ols/php-fts)
-
 A self-contained full-text search engine written in pure PHP.  
 No extensions. No external services. No dependencies. Just files.
 
@@ -31,22 +26,6 @@ If you don't — or if you'd rather not — php-fts gives you solid full-text se
 
 ---
 
-## Language support
-
-php-fts is designed for **Western Latin languages** (French, English, Spanish, German, Portuguese, Italian, Dutch, and similar).
-
-The tokenizer normalizes input by transliterating accented characters and common diacritics to their ASCII equivalents (`é`→`e`, `ü`→`u`, `ñ`→`n`, etc.), then indexes the result as trigrams.
-
-**This approach has limitations you should be aware of:**
-
-- **Non-Latin scripts** — Cyrillic, Arabic, CJK (Chinese, Japanese, Korean), Hebrew, Thai, and others are not supported. Characters outside the handled ranges are dropped during normalization, which means documents in those scripts will not be searchable.
-- **Some Latin languages** — Languages with more complex orthographies, such as Turkish, may not normalize correctly. For example, the Turkish dotless `ı` or the `ğ` are not handled.
-- **Unicode normalization** — Real-world input sometimes contains characters in NFD or NFKD form (e.g. diacritics encoded as separate combining characters). php-fts handles this: if the `ext-intl` extension is available, NFC normalization is applied before transliteration. Otherwise, combining diacritical marks are stripped directly. Either way, `fête` (NFD) is correctly indexed as `fete`.
-
-If your content is primarily in Western European languages and ASCII-compatible, php-fts will work well. For multilingual or non-Latin content, a dedicated search engine with proper Unicode support is a better fit.
-
----
-
 ## Features
 
 - **Full-text search** with trigram indexing — tolerant to typos and partial matches
@@ -55,10 +34,10 @@ If your content is primarily in Western European languages and ASCII-compatible,
 - **Field boosting** — weight some fields (e.g. title) more than others
 - **Filters** — exact match, comparisons, range, `in`, `not in`, `contains` on array fields
 - **Combined AND / OR filtering** — flexible condition logic
-- **Bulk insertion** — up to 2.4× faster than individual inserts, single lock for the whole batch
+- **Bulk insertion** — up to 12× faster than individual inserts, single lock for the whole batch, crash-safe
 - **Soft delete** with tombstones — fast deletes, cleaned up on compaction
 - **Atomic update** — soft delete + re-insert in a single lock
-- **Compaction** — rebuilds index files cleanly, removes deleted documents
+- **Compaction** — rebuilds index files cleanly, removes deleted documents and fragmentation
 - **Fragmentation monitoring** — know when to compact
 - **Binary file storage** — portable across servers, no rebuild needed
 - **O(1) trigram lookup** — fixed-size index (~810 KB), no tree traversal
@@ -70,7 +49,6 @@ If your content is primarily in Western European languages and ASCII-compatible,
 
 - PHP **8.1** or higher
 - Read/write access to a directory for index files
-- `ext-intl` — optional, but recommended for robust Unicode normalization
 
 ---
 
@@ -158,13 +136,11 @@ Supported field types: `string`, `int`, `float`, `bool`, `array` of strings.
 
 ```php
 $results = $engine->search(
-    query:            'leather shoe',
-    limit:            20,
-    maxCandidates:    5000,
-    boosts:           ['title' => 3.0, 'description' => 1.0],
-    filters:          [...],
-    highlight:        false,
-    highlightOptions: [],
+    query:         'leather shoe',
+    limit:         20,
+    maxCandidates: 5000,
+    boosts:        ['title' => 3.0, 'description' => 1.0],
+    filters:       [...],
 );
 ```
 
@@ -179,23 +155,6 @@ Each result:
 ```
 
 The `score` field is available on every result and can be used to build facet counts, custom sorting, or relevance thresholds.
-
-### Highlighting
-
-Pass `highlight: true` to get a `highlights` field on each result, containing one snippet per string field. No overhead when disabled (default).
-
-```php
-$results = $engine->search('leather shoe', highlight: true, highlightOptions: [
-    'tags'    => ['<mark>', '</mark>'],  // wrapping tags (default: ['<mark>', '</mark>'])
-    'excerpt' => true,                  // return a snippet instead of the full field (default: true)
-    'window'  => 5,                     // number of context words around each match (default: 5)
-]);
-
-// $results[0]['highlights']['description']
-// => "…elegant city shoe in soft <mark>leather</mark>…"
-```
-
-When `excerpt` is `false`, the full field value is returned with all matches wrapped in the specified tags.
 
 ### Filters
 
@@ -287,36 +246,50 @@ Benchmarks were run on two environments:
 
 ### Insertion
 
-| Volume | insert() Windows | insert() Linux | insertBulk() Windows | insertBulk() Linux |
-|--------|-----------------|----------------|----------------------|--------------------|
-| 1 000  | 5.3 s           | 7.3 s          | 3.0 s                | 3.0 s              |
-| 5 000  | —               | 33.5 s         | —                    | 14.8 s             |
-| 10 000 | 53.0 s          | 63.4 s         | 30.5 s               | 29.4 s             |
-| 50 000 | 282.2 s         | —              | 157.8 s              | —                  |
+| Volume  | insert() Win | insert() Linux | insertBulk() Win | insertBulk() Linux | Gain Win | Gain Linux |
+|---------|-------------|----------------|------------------|--------------------|----------|------------|
+| 1 000   | 3.23 s      | 8.58 s         | 274 ms           | 167 ms             | 11.8×    | 51.3×      |
+| 5 000   | 17.43 s     | 38.94 s        | 1.35 s           | 952 ms             | 12.9×    | 40.9×      |
+| 10 000  | 35.72 s     | 66.15 s        | 2.97 s           | 1.62 s             | 12×      | 40.8×      |
+| 20 000  | 72.87 s     | 129.09 s       | 5.78 s           | 3.44 s             | 12.6×    | 37.5×      |
 
-> Insertion is an offline operation — indexing is typically done via a scheduled job, not at request time.  
-> Always prefer `insertBulk()` in production: it acquires a single lock for the entire batch and is consistently ~2x faster.
+> Always prefer `insertBulk()` over `insert()` in production: it acquires a single lock
+> for the entire batch and is consistently faster — up to **12×** on local NVMe,
+> up to **51×** on shared Linux hosting. Both are designed for offline or scheduled
+> use; keep them out of critical request paths on high-traffic setups.
 
 ### Index size
 
 | Volume  | Index size |
 |---------|------------|
-| 1 000   | 2.8 MB     |
-| 10 000  | 21.7 MB    |
-| 50 000  | 106.0 MB   |
+| 1 000   | 2.32 MB    |
+| 5 000   | 8.14 MB    |
+| 10 000  | 18.97 MB   |
+| 20 000  | 36.58 MB   |
 
-### Search — Linux shared hosting, 10 000 documents
+### Search
 
-| Metric    | Value            |
-|-----------|------------------|
-| Median    | 3.2 ms           |
-| Average   | 4.9 ms           |
-| P95       | 12.5 ms          |
-| P99       | 22.9 ms          |
-| Min / Max | 1.3 ms / 37.1 ms |
+| Volume  | Median Win | Median Linux | P95 Win  | P95 Linux | P99 Win   | P99 Linux |
+|---------|-----------|--------------|----------|-----------|-----------|-----------|
+| 1 000   | 3.51 ms   | 2.06 ms      | 8.21 ms  | 4.41 ms   | 8.66 ms   | 6.64 ms   |
+| 5 000   | 4.52 ms   | 2.99 ms      | 22.79 ms | 8.7 ms    | 23.62 ms  | 16.89 ms  |
+| 10 000  | 5.92 ms   | 4.02 ms      | 41.89 ms | 15.23 ms  | 44.37 ms  | 33.67 ms  |
+| 20 000  | 7.62 ms   | 4.76 ms      | 62.88 ms | 19.76 ms  | 106.67 ms | 21.39 ms  |
 
 > 200 queries, 10 distinct queries in rotation (including typos and out-of-corpus queries).  
-> Measured with `hrtime()` on a live shared hosting environment under normal load.
+> Measured with `hrtime()`.
+
+### Compaction
+
+| Volume  | Windows  | Linux    |
+|---------|----------|----------|
+| 1 000   | 571.6 ms | 449.3 ms |
+| 5 000   | 1.25 s   | 897.9 ms |
+| 10 000  | 2.12 s   | 1.63 s   |
+| 20 000  | 4.03 s   | 2.68 s   |
+
+> Compaction rewrites the index from scratch — it is an occasional maintenance operation, not a request-time concern.  
+> Run it when `fragmentationRate()` exceeds your threshold (e.g. 20%).
 
 ---
 

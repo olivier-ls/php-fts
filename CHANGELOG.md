@@ -7,6 +7,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.2] — 2026-05-17
+
+### Performance
+
+#### `insertBulk()` — 11.7x faster (5k docs: 15.35s → 1.65s)
+
+The bulk insert now uses a three-phase batch strategy instead of processing
+each document individually:
+
+- **Phase 1** — Documents are written to `documents.bin` and doc_ids are
+  accumulated per trigram in a `$pendingPostings` map. No posting is written
+  to disk at this stage.
+- **Phase 2** — One `appendBatch()` call per unique trigram flushes all
+  accumulated doc_ids in a single write, eliminating cascading reallocations
+  in `postings.bin`.
+- **Phase 3** — `DocumentStorage::endBulk()` flushes the header stats in one
+  write (was: once per document). `TrigramIndex::flush()` rewrites the entire
+  entries block sequentially (~810 KB, was: one `fseek + fwrite` per trigram
+  update).
+
+As a side effect, `postings.bin` produced by bulk inserts has zero internal
+fragmentation since each trigram is allocated exactly once with the right
+final capacity.
+
+**Files changed:** `SearchEngine.php`, `DocumentStorage.php`,
+`TrigramIndex.php`, `PostingsStorage.php`
+
+---
+
+#### `compact()` — 9.8x faster (20k docs: 43.31s → 4.41s)
+
+Applied the same three-phase batch strategy as `insertBulk()` to the
+compaction routine. Previously, `compact()` was rebuilding the index
+document by document using individual `append()` and `set()` calls,
+causing the same cascading reallocation problem — but on a freshly
+created `postings.bin`, making it even more wasteful.
+
+The compacted `postings.bin` is now written without any holes or wasted
+capacity.
+
+**Files changed:** `SearchEngine.php`
+
+---
+
+#### `PostingsStorage::allocate()` — minor
+
+All doc_ids are now written in a single `fwrite()` call using `pack('V*', ...$ids)`
+instead of a loop of individual `fwrite()` calls.
+
+**Files changed:** `PostingsStorage.php`
+
+---
+
+### New methods (internal)
+
+#### `DocumentStorage::beginBulk()` / `endBulk()`
+
+Defers `persistHeaderStats()` disk writes during a bulk operation.
+`beginBulk()` activates the deferred mode; `endBulk()` flushes count
+and trigramSum to disk in one write.
+
+#### `TrigramIndex::beginBulk()` / `flush()`
+
+In bulk mode, `set()` only updates the in-memory entries array without
+touching the disk. `flush()` rewrites the entire entries block in one
+sequential write (~810 KB).
+
+#### `PostingsStorage::appendBatch(array $newDocIds, ...)`
+
+Appends multiple doc_ids to a trigram's posting list in one operation.
+Avoids the reallocation churn that `append()` causes when called
+repeatedly for the same trigram during a bulk operation.
+
+---
+
+### Bug fixes
+
+#### Numeric trigram keys cast to `int` by PHP (`SearchEngine.php`)
+
+In `insertBulk()` and `compact()`, trigrams are accumulated as keys of a
+PHP array (`$pendingPostings[$trigram][] = $docId`). PHP silently casts
+numeric string keys to integers (e.g. `"123"` → `123`), causing a
+`TypeError` when the key was later passed to `TrigramIndex::get(string $trigram)`.
+
+Fixed by explicitly casting the key back to string at the start of the
+Phase 2 loop:
+```php
+$trigram = (string) $trigram;
+```
+
+Affected trigrams: any 3-character sequence composed entirely of digits
+(e.g. `"123"`, `"990"`, `"v5#"`...).
+
+---
+
+### Crash safety
+
+#### Bulk sentinel file (`SearchEngine.php`)
+
+`insertBulk()` now writes a `.bulk_in_progress` sentinel file before any
+data hits the disk, and removes it only on success. If the process dies
+mid-bulk (between Phase 1 and Phase 3), the next `open()` call detects
+the sentinel, removes it, and runs `compact()` automatically to rebuild
+a consistent index from the documents already persisted in `documents.bin`.
+
+This closes the consistency gap introduced by the deferred flush strategy:
+without the sentinel, a crashed bulk would leave `documents.bin` ahead of
+`trigrams.bin`, resulting in silently incomplete search results.
+
 ## [1.1.1] — 2026-05-13
 
 ### Fixed

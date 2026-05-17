@@ -34,8 +34,27 @@ class DocumentStorage
     /** @var resource|null */
     private $handle = null;
 
-    private int $count      = 0;
-    private int $trigramSum = 0;
+    private int  $count      = 0;
+    private int  $trigramSum = 0;
+    private bool $bulkMode   = false;
+
+    /**
+     * Activates bulk mode: persistHeaderStats() is skipped on every write.
+     * Must be paired with endBulk() which flushes the stats once.
+     */
+    public function beginBulk(): void
+    {
+        $this->bulkMode = true;
+    }
+
+    /**
+     * Ends bulk mode and flushes count + trigramSum to disk in one write.
+     */
+    public function endBulk(): void
+    {
+        $this->bulkMode = false;
+        $this->persistHeaderStats();
+    }
 
     /**
      * Opens the file. Creates it with the header if it does not exist.
@@ -92,7 +111,10 @@ class DocumentStorage
 
         $this->count++;
         $this->trigramSum += $trigramCount;
-        $this->persistHeaderStats();
+
+        if (!$this->bulkMode) {
+            $this->persistHeaderStats();
+        }
 
         return $offset;
     }
