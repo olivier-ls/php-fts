@@ -367,6 +367,25 @@ Agreed and scheduled, but not now:
   compare results. This is the answer to "is it *correct*", which no benchmark
   can give. Only meaningful once v2 can search.
 
+- **Parallel-corpus search-quality tests.** The same twenty or so documents
+  translated into French, English, Japanese, Chinese, Russian and Arabic, each
+  with a handful of queries and an expected target document. For every language
+  and query, record three numbers: was the target found, at what rank, and how
+  many results came back in total.
+
+  Two things make this worth doing carefully. The bar is *comparable*, not
+  *identical* — the analyzer is deliberately different per script, so expecting
+  matching output would be expecting two different algorithms to agree. And
+  measuring recall alone is not enough: bigrams are noisier than trigrams by
+  construction, so a language could find the right document and bury it under
+  fifty wrong ones while the test still passed. A workable threshold: the
+  target in the top three, and no language returning an order of magnitude more
+  results than the others.
+
+  This is the closest substitute available for native-speaker review, which
+  remains the thing that would catch a linguistic misunderstanding no test
+  written from the same misunderstanding ever will.
+
 - **Benchmarks on real shared hosting.** Olivier has access to production
   shared-hosting servers, so the final comparison runs there as well as on
   Windows, against 1.x on the same machine. One methodological correction is
