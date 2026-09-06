@@ -83,6 +83,39 @@ trait OpensIndexFile
     }
 
     /**
+     * Opens an existing index file for reading only, with the same symlink
+     * protection as openIndexFile().
+     *
+     * Kept separate rather than folded in as a flag because a reader must work
+     * on an index the process cannot write — a read-only mount, or a web user
+     * granted read access to a directory a cron job owns. Opening in 'r+b'
+     * would fail there for no reason.
+     *
+     * @return resource
+     * @throws StorageException
+     */
+    private function openIndexFileForReading(string $path)
+    {
+        if (is_link($path)) {
+            throw new StorageException("Refusing to open a symbolic link: $path");
+        }
+
+        try {
+            $handle = @fopen($path, 'rb');
+
+            if ($handle === false) {
+                throw new StorageException("Unable to open file for reading: $path");
+            }
+
+            $this->assertNotRedirected($handle, $path);
+
+            return $handle;
+        } finally {
+            clearstatcache(true, $path);
+        }
+    }
+
+    /**
      * Verifies that the open descriptor and the path designate the same inode.
      *
      * @param resource $handle
