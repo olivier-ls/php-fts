@@ -52,8 +52,15 @@ use Ols\PhpFts\Storage\Varint;
  */
 final class SegmentIndexWriter
 {
-    /** Strings at or below this many bytes also get a keyword column. */
+    /** A string longer than this is prose, never a value to filter on. */
     private const KEYWORD_MAX_LENGTH = 64;
+
+    /**
+     * Distinct values a string field may have and still earn a column, however
+     * few documents there are. Below this the column costs almost nothing, and
+     * the "few values relative to documents" test is meaningless anyway.
+     */
+    private const KEYWORD_MIN_DISTINCT = 64;
 
     private Analyzer $analyzer;
 
@@ -133,29 +140,75 @@ final class SegmentIndexWriter
     /**
      * Works out, for every field seen anywhere in the batch, what it is.
      *
+     * Numbers are easy. Strings are the interesting case, and length alone is
+     * not enough to decide: a product title is short, and giving it a keyword
+     * column is pure waste — nobody filters on an exact title and nobody facets
+     * one, because every value is unique.
+     *
+     * What actually distinguishes a keyword from prose is **repetition**. A
+     * brand appears across hundreds of documents; a title appears once. So a
+     * string field earns a column when its distinct values are few relative to
+     * the number of documents — which is the same thing as saying it is worth
+     * faceting on.
+     *
+     * The small-index allowance exists because the ratio means nothing when
+     * there are ten documents: everything looks unique, and the column would be
+     * tiny anyway.
+     *
      * @return array<string, string> field => 'number' | 'keyword' | 'text'
      */
     private function inferFields(): array
     {
-        $fields = [];
+        $documentCount = count($this->documents);
+
+        /** @var array<string, bool> */
+        $numeric = [];
+        /** @var array<string, bool> */
+        $tooLong = [];
+        /** @var array<string, array<string, true>> */
+        $distinct = [];
 
         foreach ($this->documents as $document) {
             foreach ($document as $field => $value) {
-                $field    = (string) $field;
-                $observed = match (true) {
-                    is_int($value), is_float($value), is_bool($value) => 'number',
-                    is_string($value) && strlen($value) <= self::KEYWORD_MAX_LENGTH => 'keyword',
-                    default => 'text',
-                };
+                $field = (string) $field;
 
-                // A field seen as several things settles on the loosest: one
-                // long description anywhere means the field is not a keyword.
-                $fields[$field] = match (true) {
-                    !isset($fields[$field])          => $observed,
-                    $fields[$field] === $observed    => $observed,
-                    default                          => 'text',
-                };
+                if (is_int($value) || is_float($value) || is_bool($value)) {
+                    $numeric[$field] = true;
+                    continue;
+                }
+
+                if (!is_string($value)) {
+                    continue;
+                }
+
+                if (strlen($value) > self::KEYWORD_MAX_LENGTH) {
+                    $tooLong[$field] = true;
+                    continue;
+                }
+
+                $distinct[$field][$value] = true;
             }
+        }
+
+        $ceiling = max(self::KEYWORD_MIN_DISTINCT, intdiv($documentCount, 2));
+        $fields  = [];
+
+        foreach ($numeric as $field => $_) {
+            $fields[$field] = 'number';
+        }
+
+        foreach ($distinct as $field => $values) {
+            if (isset($fields[$field])) {
+                continue;   // already numeric somewhere; numbers win
+            }
+
+            $fields[$field] = !isset($tooLong[$field]) && count($values) <= $ceiling
+                ? 'keyword'
+                : 'text';
+        }
+
+        foreach ($tooLong as $field => $_) {
+            $fields[$field] ??= 'text';
         }
 
         return $fields;

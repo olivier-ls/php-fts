@@ -337,4 +337,45 @@ class SegmentIndexTest extends TestCase
             $this->assertGreaterThan(0, $hit->document['stock']);
         }
     }
+    // =========================================================================
+    // Field inference
+    // =========================================================================
+
+    #[Test]
+    public function a_field_whose_values_repeat_earns_a_column_and_a_unique_one_does_not(): void
+    {
+        // Length alone cannot tell a brand from a title: both are short. What
+        // separates them is repetition — a brand appears across hundreds of
+        // documents, a title once — and that is also exactly what makes a field
+        // worth faceting on.
+        $writer = new SegmentIndexWriter();
+
+        for ($i = 0; $i < 2000; $i++) {
+            $writer->put("sku-$i", [
+                "title" => "Chaussure modele $i en cuir",
+                "brand" => ["Adidas", "Puma", "Nike"][$i % 3],
+            ]);
+        }
+
+        $writer->write($this->path);
+
+        $fields = SegmentIndex::open($this->path)->fields();
+
+        $this->assertSame("keyword", $fields["brand"], "three values over two thousand documents");
+        $this->assertSame("text", $fields["title"], "every title is unique, so no column");
+    }
+
+    #[Test]
+    public function a_long_string_never_earns_a_column(): void
+    {
+        $writer = new SegmentIndexWriter();
+
+        for ($i = 0; $i < 200; $i++) {
+            $writer->put("sku-$i", ["description" => str_repeat("texte de description ", 10)]);
+        }
+
+        $writer->write($this->path);
+
+        $this->assertSame("text", SegmentIndex::open($this->path)->fields()["description"]);
+    }
 }
