@@ -350,3 +350,27 @@ deletion; the failure is benign and retried on the next commit.
    it fixes the maximum merge output. Confirm.
 4. **Block size** (64 terms / 128 postings) — to be tuned against a real
    benchmark on network storage, not guessed.
+
+---
+
+## 14. Deferred, deliberately
+
+Agreed and scheduled, but not now:
+
+- **Segment inspector** — a command that opens a `.fts` and prints its
+  structure: sections and sizes, block counts, cost per key, a sample of keys
+  with their payloads, checksum status. Makes the format legible instead of
+  opaque, and becomes the basis of the CLI the adoption plan calls for. Judged
+  premature while there is only a dictionary to look at.
+
+- **Differential test against 1.x** — same corpus, same queries, both engines,
+  compare results. This is the answer to "is it *correct*", which no benchmark
+  can give. Only meaningful once v2 can search.
+
+- **Benchmarks on real shared hosting.** Olivier has access to production
+  shared-hosting servers, so the final comparison runs there as well as on
+  Windows, against 1.x on the same machine. One methodological correction is
+  required: `benchmark/benchmark.php` in 1.x opens the engine *outside* the
+  timed loop, so its published medians measure a search over an already-loaded
+  index. Nothing survives between HTTP requests on shared hosting, so the v2
+  benchmark must time **open + search** together.
