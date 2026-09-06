@@ -22,3 +22,9 @@ Thumbs.db
 # Tooling caches
 .phpunit.cache/
 .phpunit.result.cache
+
+# Local scratch files and generated segments
+/test.php
+/scratch/
+*.fts
+*.fts.tmp
