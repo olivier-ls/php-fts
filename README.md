@@ -195,7 +195,7 @@ A document missing a filtered field is excluded from results.
 | `in` `not in`             | int, float, string       |
 | `contains` `not contains` | array (document field)   |
 
-**Comparisons are strict** (since 1.1.3). A value only matches a field of the same
+**Comparisons are strict** (since 1.1.4). A value only matches a field of the same
 type — the sole exception being `int` versus `float`, which compare numerically
 because JSON round trips move values between the two. So `'42'` does not match
 `42`, and `true` does not match `'Adidas'`.
@@ -219,7 +219,7 @@ echo $results[0]['highlights']['title'];  // Brown <mark>leather</mark> shoe
 
 Only string fields containing a match appear in `highlights`.
 
-**Field text is HTML-escaped before the tags are inserted** (since 1.1.3), so the
+**Field text is HTML-escaped before the tags are inserted** (since 1.1.4), so the
 result is safe to render even when the indexed content came from users. Pass
 `'escape' => false` only if you escape downstream yourself.
 

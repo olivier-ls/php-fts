@@ -7,10 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.1.3] — 2026-09-06
+## [1.1.4] — 2026-09-06
 
 Security and correctness release. No format change — existing indexes are read
 and written unchanged.
+
+> Supersedes **1.1.3**, which was withdrawn. Its git tag was moved after
+> publication while commit authorship was being cleaned up, which left the
+> Packagist entry pointing at a commit that no longer exists. The code is
+> byte-identical; 1.1.4 is the same release under a number that resolves.
+> Anyone who managed to install 1.1.3 should move to 1.1.4.
 
 ### Security
 
