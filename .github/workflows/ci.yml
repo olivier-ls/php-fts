@@ -22,7 +22,7 @@ jobs:
         php: ['8.1', '8.2', '8.3', '8.4']
         include:
           # The library ships no extensions, so it has to be proven on Windows
-          # too — symlink handling and rename() semantics differ there.
+          # and macOS too — symlink handling and rename() semantics differ.
           - os: windows-latest
             php: '8.3'
           - os: macos-latest
@@ -35,13 +35,8 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          # Deliberately minimal: php-fts must run on a bare PHP install.
-          extensions: none, json, pcre, spl, tokenizer, dom, xml, xmlwriter, mbstring
           coverage: none
           ini-values: error_reporting=E_ALL, display_errors=On
-
-      - name: Validate composer.json
-        run: composer validate --strict
 
       - name: Install dependencies
         uses: ramsey/composer-install@v3
@@ -61,12 +56,15 @@ jobs:
           php-version: '8.3'
           coverage: none
 
+      - name: Validate composer.json
+        run: composer validate --strict
+
       - uses: ramsey/composer-install@v3
 
       - run: vendor/bin/phpstan analyse --no-progress
 
-  no-extension-check:
-    name: Runs without optional extensions
+  no-optional-extensions:
+    name: Runs without ext-intl and ext-posix
     runs-on: ubuntu-latest
 
     steps:
@@ -75,15 +73,19 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
-          # No intl (Normalizer), no posix — the two things the code probes for.
-          extensions: none, json, pcre, spl, tokenizer, dom, xml, xmlwriter, mbstring
+          # Disable exactly the two extensions the library probes for, and
+          # nothing else — a stripped-down PHP would break Composer itself
+          # and prove nothing about php-fts.
+          extensions: :intl, :posix
           coverage: none
 
       - uses: ramsey/composer-install@v3
 
       - name: Assert the probed extensions really are absent
         run: |
-          php -r 'if (class_exists("Normalizer")) { fwrite(STDERR, "ext-intl present, test is meaningless\n"); exit(1); }'
-          php -r 'if (function_exists("posix_kill")) { fwrite(STDERR, "ext-posix present, test is meaningless\n"); exit(1); }'
+          php -r 'if (class_exists("Normalizer")) { fwrite(STDERR, "ext-intl is present, this job proves nothing\n"); exit(1); }'
+          php -r 'if (function_exists("posix_kill")) { fwrite(STDERR, "ext-posix is present, this job proves nothing\n"); exit(1); }'
 
-      - run: vendor/bin/phpunit
+      # Tests needing posix_kill declare it and skip; everything else must pass.
+      - name: Run tests
+        run: vendor/bin/phpunit

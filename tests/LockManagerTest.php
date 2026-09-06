@@ -6,7 +6,9 @@ namespace Ols\PhpFts\Tests;
 
 use Ols\PhpFts\LockManager;
 use PHPUnit\Framework\Attributes\Test;
+use Ols\PhpFts\Exception\LockException;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
+use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -152,6 +154,7 @@ class LockManagerTest extends TestCase
 
     #[Test]
     #[RequiresOperatingSystemFamily('Linux')]
+    #[RequiresPhpExtension('posix')]
     public function acquire_detects_stale_lock_and_recovers(): void
     {
         // PID 999999 : très vraisemblablement inexistant sur Linux
@@ -168,6 +171,7 @@ class LockManagerTest extends TestCase
 
     #[Test]
     #[RequiresOperatingSystemFamily('Linux')]
+    #[RequiresPhpExtension('posix')]
     public function acquire_after_stale_recovery_writes_correct_pid(): void
     {
         $this->simulateForeignLock(999999);
@@ -178,6 +182,49 @@ class LockManagerTest extends TestCase
         $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
 
         $lm->release();
+    }
+
+    /**
+     * The age-based path is the only recovery available on Windows and on any
+     * host without ext-posix, so it must work with a PID that is very much alive.
+     */
+    #[Test]
+    public function acquire_reclaims_a_lock_older_than_the_maximum_age(): void
+    {
+        $this->simulateForeignLock(getmypid());
+        touch($this->lockDir(), time() - 600);
+        clearstatcache(true, $this->lockDir());
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
+        $lm->acquire();
+
+        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
+
+        $lm->release();
+    }
+
+    #[Test]
+    public function acquire_does_not_reclaim_a_lock_within_the_maximum_age(): void
+    {
+        $this->simulateForeignLock(getmypid());
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 300);
+
+        $this->expectException(LockException::class);
+        $lm->acquire();
+    }
+
+    #[Test]
+    public function maximum_age_can_be_disabled(): void
+    {
+        $this->simulateForeignLock(getmypid());
+        touch($this->lockDir(), time() - 100_000);
+        clearstatcache(true, $this->lockDir());
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 0);
+
+        $this->expectException(LockException::class);
+        $lm->acquire();
     }
 
     #[Test]
