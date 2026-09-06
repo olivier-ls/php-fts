@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+use Ols\PhpFts\Exception\StorageException;
+
 /**
  * TrigramIndex
  *
@@ -29,6 +31,8 @@ namespace Ols\PhpFts;
  */
 class TrigramIndex
 {
+    use OpensIndexFile;
+
     private const MAGIC         = 'TRIG';
     private const VERSION       = 1;
     private const HEADER_SIZE   = 16;
@@ -62,7 +66,7 @@ class TrigramIndex
      * Ends bulk mode and rewrites the entire entries block in one sequential
      * fwrite (~810 KB). Far cheaper than N individual seeks.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function flush(): void
     {
@@ -86,17 +90,11 @@ class TrigramIndex
      * Creates it with 50 653 zero entries if it does not exist.
      * Loads everything into memory if it already exists.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function open(string $path): void
     {
-        $isNew = !file_exists($path);
-
-        $this->handle = fopen($path, $isNew ? 'w+b' : 'r+b');
-
-        if ($this->handle === false) {
-            throw new RuntimeException("Unable to open file: $path");
-        }
+        [$this->handle, $isNew] = $this->openIndexFile($path);
 
         if ($isNew) {
             $this->writeHeader();
@@ -112,7 +110,7 @@ class TrigramIndex
      * In-memory read only — no I/O.
      *
      * @return array{offset: int, capacity: int, count: int}
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function get(string $trigram): array
     {
@@ -126,7 +124,7 @@ class TrigramIndex
      * Updates [offset, capacity, count] for a trigram.
      * Writes to memory AND to the exact position on disk.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function set(string $trigram, int $offset, int $capacity, int $count): void
     {
@@ -173,12 +171,12 @@ class TrigramIndex
      * Converts a trigram to a numeric index.
      * index = c1 × 37² + c2 × 37 + c3
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function trigramToIndex(string $trigram): int
     {
         if (strlen($trigram) !== 3) {
-            throw new RuntimeException("A trigram must be exactly 3 characters: '$trigram'");
+            throw new StorageException("A trigram must be exactly 3 characters: '$trigram'");
         }
 
         $index = 0;
@@ -187,7 +185,7 @@ class TrigramIndex
             $pos = strpos(self::ALPHABET, $trigram[$i]);
 
             if ($pos === false) {
-                throw new RuntimeException(
+                throw new StorageException(
                     "Invalid character in trigram '$trigram': '{$trigram[$i]}'"
                 );
             }
@@ -225,7 +223,7 @@ class TrigramIndex
     /**
      * Loads all entries from the file into memory.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function loadAll(): void
     {
@@ -235,7 +233,7 @@ class TrigramIndex
             $data = fread($this->handle, self::ENTRY_SIZE);
 
             if ($data === false || strlen($data) < self::ENTRY_SIZE) {
-                throw new RuntimeException("File truncated at entry $i");
+                throw new StorageException("File truncated at entry $i");
             }
 
             ['lo' => $lo, 'hi' => $hi, 'capacity' => $capacity, 'count' => $count]
@@ -250,7 +248,7 @@ class TrigramIndex
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function validateHeader(): void
     {
@@ -258,28 +256,28 @@ class TrigramIndex
         $header = fread($this->handle, self::HEADER_SIZE);
 
         if ($header === false || strlen($header) < self::HEADER_SIZE) {
-            throw new RuntimeException('Unreadable header or file too short');
+            throw new StorageException('Unreadable header or file too short');
         }
 
         $magic   = substr($header, 0, 4);
         $version = ord($header[4]);
 
         if ($magic !== self::MAGIC) {
-            throw new RuntimeException("Invalid magic number: expected 'TRIG', got '$magic'");
+            throw new StorageException("Invalid magic number: expected 'TRIG', got '$magic'");
         }
 
         if ($version !== self::VERSION) {
-            throw new RuntimeException("Unsupported version: $version");
+            throw new StorageException("Unsupported version: $version");
         }
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function assertOpen(): void
     {
         if ($this->handle === null) {
-            throw new RuntimeException("File is not open. Call open() first.");
+            throw new StorageException("File is not open. Call open() first.");
         }
     }
 }

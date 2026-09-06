@@ -4,6 +4,11 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+require_once __DIR__ . '/Exception/FtsException.php';
+require_once __DIR__ . '/Exception/StorageException.php';
+require_once __DIR__ . '/Exception/LockException.php';
+require_once __DIR__ . '/Exception/FilterException.php';
+require_once __DIR__ . '/OpensIndexFile.php';
 require_once __DIR__ . '/DocumentStorage.php';
 require_once __DIR__ . '/TombstoneStorage.php';
 require_once __DIR__ . '/PostingsStorage.php';
@@ -11,18 +16,15 @@ require_once __DIR__ . '/TrigramIndex.php';
 require_once __DIR__ . '/Tokenizer.php';
 require_once __DIR__ . '/LockManager.php';
 
+use Ols\PhpFts\Exception\FilterException;
+use Ols\PhpFts\Exception\FtsException;
+use Ols\PhpFts\Exception\StorageException;
+
 /**
  * SearchEngine
  *
  * Single responsibility: orchestrate the components to expose
  * a simple API — insert, delete, search, compact.
- *
- * Applied fixes:
- *   - compact()  : lock acquired before any operation + finally guarantees release
- *                  + $acquiredLock captured before $this->open() overwrites $this->lock
- *                  + glob() ?: [] to avoid foreach on false
- *   - update()   : atomic via doInsert() / doDelete() — single lock
- *   - insertBulk(): duplicated code removed, uses doInsert()
  */
 class SearchEngine
 {
@@ -55,12 +57,12 @@ class SearchEngine
      * The sentinel is removed and compact() is run automatically to rebuild a
      * consistent index from the documents already written to documents.bin.
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function open(string $directory, int $lockTimeout = 5): void
     {
         if (!is_dir($directory) && !mkdir($directory, 0755, true)) {
-            throw new RuntimeException("Unable to create directory: $directory");
+            throw new StorageException("Unable to create directory: $directory");
         }
 
         $this->directory   = rtrim($directory, '/');
@@ -89,7 +91,7 @@ class SearchEngine
      * Inserts a document and updates the index.
      *
      * @return int doc_id
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function insert(array $document): int
     {
@@ -113,7 +115,7 @@ class SearchEngine
      *   index from the documents already persisted in documents.bin.
      *
      * @return int[] doc_ids
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function insertBulk(array $documents): array
     {
@@ -181,7 +183,7 @@ class SearchEngine
      * Atomic: delete + insert under a single lock.
      * Returns the new doc_id — different from the old one.
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function update(int $docId, array $newDocument): int
     {
@@ -196,7 +198,7 @@ class SearchEngine
     /**
      * Deletes a document (soft delete via tombstone).
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function delete(int $docId): void
     {
@@ -240,10 +242,11 @@ class SearchEngine
      *                                   'excerpt' => true,                   // true = extract a window around the match
      *                                                                        // false = full field with matched words wrapped
      *                                   'window'  => 5,                      // words of context on each side (excerpt mode only)
+     *                                   'escape'  => true,                   // HTML-escape field text before wrapping it
      *                                 ]
      *
      * @return array<array{docId: int, score: float, document: array, highlights?: array}>
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function search(string $query, int $limit = 20, int $maxCandidates = 5000, array $boosts = [], array $filters = [], bool $highlight = false, array $highlightOptions = []): array
     {
@@ -331,7 +334,7 @@ class SearchEngine
     /**
      * Returns the number of indexed documents (excluding deletions).
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function count(): int
     {
@@ -344,7 +347,7 @@ class SearchEngine
      * Returns the fragmentation rate as a percentage (0-100).
      * 0 = no deletions, 100 = all documents are deleted.
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function fragmentationRate(): int
     {
@@ -373,7 +376,7 @@ class SearchEngine
      *   - $acquiredLock captured before $this->open() overwrites $this->lock
      *   - glob() ?: [] — avoids foreach on false if directory is empty or unreadable
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function compact(): void
     {
@@ -389,7 +392,7 @@ class SearchEngine
 
         if (!is_dir($tmpDir) && !mkdir($tmpDir, 0755, true)) {
             $acquiredLock->release();
-            throw new RuntimeException("Unable to create temporary directory: $tmpDir");
+            throw new StorageException("Unable to create temporary directory: $tmpDir");
         }
 
         try {
@@ -470,7 +473,7 @@ class SearchEngine
 
             foreach ($files as $file) {
                 if (!rename($tmpDir . '/' . $file, $this->directory . '/' . $file)) {
-                    throw new RuntimeException("Unable to rename $file — index may be partially corrupted");
+                    throw new StorageException("Unable to rename $file — index may be partially corrupted");
                 }
             }
 
@@ -479,7 +482,7 @@ class SearchEngine
             // $this->lock is reassigned here — that is why $acquiredLock was captured above
             $this->open($this->directory, $this->lockTimeout);
 
-        } catch (Throwable $e) {
+        } catch (\Throwable $e) {
             foreach (glob($tmpDir . '/*') ?: [] as $file) {
                 unlink($file);
             }
@@ -488,7 +491,7 @@ class SearchEngine
                 rmdir($tmpDir);
             }
 
-            throw new RuntimeException('Compaction failed: ' . $e->getMessage(), 0, $e);
+            throw new StorageException('Compaction failed: ' . $e->getMessage(), 0, $e);
 
         } finally {
             // Guaranteed release in all cases — success or exception
@@ -500,7 +503,7 @@ class SearchEngine
      * Resets the engine.
      * Deletes all binary files and recreates them empty.
      *
-     * @throws RuntimeException
+     * @throws FtsException
      */
     public function reset(): void
     {
@@ -805,13 +808,13 @@ class SearchEngine
     {
         // AND block — all must pass
         foreach ($filters['and'] ?? [] as $filter) {
-            $field = $filter['field'];
+            [$field, $op, $value] = $this->normaliseFilter($filter);
 
             if (!array_key_exists($field, $document)) {
                 return false;
             }
 
-            if (!$this->matchesSingleFilter($document[$field], $filter['op'], $filter['value'])) {
+            if (!$this->matchesSingleFilter($document[$field], $op, $value)) {
                 return false;
             }
         }
@@ -823,13 +826,13 @@ class SearchEngine
             $orPassed = false;
 
             foreach ($orFilters as $filter) {
-                $field = $filter['field'];
+                [$field, $op, $value] = $this->normaliseFilter($filter);
 
                 if (!array_key_exists($field, $document)) {
                     continue;
                 }
 
-                if ($this->matchesSingleFilter($document[$field], $filter['op'], $filter['value'])) {
+                if ($this->matchesSingleFilter($document[$field], $op, $value)) {
                     $orPassed = true;
                     break;
                 }
@@ -844,6 +847,34 @@ class SearchEngine
     }
 
     /**
+     * Validates the shape of a single filter and returns [field, op, value].
+     *
+     * A malformed filter used to surface as an "Undefined array key" warning
+     * and a silent mismatch; it is now an explicit error.
+     *
+     * @return array{0: string, 1: string, 2: mixed}
+     * @throws FilterException
+     */
+    private function normaliseFilter(mixed $filter): array
+    {
+        if (!is_array($filter)) {
+            throw new FilterException('Each filter must be an array with keys: field, op, value');
+        }
+
+        foreach (['field', 'op', 'value'] as $key) {
+            if (!array_key_exists($key, $filter)) {
+                throw new FilterException("Filter is missing the '$key' key");
+            }
+        }
+
+        if (!is_string($filter['field']) || !is_string($filter['op'])) {
+            throw new FilterException("Filter keys 'field' and 'op' must be strings");
+        }
+
+        return [$filter['field'], $filter['op'], $filter['value']];
+    }
+
+    /**
      * Tests a single filter against a field value.
      *
      * Supported operators:
@@ -852,23 +883,86 @@ class SearchEngine
      *   in, not in          → int, float, string  (value must be an array)
      *   contains, not contains → array            (fieldValue must be an array)
      *
-     * @throws RuntimeException if the operator is unknown
+     * @throws FtsException if the operator is unknown
      */
     private function matchesSingleFilter(mixed $fieldValue, string $op, mixed $expected): bool
     {
         return match ($op) {
-            '='         => $fieldValue == $expected,
-            '!='        => $fieldValue != $expected,
-            '>'         => is_numeric($fieldValue) && $fieldValue > $expected,
-            '>='        => is_numeric($fieldValue) && $fieldValue >= $expected,
-            '<'         => is_numeric($fieldValue) && $fieldValue < $expected,
-            '<='        => is_numeric($fieldValue) && $fieldValue <= $expected,
-            'in'        => is_array($expected) && in_array($fieldValue, $expected, strict: false),
-            'not in'    => is_array($expected) && !in_array($fieldValue, $expected, strict: false),
-            'contains'     => is_array($fieldValue) && in_array($expected, $fieldValue, strict: false),
-            'not contains' => is_array($fieldValue) && !in_array($expected, $fieldValue, strict: false),
-            default     => throw new RuntimeException("Unknown filter operator: '$op'"),
+            '='  => $this->valuesEqual($fieldValue, $expected),
+            '!=' => !$this->valuesEqual($fieldValue, $expected),
+
+            '>'  => $this->bothNumeric($fieldValue, $expected) && $fieldValue >  $expected,
+            '>=' => $this->bothNumeric($fieldValue, $expected) && $fieldValue >= $expected,
+            '<'  => $this->bothNumeric($fieldValue, $expected) && $fieldValue <  $expected,
+            '<=' => $this->bothNumeric($fieldValue, $expected) && $fieldValue <= $expected,
+
+            'in'     => $this->valueInList($fieldValue, $expected),
+            'not in' => !$this->valueInList($fieldValue, $expected),
+
+            // Both require the document field to actually be an array: a
+            // wrongly-typed field rejects the document, as in 1.1.2.
+            'contains'     => is_array($fieldValue) && $this->listContains($fieldValue, $expected),
+            'not contains' => is_array($fieldValue) && !$this->listContains($fieldValue, $expected),
+
+            default => throw new FilterException("Unknown filter operator: '$op'"),
         };
+    }
+
+    /**
+     * Type-safe equality.
+     *
+     * PHP's `==` treats any non-empty string as equal to `true`, so a filter
+     * value of `true` used to match every document with a non-empty string in
+     * that field — enough to defeat a filter used for ownership or tenant
+     * scoping. Comparison is therefore identity-based, with one deliberate
+     * exception: int and float are compared numerically, because JSON round
+     * trips move values between the two.
+     */
+    private function valuesEqual(mixed $fieldValue, mixed $expected): bool
+    {
+        if ($this->bothNumeric($fieldValue, $expected)) {
+            return (float) $fieldValue === (float) $expected;
+        }
+
+        return $fieldValue === $expected;
+    }
+
+    private function bothNumeric(mixed $a, mixed $b): bool
+    {
+        return (is_int($a) || is_float($a)) && (is_int($b) || is_float($b));
+    }
+
+    /**
+     * @throws FilterException if the expected value is not a list
+     */
+    private function valueInList(mixed $fieldValue, mixed $expected): bool
+    {
+        if (!is_array($expected)) {
+            throw new FilterException("Operator 'in' expects an array of values");
+        }
+
+        foreach ($expected as $candidate) {
+            if ($this->valuesEqual($fieldValue, $candidate)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function listContains(mixed $fieldValue, mixed $expected): bool
+    {
+        if (!is_array($fieldValue)) {
+            return false;
+        }
+
+        foreach ($fieldValue as $candidate) {
+            if ($this->valuesEqual($candidate, $expected)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // -------------------------------------------------------------------------
@@ -918,10 +1012,16 @@ class SearchEngine
      */
     private function buildHighlights(array $document, array $queryTrigrams, array $options): array
     {
-        $openTag    = $options['tags'][0]  ?? '<mark>';
-        $closeTag   = $options['tags'][1]  ?? '</mark>';
+        $openTag     = $options['tags'][0]  ?? '<mark>';
+        $closeTag    = $options['tags'][1]  ?? '</mark>';
         $excerptMode = $options['excerpt'] ?? true;
-        $window     = max(1, (int) ($options['window'] ?? 5));
+        $window      = max(1, (int) ($options['window'] ?? 5));
+
+        // Highlights are HTML by construction — they carry the open/close tags —
+        // and indexed content is routinely user-supplied. Field text is therefore
+        // escaped before the tags are inserted, so the result is safe to render.
+        // Set 'escape' => false only if the caller escapes downstream itself.
+        $escape = $options['escape'] ?? true;
 
         $querySet   = array_flip($queryTrigrams);
         $highlights = [];
@@ -953,7 +1053,11 @@ class SearchEngine
                     }
                 }
 
-                $processedWords[$i] = $hasMatch ? $openTag . $word . $closeTag : $word;
+                $safeWord = $escape
+                    ? htmlspecialchars($word, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
+                    : $word;
+
+                $processedWords[$i] = $hasMatch ? $openTag . $safeWord . $closeTag : $safeWord;
 
                 if ($hasMatch) {
                     $matchedPositions[] = $i;
@@ -996,7 +1100,7 @@ class SearchEngine
     private function assertOpen(): void
     {
         if (!$this->open) {
-            throw new RuntimeException("Engine is not open. Call open() first.");
+            throw new FtsException("Engine is not open. Call open() first.");
         }
     }
 

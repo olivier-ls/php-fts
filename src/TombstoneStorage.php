@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+use Ols\PhpFts\Exception\StorageException;
+
 /**
  * TombstoneStorage
  *
@@ -15,6 +17,8 @@ namespace Ols\PhpFts;
  */
 class TombstoneStorage
 {
+    use OpensIndexFile;
+
     private const MAGIC       = 'TOMB';
     private const VERSION     = 1;
     private const HEADER_SIZE = 16;
@@ -30,20 +34,11 @@ class TombstoneStorage
      * Opens the file. Creates it with the header if it does not exist.
      * Loads all existing doc_ids into memory.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function open(string $path): void
     {
-        $this->handle = @fopen($path, 'r+b');
-        $isNew = ($this->handle === false);
-
-        if ($isNew) {
-            $this->handle = fopen($path, 'w+b');
-        }
-
-        if ($this->handle === false) {
-            throw new RuntimeException("Unable to open file: $path");
-        }
+        [$this->handle, $isNew] = $this->openIndexFile($path);
 
         if ($isNew) {
             $this->writeHeader();
@@ -57,7 +52,7 @@ class TombstoneStorage
      * Marks a doc_id as deleted.
      * Writes it to disk and updates the in-memory array.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function add(int $docId): void
     {
@@ -77,7 +72,7 @@ class TombstoneStorage
      * Returns true if the doc_id is deleted.
      * In-memory lookup only — no I/O.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function isDeleted(int $docId): bool
     {
@@ -91,7 +86,7 @@ class TombstoneStorage
      * Useful for compaction.
      *
      * @return int[]
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function getAll(): array
     {
@@ -103,7 +98,7 @@ class TombstoneStorage
     /**
      * Returns the number of deleted doc_ids.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function count(): int
     {
@@ -137,7 +132,7 @@ class TombstoneStorage
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function validateHeader(): void
     {
@@ -145,18 +140,18 @@ class TombstoneStorage
         $header = fread($this->handle, self::HEADER_SIZE);
 
         if ($header === false || strlen($header) < self::HEADER_SIZE) {
-            throw new RuntimeException('Unreadable header or file too short');
+            throw new StorageException('Unreadable header or file too short');
         }
 
         $magic   = substr($header, 0, 4);
         $version = ord($header[4]);
 
         if ($magic !== self::MAGIC) {
-            throw new RuntimeException("Invalid magic number: expected 'TOMB', got '$magic'");
+            throw new StorageException("Invalid magic number: expected 'TOMB', got '$magic'");
         }
 
         if ($version !== self::VERSION) {
-            throw new RuntimeException("Unsupported version: $version");
+            throw new StorageException("Unsupported version: $version");
         }
     }
 
@@ -180,12 +175,12 @@ class TombstoneStorage
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function assertOpen(): void
     {
         if ($this->handle === null) {
-            throw new RuntimeException("File is not open. Call open() first.");
+            throw new StorageException("File is not open. Call open() first.");
         }
     }
 }

@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.1.3] — 2026-09-06
+
+Security and correctness release. No format change — existing indexes are read
+and written unchanged.
+
+### Security
+
+#### Stored XSS in highlights ([#1])
+
+`buildHighlights()` concatenated document text with HTML tags without escaping
+it. An application indexing user-supplied content and rendering `highlights` as
+HTML would execute whatever markup the document contained.
+
+Field text is now escaped with `htmlspecialchars()` before the open/close tags
+are inserted. The new `'escape' => false` option restores the previous behaviour
+for callers that escape downstream themselves.
+
+**This changes output.** If you already escaped highlights yourself, either drop
+that escaping or pass `'escape' => false`.
+
+#### Filter bypass by type juggling ([#2])
+
+Filters compared with `==` and `in_array(..., strict: false)`. PHP considers any
+non-empty string equal to `true`, so a filter value of `true` matched every
+document with a non-empty string in that field — enough to defeat a filter used
+for ownership or tenant scoping.
+
+Comparisons are now type-strict, with one deliberate exception: `int` and `float`
+compare numerically, because JSON round trips move values between the two.
+
+Malformed filters — a missing `field`/`op`/`value` key, a non-string operator,
+`in` without an array — now raise `FilterException` instead of emitting a warning
+and silently failing to match.
+
+**This changes behaviour.** `'42'` no longer matches `42`. Cast request input to
+the intended type before building filters.
+
+#### Symlink following when opening index files ([#3])
+
+All four storage classes opened index files in a way that followed symbolic
+links, and `TrigramIndex` additionally used a `file_exists()` + `fopen()`
+two-step with a TOCTOU window. An attacker able to write to the index directory
+could pre-place a link and have the engine create or truncate a file elsewhere.
+
+Opening now goes through `OpensIndexFile`, which creates files with `x+b`
+(`O_CREAT|O_EXCL`, which the kernel refuses to satisfy through a symlink) and
+verifies for existing files that the descriptor and the path resolve to the same
+inode.
+
+### Fixed
+
+#### Every thrown exception was a fatal error
+
+`src/` threw `RuntimeException` from inside `namespace Ols\PhpFts` with no
+import. PHP resolves unqualified class names to the current namespace and does
+not fall back to the global one, so every `throw` actually raised
+`Error: Class "Ols\PhpFts\RuntimeException" not found`, and the whole error
+handling path was dead — as was `catch (Throwable $e)` in `compact()`, which
+resolved to a non-existent `Ols\PhpFts\Throwable` and never caught anything.
+
+Introduced a proper hierarchy under `Ols\PhpFts\Exception`:
+
+| Class | Thrown for |
+|---|---|
+| `FtsException` | base class, extends `\RuntimeException` |
+| `StorageException` | file open/read/write, corrupt or unsupported index files |
+| `LockException` | the write lock could not be acquired |
+| `FilterException` | malformed filter or unknown operator |
+
+`FtsException` extends `\RuntimeException`, so existing `catch (\RuntimeException)`
+code keeps working.
+
+#### `LockManager` crashed without ext-posix
+
+`posix_kill()` was called without a `function_exists()` guard. `ext-posix` is not
+a dependency and is frequently listed in `disable_functions` on shared hosting,
+so stale-lock detection raised a fatal error on exactly the platform the library
+targets.
+
+#### Orphaned locks could block an index forever on Windows
+
+Stale-lock detection relied entirely on the PID, and was disabled on Windows. A
+process that died while holding the lock left it in place with no recovery path.
+
+A lock older than `maxAgeSeconds` (default 300, new optional third constructor
+argument) is now treated as abandoned on every platform.
+
+### Added
+
+- `src/autoload.php` — the standalone autoloader the README has always
+  documented, and which did not exist.
+- `phpunit.xml`, GitHub Actions CI (PHP 8.1–8.4 on Linux, plus Windows and
+  macOS), and a job that runs the suite with neither `ext-intl` nor `ext-posix`
+  installed.
+- PHPStan level 5 on `src`, clean.
+- `SECURITY.md` with a reporting process and an explicit threat model.
+- `tests/SecurityTest.php` — regression tests for all three issues.
+
+### Changed
+
+- `phpunit/phpunit` widened to `^10.5 || ^11.0` so the suite can run on PHP 8.1,
+  which the library supports but PHPUnit 11 does not.
+
+### Documentation
+
+- Removed the claim that BM25 term-frequency saturation applies. Trigrams are
+  deduplicated per document, so `tf` is always 1 and `k1` has no effect.
+- Removed the claim that scores can be used to build facet counts. There is no
+  facet or aggregation API, and `search()` reports neither a total nor an offset.
+- Documented the highlighting API, which was implemented but absent from the
+  README.
+- Added a Security section, and a warning to keep the index directory outside
+  the web root.
+
+### Notes
+
+Two assertions in `TokenizerTest` were wrong and had never been run:
+`tokenize_deduplicates_identical_trigrams` asserted that a trigram appears twice
+*after* deduplication, and the HTML-entity test expected `&euro;` to normalise to
+the text `euro`. Both were corrected to assert actual behaviour.
+
+[#1]: https://github.com/olivier-ls/php-fts/issues/1
+[#2]: https://github.com/olivier-ls/php-fts/issues/2
+[#3]: https://github.com/olivier-ls/php-fts/issues/3
+
+---
+
 ## [1.1.2] — 2026-05-17
 
 ### Performance

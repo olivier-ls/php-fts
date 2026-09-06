@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+use Ols\PhpFts\Exception\LockException;
+
 /**
  * LockManager
  *
@@ -30,7 +32,8 @@ class LockManager
 
     public function __construct(
         private readonly string $directory,
-        private readonly int    $timeoutSeconds = 5
+        private readonly int    $timeoutSeconds = 5,
+        private readonly int    $maxAgeSeconds  = 300
     ) {
         $this->lockDir = $directory . '/' . self::LOCK_DIR;
         $this->pidFile = $directory . '/' . self::PID_FILE;
@@ -41,7 +44,7 @@ class LockManager
      * Retries every 50ms until timeout.
      * Detects and cleans up orphaned locks (dead process).
      *
-     * @throws RuntimeException if the lock cannot be acquired within the timeout
+     * @throws LockException if the lock cannot be acquired within the timeout
      */
     public function acquire(): void
     {
@@ -64,7 +67,7 @@ class LockManager
 
             // Timeout exceeded
             if (microtime(true) >= $deadline) {
-                throw new RuntimeException(
+                throw new LockException(
                     "Unable to acquire lock after {$this->timeoutSeconds}s. " .
                     "Another process may be stuck in: {$this->lockDir}"
                 );
@@ -92,7 +95,7 @@ class LockManager
      * Executes a callable under lock.
      * Guarantees release even if an exception is thrown.
      *
-     * @throws RuntimeException
+     * @throws LockException
      */
     public function withLock(callable $fn): mixed
     {
@@ -114,6 +117,13 @@ class LockManager
      */
     private function isStale(): bool
     {
+        // A lock older than the maximum age is considered abandoned whatever the
+        // PID says. This is the only recovery path on Windows, and the safety net
+        // when posix_kill() is unavailable or the PID has been recycled.
+        if ($this->isExpired()) {
+            return true;
+        }
+
         if (!file_exists($this->pidFile)) {
             return false;
         }
@@ -124,14 +134,32 @@ class LockManager
             return true;
         }
 
-        // On Linux/Unix: kill(pid, 0) returns false if the process does not exist
-        // On Windows: cannot check, assume not stale
-        if (PHP_OS_FAMILY === 'Windows') {
+        // posix_kill() with signal 0 does not kill anything — it only reports
+        // whether the process exists. ext-posix is not always installed, and is
+        // frequently listed in disable_functions on shared hosting.
+        if (PHP_OS_FAMILY === 'Windows' || !function_exists('posix_kill')) {
             return false;
         }
 
-        // posix_kill with signal 0 does not kill the process — just checks if it exists
         return !posix_kill($pid, 0);
+    }
+
+    /**
+     * True when the lock directory is older than the configured maximum age.
+     */
+    private function isExpired(): bool
+    {
+        if ($this->maxAgeSeconds <= 0) {
+            return false;
+        }
+
+        $createdAt = @filemtime($this->lockDir);
+
+        if ($createdAt === false) {
+            return false;
+        }
+
+        return (time() - $createdAt) > $this->maxAgeSeconds;
     }
 
     /**

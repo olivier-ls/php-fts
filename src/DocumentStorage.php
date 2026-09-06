@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+use Ols\PhpFts\Exception\StorageException;
+
 /**
  * DocumentStorage
  *
@@ -24,12 +26,13 @@ namespace Ols\PhpFts;
  */
 class DocumentStorage
 {
+    use OpensIndexFile;
+
     private const MAGIC              = 'DOCS';
     private const VERSION            = 4;
     private const HEADER_SIZE        = 16;
     private const RECORD_HEADER_SIZE = 8;
     private const COUNT_OFFSET       = 5;
-    private const TRIGRAM_SUM_OFFSET = 9;
 
     /** @var resource|null */
     private $handle = null;
@@ -59,20 +62,11 @@ class DocumentStorage
     /**
      * Opens the file. Creates it with the header if it does not exist.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function open(string $path): void
     {
-        $this->handle = @fopen($path, 'r+b');
-        $isNew = ($this->handle === false);
-
-        if ($isNew) {
-            $this->handle = fopen($path, 'w+b');
-        }
-
-        if ($this->handle === false) {
-            throw new RuntimeException("Unable to open file: $path");
-        }
+        [$this->handle, $isNew] = $this->openIndexFile($path);
 
         if ($isNew) {
             $this->count      = 0;
@@ -89,7 +83,7 @@ class DocumentStorage
      * Updates count and trigramSum in the header.
      * Returns the record offset (= future doc_id).
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function write(array $document, int $trigramCount = 0): int
     {
@@ -98,7 +92,7 @@ class DocumentStorage
         $json = json_encode($document, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
         if ($json === false) {
-            throw new RuntimeException('JSON serialization failed: ' . json_last_error_msg());
+            throw new StorageException('JSON serialization failed: ' . json_last_error_msg());
         }
 
         $length = strlen($json);
@@ -123,14 +117,14 @@ class DocumentStorage
      * Reads and returns the document at the given offset.
      *
      * @return array{document: array, trigramCount: int}
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function read(int $offset): array
     {
         $this->assertOpen();
 
         if ($offset < self::HEADER_SIZE) {
-            throw new RuntimeException("Invalid offset: $offset");
+            throw new StorageException("Invalid offset: $offset");
         }
 
         fseek($this->handle, $offset);
@@ -138,7 +132,7 @@ class DocumentStorage
         $header = fread($this->handle, self::RECORD_HEADER_SIZE);
 
         if ($header === false || strlen($header) < self::RECORD_HEADER_SIZE) {
-            throw new RuntimeException("Unable to read record header at offset $offset");
+            throw new StorageException("Unable to read record header at offset $offset");
         }
 
         $unpacked     = unpack('Vlength/VtrigramCount', $header);
@@ -148,13 +142,13 @@ class DocumentStorage
         $json = fread($this->handle, $length);
 
         if ($json === false || strlen($json) < $length) {
-            throw new RuntimeException("Corrupted data at offset $offset");
+            throw new StorageException("Corrupted data at offset $offset");
         }
 
         $document = json_decode($json, true);
 
         if ($document === null) {
-            throw new RuntimeException("JSON decoding failed at offset $offset");
+            throw new StorageException("JSON decoding failed at offset $offset");
         }
 
         return [
@@ -168,7 +162,7 @@ class DocumentStorage
      * Constant memory footprint — no intermediate array.
      *
      * @param callable(int, array, int): void $callback
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function iterate(callable $callback): void
     {
@@ -205,7 +199,7 @@ class DocumentStorage
     /**
      * Returns the number of written documents (including deleted ones).
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function count(): int
     {
@@ -217,7 +211,7 @@ class DocumentStorage
      * Returns the average document length in trigrams.
      * Used by BM25 for length normalization.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function avgTrigramCount(): float
     {
@@ -268,7 +262,7 @@ class DocumentStorage
         $data = fread($this->handle, 8);
 
         if ($data === false || strlen($data) < 8) {
-            throw new RuntimeException('Unable to read stats from header');
+            throw new StorageException('Unable to read stats from header');
         }
 
         $unpacked         = unpack('Vcount/VtrigramSum', $data);
@@ -282,25 +276,25 @@ class DocumentStorage
         $header = fread($this->handle, self::HEADER_SIZE);
 
         if ($header === false || strlen($header) < self::HEADER_SIZE) {
-            throw new RuntimeException('Unreadable header or file too short');
+            throw new StorageException('Unreadable header or file too short');
         }
 
         $magic   = substr($header, 0, 4);
         $version = ord($header[4]);
 
         if ($magic !== self::MAGIC) {
-            throw new RuntimeException("Invalid magic number: expected 'DOCS', got '$magic'");
+            throw new StorageException("Invalid magic number: expected 'DOCS', got '$magic'");
         }
 
         if ($version !== self::VERSION) {
-            throw new RuntimeException("Unsupported version: $version");
+            throw new StorageException("Unsupported version: $version");
         }
     }
 
     private function assertOpen(): void
     {
         if ($this->handle === null) {
-            throw new RuntimeException("File is not open. Call open() first.");
+            throw new StorageException("File is not open. Call open() first.");
         }
     }
 }

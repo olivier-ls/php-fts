@@ -18,3 +18,7 @@ Thumbs.db
 
 # PHP
 *.log
+
+# Tooling caches
+.phpunit.cache/
+.phpunit.result.cache

@@ -35,7 +35,7 @@ If you don't — or if you'd rather not — php-fts gives you solid full-text se
 
 - **Full-text search** with trigram indexing — tolerant to typos and partial matches
 - **BM25 + IDF scoring** — industry-standard relevance ranking (same algorithm as Lucene / Elasticsearch)
-- **Per-document score** — exposed in results, usable to build facet counts, sorting, or custom ranking
+- **Per-document score** — exposed on every result, usable for custom sorting or a relevance threshold
 - **Field boosting** — weight some fields (e.g. title) more than others
 - **Filters** — exact match, comparisons, range, `in`, `not in`, `contains` on array fields
 - **Combined AND / OR filtering** — flexible condition logic
@@ -159,7 +159,9 @@ Each result:
 ]
 ```
 
-The `score` field is available on every result and can be used to build facet counts, custom sorting, or relevance thresholds.
+The `score` field is available on every result and can be used for custom sorting or relevance thresholds.
+
+`search()` returns at most `limit` results and does not report how many documents matched in total. There is no `offset` parameter in 1.x, so it cannot paginate.
 
 ### Filters
 
@@ -192,6 +194,38 @@ A document missing a filtered field is excluded from results.
 | `>` `>=` `<` `<=`         | int, float               |
 | `in` `not in`             | int, float, string       |
 | `contains` `not contains` | array (document field)   |
+
+**Comparisons are strict** (since 1.1.3). A value only matches a field of the same
+type — the sole exception being `int` versus `float`, which compare numerically
+because JSON round trips move values between the two. So `'42'` does not match
+`42`, and `true` does not match `'Adidas'`.
+
+Cast request input to the right type before building a filter. A malformed filter
+(missing key, unknown operator, `in` without an array) throws
+`Ols\PhpFts\Exception\FilterException` rather than silently failing to match.
+
+### Highlighting
+
+```php
+$results = $engine->search('leather', highlight: true, highlightOptions: [
+    'tags'    => ['<mark>', '</mark>'],  // wrapping tags
+    'excerpt' => true,                   // window around the first match
+    'window'  => 5,                      // words of context on each side
+    'escape'  => true,                   // HTML-escape field text (default)
+]);
+
+echo $results[0]['highlights']['title'];  // Brown <mark>leather</mark> shoe
+```
+
+Only string fields containing a match appear in `highlights`.
+
+**Field text is HTML-escaped before the tags are inserted** (since 1.1.3), so the
+result is safe to render even when the indexed content came from users. Pass
+`'escape' => false` only if you escape downstream yourself.
+
+Matching is trigram-based: a word is highlighted when any of its trigrams appears
+in the query, which is deliberately generous and will sometimes wrap a word that
+merely shares a fragment with the search term.
 
 ### Update / Delete
 
@@ -230,13 +264,32 @@ search_data/
 
 Files are fully portable — copy them between servers without rebuilding.
 
+> **Keep this directory outside your web root.** `documents.bin` holds your
+> documents in readable form; if it is served over HTTP, your whole index is
+> downloadable. See [SECURITY.md](SECURITY.md).
+
+---
+
+## Security
+
+- **Put the index directory outside the web root.** The library cannot enforce it.
+- **Never build filters straight from request input.** Cast and whitelist first.
+  Strict comparisons stop type confusion, but they cannot know which fields a
+  given user is allowed to filter on.
+- **Highlights are HTML-escaped by default.** Only disable it if you escape later.
+- Index files are opened without following symbolic links, so a link pre-placed
+  in a shared directory cannot redirect a write.
+
+Reporting a vulnerability: see [SECURITY.md](SECURITY.md).
+
 ---
 
 ## Scoring
 
 Relevance is computed using **BM25 + IDF**:
 
-- **BM25** — term frequency saturation (a word appearing 10x doesn't score 10x higher) and document length normalization. Parameters: k1 = 1.5, b = 0.75 (standard Lucene defaults).
+- **BM25** — document length normalization, so a long description does not outrank a precise title. Parameters: k1 = 1.5, b = 0.75 (standard Lucene defaults).
+  Note: trigrams are deduplicated per document, so the term frequency is always 1 and the `k1` saturation term has no effect in practice. This is a known limitation of the 1.x scoring model.
 - **IDF** — a trigram present in every document contributes little; a rare trigram contributes a lot.
 - The final score is normalized between 0 and 100.
 

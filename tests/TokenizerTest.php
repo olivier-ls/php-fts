@@ -39,7 +39,15 @@ class TokenizerTest extends TestCase
     #[Test]
     public function normalize_decodes_html_entities_after_stripping_tags(): void
     {
-        $this->assertSame('prix en euros', $this->tokenizer->normalize('<p>prix en &euro;uros</p>'));
+        $this->assertSame('prix en cafe', $this->tokenizer->normalize('<p>prix en caf&eacute;</p>'));
+    }
+
+    #[Test]
+    public function normalize_drops_symbol_entities_that_have_no_ascii_equivalent(): void
+    {
+        // &euro; decodes to the € sign, which is not in the transliteration table
+        // and is not [a-z0-9], so it becomes a separator.
+        $this->assertSame('prix en uros', $this->tokenizer->normalize('<p>prix en &euro;uros</p>'));
     }
 
     #[Test]
@@ -240,8 +248,8 @@ class TokenizerTest extends TestCase
         // "aa aa" → word "aa" appears twice → trigrams #aa, aa# deduplicated
         $result = $this->tokenizer->tokenize('aa aa');
 
-        $this->assertCount(2, array_filter($result, fn($t) => $t === '#aa'));
         // After dedup, #aa must appear exactly once
+        $this->assertCount(1, array_filter($result, fn($t) => $t === '#aa'));
         $this->assertSame(1, count(array_keys($result, '#aa')));
     }
 

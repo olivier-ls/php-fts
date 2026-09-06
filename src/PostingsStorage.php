@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+use Ols\PhpFts\Exception\StorageException;
+
 /**
  * PostingsStorage
  *
@@ -25,6 +27,8 @@ namespace Ols\PhpFts;
  */
 class PostingsStorage
 {
+    use OpensIndexFile;
+
     private const MAGIC            = 'POST';
     private const VERSION          = 1;
     private const HEADER_SIZE      = 16;
@@ -38,20 +42,11 @@ class PostingsStorage
     /**
      * Opens the file. Creates it with the header if it does not exist.
      *
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function open(string $path): void
     {
-        $this->handle = @fopen($path, 'r+b');
-        $isNew = ($this->handle === false);
-
-        if ($isNew) {
-            $this->handle = fopen($path, 'w+b');
-        }
-
-        if ($this->handle === false) {
-            throw new RuntimeException("Unable to open file: $path");
-        }
+        [$this->handle, $isNew] = $this->openIndexFile($path);
 
         if ($isNew) {
             $this->writeHeader();
@@ -64,7 +59,7 @@ class PostingsStorage
      * Reads and returns the doc_ids of a list.
      *
      * @return int[]
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function read(int $offset, int $count): array
     {
@@ -79,7 +74,7 @@ class PostingsStorage
         $data = fread($this->handle, $count * self::ID_SIZE);
 
         if ($data === false || strlen($data) < $count * self::ID_SIZE) {
-            throw new RuntimeException("Corrupted data at offset $offset");
+            throw new StorageException("Corrupted data at offset $offset");
         }
 
         return array_values(unpack('V*', $data));
@@ -96,7 +91,7 @@ class PostingsStorage
      * The caller must update trigrams_index.bin if the offset has changed.
      *
      * @return array{offset: int, capacity: int, count: int}
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function append(int $docId, int $offset, int $capacity, int $count): array
     {
@@ -142,7 +137,7 @@ class PostingsStorage
      * @param int    $capacity   Current allocated capacity
      * @param int    $count      Current number of written doc_ids
      * @return array{offset: int, capacity: int, count: int}
-     * @throws RuntimeException
+     * @throws StorageException
      */
     public function appendBatch(array $newDocIds, int $offset, int $capacity, int $count): array
     {
@@ -234,7 +229,7 @@ class PostingsStorage
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function validateHeader(): void
     {
@@ -242,38 +237,38 @@ class PostingsStorage
         $header = fread($this->handle, self::HEADER_SIZE);
 
         if ($header === false || strlen($header) < self::HEADER_SIZE) {
-            throw new RuntimeException('Unreadable header or file too short');
+            throw new StorageException('Unreadable header or file too short');
         }
 
         $magic   = substr($header, 0, 4);
         $version = ord($header[4]);
 
         if ($magic !== self::MAGIC) {
-            throw new RuntimeException("Invalid magic number: expected 'POST', got '$magic'");
+            throw new StorageException("Invalid magic number: expected 'POST', got '$magic'");
         }
 
         if ($version !== self::VERSION) {
-            throw new RuntimeException("Unsupported version: $version");
+            throw new StorageException("Unsupported version: $version");
         }
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function assertOffset(int $offset): void
     {
         if ($offset < self::HEADER_SIZE) {
-            throw new RuntimeException("Invalid offset: $offset");
+            throw new StorageException("Invalid offset: $offset");
         }
     }
 
     /**
-     * @throws RuntimeException
+     * @throws StorageException
      */
     private function assertOpen(): void
     {
         if ($this->handle === null) {
-            throw new RuntimeException("File is not open. Call open() first.");
+            throw new StorageException("File is not open. Call open() first.");
         }
     }
 }
