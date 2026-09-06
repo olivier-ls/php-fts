@@ -101,9 +101,15 @@ $engine->search('кожаные');     // ✔
 $engine->search('جلدي');        // ✔
 ```
 
-Handled automatically: Unicode normalization (NFKC), full-width to half-width,
-hiragana/katakana folding, diacritic folding for Latin, Greek and Cyrillic, and
-n-gram size chosen per script (2 for CJK, 3 for alphabetic scripts).
+Handled automatically: full-width forms folded to ASCII, case folded across
+Latin, Greek and Cyrillic, combining marks dropped, diacritics folded to their
+base letter, and the n-gram size chosen per script — 2 for scripts written
+without spaces, 3 for the rest, with runs broken at script changes so a bigram
+never straddles the seam in 革靴ブラウン.
+
+Katakana is deliberately *not* folded to hiragana: it marks loanwords in
+Japanese, and erasing that makes distinct words collide. Half-width katakana
+folding is not implemented yet.
 
 Need control? Override per field:
 
