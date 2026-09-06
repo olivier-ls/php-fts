@@ -48,7 +48,7 @@ application chooses. That shapes what counts as a vulnerability:
 - Put the index directory **outside the web root**. It contains your documents
   in readable form.
 - Never build filters directly from unvalidated request input. Cast and
-  whitelist values first — `1.1.3` makes comparisons strict, which stops type
+  whitelist values first — `1.1.4` makes comparisons strict, which stops type
   confusion, but it cannot know which fields a given user may filter on.
 - Highlights are HTML-escaped by default. Only pass `'escape' => false` if you
   escape downstream yourself.

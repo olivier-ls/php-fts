@@ -14,7 +14,7 @@ use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
 /**
- * Regression tests for the issues fixed in 1.1.3.
+ * Regression tests for the issues fixed in 1.1.4.
  *
  * @see https://github.com/olivier-ls/php-fts/issues/1 stored XSS in highlights
  * @see https://github.com/olivier-ls/php-fts/issues/2 filter bypass by type juggling
