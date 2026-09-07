@@ -257,6 +257,14 @@ data instead of squeezing it:
 
 Constraint to document: highlighting a field requires that field to be stored.
 
+**Decided: no term positions, in 2.0 or later.** Highlighting is the only thing
+that would read them, and it reads them for at most `limit` documents per query
+— while the postings section would carry them for every document of every
+segment, forever. The field is re-analysed instead, at highlight time, by the
+same analyzer that indexed it: same rules, so the same terms, and each term
+knows the characters it came from. The index pays nothing, and a highlight can
+never disagree with what was indexed. See `Query\Highlighter`.
+
 ---
 
 ## 8. § meta

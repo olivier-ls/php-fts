@@ -334,4 +334,128 @@ class AnalyzerTest extends TestCase
         $this->assertSame(Script::Han, $runs[1]['script']);
         $this->assertSame('cuir', $runs[0]['bytes']);
     }
+
+    // =========================================================================
+    // Occurrences: the same terms, each pointing back at the text it came from
+    // =========================================================================
+
+    #[Test]
+    public function every_occurrence_spans_the_text_it_was_cut_from(): void
+    {
+        ['text' => $text, 'terms' => $terms] = $this->analyzer->occurrences('Brown leather shoe');
+
+        $this->assertSame('Brown leather shoe', $text);
+
+        foreach ($terms as [$term, $start, $end]) {
+            $span = substr($text, $start, $end - $start);
+
+            // A term is its own span, once the boundary markers — which are
+            // not text — are taken back off.
+            $this->assertSame(strtolower(trim($term, '#')), strtolower($span));
+        }
+    }
+
+    #[Test]
+    public function occurrences_are_not_deduplicated(): void
+    {
+        // Two places to mark, not one term. The offsets are what distinguishes
+        // them, which is the whole reason this exists next to analyze().
+        $terms = $this->analyzer->occurrences('cuir cuir')['terms'];
+
+        $this->assertCount(8, $terms);
+        $this->assertSame(['#cu', 0, 2, true], $terms[0]);
+        $this->assertSame(['#cu', 5, 7, true], $terms[4]);
+    }
+
+    #[Test]
+    public function the_text_of_an_occurrence_is_the_plain_text(): void
+    {
+        $raw = 'en <b>cuir</b> &amp; daim';
+
+        ['text' => $text, 'terms' => $terms] = $this->analyzer->occurrences($raw);
+
+        $this->assertSame('en cuir & daim', $text);
+
+        $starts = [];
+
+        foreach ($terms as [$term, $start]) {
+            $starts[$term] = $start;
+        }
+
+        // `daim` begins at byte 10 of the plain text and at byte 21 of the
+        // value the caller passed in. An offset means the former, which is why
+        // the text it indexes into is handed back with it.
+        $this->assertSame(10, $starts['#da']);
+        $this->assertSame(21, strpos($raw, 'daim'));
+    }
+
+    #[Test]
+    public function a_folded_away_mark_belongs_to_the_character_it_sat_on(): void
+    {
+        // "café" decomposed: the combining acute has no term of its own, so its
+        // bytes are attached to the `e` before it. Anything else would leave an
+        // orphan accent outside a highlighted span.
+        $decomposed = 'cafe' . "\xcc\x81";
+
+        ['text' => $text, 'terms' => $terms] = $this->analyzer->occurrences($decomposed);
+
+        $last = end($terms);
+
+        $this->assertSame('fe' . "\xcc\x81", substr($text, $last[1], $last[2] - $last[1]));
+    }
+
+    #[Test]
+    public function a_term_anchored_to_a_word_edge_says_so(): void
+    {
+        $terms = [];
+
+        foreach ($this->analyzer->occurrences('over')['terms'] as [$term, , , $edge]) {
+            $terms[$term] = $edge;
+        }
+
+        // `er#` describes how the word ends, and spans only two of its
+        // characters; `ove` is about its content. Highlighting is the caller
+        // of this distinction — a shared word ending is not a match.
+        $this->assertTrue($terms['er#']);
+        $this->assertTrue($terms['#ov']);
+        $this->assertFalse($terms['ove']);
+    }
+
+    #[Test]
+    public function a_marker_is_not_an_edge_when_the_term_is_the_whole_word(): void
+    {
+        // Both trigrams of "en" carry a marker, and both span the entire word:
+        // there is no content left for them to be missing.
+        foreach ($this->analyzer->occurrences('en')['terms'] as [, , , $edge]) {
+            $this->assertFalse($edge);
+        }
+
+        foreach ($this->analyzer->occurrences('a')['terms'] as [, , , $edge]) {
+            $this->assertFalse($edge);
+        }
+    }
+
+    #[Test]
+    public function a_continuous_script_has_no_edges_to_be_anchored_to(): void
+    {
+        foreach ($this->analyzer->occurrences('日本革靴業界')['terms'] as [, , , $edge]) {
+            $this->assertFalse($edge);
+        }
+    }
+
+    #[Test]
+    public function occurrences_agree_with_analyze(): void
+    {
+        // The property that makes highlighting trustworthy: it cannot mark
+        // anything the index did not index, because both come from here.
+        foreach (['Chaussure en cuir', '革靴 ブラウン', 'Коричневые туфли', 'iphone12', ''] as $text) {
+            $occurred = [];
+
+            foreach ($this->analyzer->occurrences($text)['terms'] as [$term]) {
+                $occurred[$term] = true;
+            }
+
+            $this->assertSame($this->analyzer->analyze($text), array_keys($occurred));
+        }
+    }
 }

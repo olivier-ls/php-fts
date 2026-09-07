@@ -487,15 +487,62 @@ $result = $engine->search('leather', highlight: ['title', 'description']);
 $hit->highlights['title'];   // 'Brown <mark>leather</mark> shoe'
 ```
 
+Only the fields that matched are present, so a template can fall back with
+`$hit->highlights['title'] ?? $hit->document['title']`.
+
 **Field values are HTML-escaped before the tags are inserted.** Indexed content
 is frequently user-supplied; highlights are safe to render.
 
 ```php
 Highlight::fields(['title'])
     ->tags('<b>', '</b>')
-    ->excerpt(window: 8)   // …context around the match…
+    ->excerpt(window: 40)  // …context around the match…
+    ->raw()                // insert the tags into the text as it stands
     ->positions();         // byte offsets instead of HTML, for non-HTML output
 ```
+
+`positions()` returns `['text' => …, 'spans' => [[start, end], …]]`, where the
+text is the field with markup stripped and entities decoded — the string those
+offsets index into, which is not the raw value you indexed.
+
+**The window is in characters, not words.** Words are not a unit that exists in
+every script this engine indexes; a Japanese sentence is one "word", and an
+excerpt of eight of them is the whole field. In a script that does use spaces,
+the cut is nudged outwards to the nearest one, so an excerpt still begins and
+ends on a word.
+
+**Highlighting a field requires that field to be stored** — the highlight is
+built by re-reading the field's own text. It does *not* require the field to be
+indexed: a `stored()` field highlights fine.
+
+### What is marked, and why it is not a word
+
+There are no term positions in the index. Positions would grow the postings of
+every document to serve at most `limit` of them per query; instead the field is
+re-analysed for the handful of documents actually being returned, by the same
+analyzer that indexed it. Re-analysing cannot disagree with what was indexed,
+because there is only one set of rules.
+
+Each term the analyzer produces knows the characters it was cut from. A query's
+terms are looked up, their spans are merged where they overlap, and the union is
+marked. `leather` becomes seven trigrams whose spans tile the word, so the union
+is `leather`; 革靴 becomes bigrams, and the same code marks it with no special
+case for the script. Nothing here knows what a word is, which is exactly why it
+works in scripts that have none.
+
+Two consequences worth knowing:
+
+- **A partial match is marked as a partial match.** Searching `shoe` marks
+  `snow⟦shoe⟧s`, and `leather` marks `w⟦eather⟧`. That is genuinely why the
+  document ranked, and 1.x could not say so — having only words, it wrapped the
+  whole one.
+- **A coincidence is not marked.** `leather` and `The` share the trigram `the`,
+  and `leather` and `over` share `er#`. Neither is marked: a span survives only
+  if every term the *document* produced inside it is one the query asked for,
+  and only if some term of it is about a word's content rather than its edge.
+  Ranking absorbs coincidences like these — one term out of seven barely scores
+  — but a highlight is either drawn or not, and drawn over `The` it makes the
+  engine look broken.
 
 ---
 

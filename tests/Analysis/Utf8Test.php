@@ -187,4 +187,40 @@ class Utf8Test extends TestCase
         $this->assertSame(3, strlen(Utf8::chr(0xFFFF)));
         $this->assertSame(4, strlen(Utf8::chr(0x10000)));
     }
+
+    #[Test]
+    public function offsets_are_reported_when_an_array_is_passed(): void
+    {
+        $offsets = [];
+        $text    = "a\u{00e9}\u{9769}";   // 1 + 2 + 3 bytes
+
+        $this->assertCount(3, Utf8::codepoints($text, $offsets));
+
+        // One entry per code point, plus the length as a sentinel, so that a
+        // character's bytes are always $offsets[$i] to $offsets[$i + 1].
+        $this->assertSame([0, 1, 3, 6], $offsets);
+    }
+
+    #[Test]
+    public function offsets_stay_true_across_an_invalid_byte(): void
+    {
+        // The reason offsets have to be reported rather than recomputed: this
+        // decodes to three code points, but U+FFFD consumed one byte where
+        // re-encoding it would take three, and everything after would drift.
+        $offsets = [];
+        $points  = Utf8::codepoints("a\xFFb", $offsets);
+
+        $this->assertSame([0x61, Utf8::REPLACEMENT, 0x62], $points);
+        $this->assertSame([0, 1, 2, 3], $offsets);
+    }
+
+    #[Test]
+    public function nothing_is_collected_unless_it_is_asked_for(): void
+    {
+        $offsets = null;
+
+        Utf8::codepoints('cuir', $offsets);
+
+        $this->assertNull($offsets);
+    }
 }

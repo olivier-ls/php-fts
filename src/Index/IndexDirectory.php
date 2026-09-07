@@ -7,12 +7,15 @@ namespace Ols\PhpFts\Index;
 use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
+use Ols\PhpFts\Exception\HighlightException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
+use Ols\PhpFts\Highlight;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\LockManager;
 use Ols\PhpFts\Query\CollectionStatistics;
+use Ols\PhpFts\Query\Highlighter;
 use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
@@ -425,9 +428,11 @@ final class IndexDirectory
      * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
      *        flat list of clauses, which are ANDed
      * @param array<mixed>        $facets  field names, or name => Facet
+     * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
      *
      * @throws CorruptSegmentException
      * @throws FilterException
+     * @throws HighlightException
      */
     public function search(
         string $query = '',
@@ -436,13 +441,26 @@ final class IndexDirectory
         Filter|array $filters = [],
         array $facets = [],
         array $boosts = [],
+        Highlight|array $highlight = [],
     ): SearchResult {
         $started = hrtime(true);
 
         // Parsed once here rather than once per segment: a malformed filter is
         // the caller's mistake, and it should be reported before any file is
         // touched rather than by whichever segment happened to be read first.
-        $filters = Filter::normalise($filters) ?? Filter::all();
+        $filters   = Filter::normalise($filters) ?? Filter::all();
+        $highlight = Highlight::normalise($highlight);
+        $terms     = [];
+
+        if ($highlight !== null) {
+            // Also checked here, and not only per segment, so that the answer
+            // does not depend on which segments happen to hold the page — and
+            // so that an index with no segments at all still reports a field
+            // name the schema does not have.
+            Highlighter::verify($highlight, $this->schema());
+
+            $terms = $this->segments === [] ? [] : reset($this->segments)->analyze($query);
+        }
 
         // Gathered before anything is scored: IDF describes how rare a term is
         // in the index, so it cannot be answered segment by segment without the
@@ -514,14 +532,28 @@ final class IndexDirectory
             $merged[$name] = $facet->limit($merged[$name] ?? []);
         }
 
-        $hits = [];
+        $hits    = [];
+        $markers = [];
+        $marked  = $highlight === null ? [] : array_fill_keys($terms, true);
 
         foreach (array_slice($top->drain(), max(0, $offset)) as [$score, $position, $ordinal]) {
             $document = $this->segments[$position]->documentAt($ordinal);
 
-            if ($document !== null) {
-                $hits[] = new Hit($this->segments[$position]->keyAt($ordinal), $score, $document);
+            if ($document === null) {
+                continue;
             }
+
+            $highlights = [];
+
+            if ($highlight !== null) {
+                // One highlighter per segment that actually contributed a hit,
+                // because each holds that segment's own analyzer. A search whose
+                // page comes from one segment builds one.
+                $markers[$position] ??= $this->segments[$position]->highlighter($highlight);
+                $highlights           = $markers[$position]->document($document, $marked, $highlight);
+            }
+
+            $hits[] = new Hit($this->segments[$position]->keyAt($ordinal), $score, $document, $highlights);
         }
 
         return new SearchResult($hits, $total, $merged, (hrtime(true) - $started) / 1e6);

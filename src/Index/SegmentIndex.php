@@ -8,10 +8,13 @@ use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
+use Ols\PhpFts\Exception\HighlightException;
 use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
+use Ols\PhpFts\Highlight;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\Query\CollectionStatistics;
+use Ols\PhpFts\Query\Highlighter;
 use Ols\PhpFts\Query\Scorer;
 use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\Schema;
@@ -204,9 +207,11 @@ final class SegmentIndex
      * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
      *        flat list of clauses, which are ANDed
      * @param array<mixed>        $facets  field names, or name => Facet
+     * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
      *
      * @throws CorruptSegmentException
      * @throws FilterException
+     * @throws HighlightException
      */
     public function search(
         string $query = '',
@@ -215,8 +220,16 @@ final class SegmentIndex
         Filter|array $filters = [],
         array $facets = [],
         array $boosts = [],
+        Highlight|array $highlight = [],
     ): SearchResult {
         $started = hrtime(true);
+
+        // Verified before a single posting list is read: a field that cannot be
+        // highlighted is the caller's mistake, and it should be reported as
+        // such rather than by every hit quietly missing a highlight.
+        $highlight = Highlight::normalise($highlight);
+        $marker    = $highlight === null ? null : $this->highlighter($highlight);
+        $marked    = $highlight === null ? [] : array_fill_keys($this->analyzer->analyze($query), true);
 
         $filter                = Filter::normalise($filters) ?? Filter::all();
         [$candidates, $scores] = $this->candidates($query, boosts: $boosts);
@@ -246,10 +259,30 @@ final class SegmentIndex
                 continue;
             }
 
-            $hits[] = new Hit($this->keyOf($ordinal), $score, $document);
+            $hits[] = new Hit(
+                $this->keyOf($ordinal),
+                $score,
+                $document,
+                $marker === null ? [] : $marker->document($document, $marked, $highlight),
+            );
         }
 
         return new SearchResult($hits, $total, $counted, (hrtime(true) - $started) / 1e6);
+    }
+
+    /**
+     * A highlighter for this segment, or none when nothing was asked for.
+     *
+     * It borrows the segment's own analyzer, which is the whole reason a
+     * re-analysed field is guaranteed to agree with what was indexed.
+     *
+     * @throws HighlightException
+     */
+    public function highlighter(Highlight $highlight): Highlighter
+    {
+        Highlighter::verify($highlight, $this->schema);
+
+        return new Highlighter($this->analyzer);
     }
 
     // -------------------------------------------------------------------------

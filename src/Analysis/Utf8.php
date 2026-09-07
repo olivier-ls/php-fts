@@ -57,15 +57,32 @@ final class Utf8
     /**
      * Decodes a UTF-8 string into code points.
      *
+     * @param int[]|null $offsets pass an array to also receive, for each code
+     *        point, its byte offset in $text — followed by one sentinel equal
+     *        to the string length, so that code point $i occupies the bytes
+     *        $offsets[$i] up to $offsets[$i + 1].
+     *
+     *        These cannot be recomputed from the code points afterwards: an
+     *        invalid byte yields U+FFFD while consuming a single byte, not the
+     *        three that U+FFFD encodes to, so a re-encode drifts from the
+     *        original exactly where the text is malformed. Highlighting needs
+     *        to point back into the caller's own bytes and therefore needs
+     *        them; indexing does not ask, and pays one null check per string.
+     *
      * @return int[]
      */
-    public static function codepoints(string $text): array
+    public static function codepoints(string $text, ?array &$offsets = null): array
     {
         $codepoints = [];
         $length     = strlen($text);
         $position   = 0;
+        $wanted     = $offsets !== null;
 
         while ($position < $length) {
+            if ($wanted) {
+                $offsets[] = $position;
+            }
+
             $byte = ord($text[$position]);
 
             if ($byte < 0x80) {
@@ -123,6 +140,10 @@ final class Utf8
 
             $codepoints[] = $value;
             $position    += $width;
+        }
+
+        if ($wanted) {
+            $offsets[] = $length;
         }
 
         return $codepoints;
