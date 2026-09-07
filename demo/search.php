@@ -1,13 +1,18 @@
 <?php
 
 /*
- * ⚠ Still on the 1.x API, and therefore broken on this branch: the engine it
- * calls was deleted with the rest of 1.x.
+ * The demo's search endpoint: one query, and everything the page needs.
  *
- * Not a mechanical port. This file runs five searches and counts facets in
- * userland, which is precisely what 2.x replaced with one query and
- * Facet::terms(exclude:). Rewriting it is worth doing properly, and worth
- * doing once multi-valued tags are filterable — the demo facets on them.
+ * ── What this file used to be ───────────────────────────────────────────────
+ *
+ * Six searches with `limit: 2000`, and the facets tallied in PHP by decoding
+ * every document that came back — twelve thousand deserialisations to draw one
+ * sidebar. The `total` it reported was `count($results)`, which is the page
+ * size, because nothing in 1.x could count matches without materialising them.
+ *
+ * All of that is now one call. The counting happens over bitsets and columns,
+ * so no document is read to count a facet, and `total` is the real number of
+ * matches across the whole index.
  */
 
 header('Content-Type: application/json');
@@ -22,211 +27,166 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 require __DIR__ . '/autoload.php';
 
+use Ols\PhpFts\Exception\FtsException;
+use Ols\PhpFts\Facet;
+use Ols\PhpFts\Filter;
+use Ols\PhpFts\Highlight;
 use Ols\PhpFts\SearchEngine;
+use Ols\PhpFts\Sort;
+
+const PAGE_SIZE = 48;
 
 // ---------------------------------------------------------------------------
-//  Parse input
+//  What the page asked for
 // ---------------------------------------------------------------------------
 
-$input = json_decode(file_get_contents('php://input'), true) ?? [];
+$input = json_decode(file_get_contents('php://input') ?: '', true) ?? [];
 
-$q         = trim($input['q']         ?? '');
-$fCat      = !empty($input['category'])  ? (array)$input['category']  : null;
-$fBrand    = !empty($input['brand'])     ? (array)$input['brand']      : null;
-$fGender   = !empty($input['gender'])   ? (string)$input['gender']     : null;
-$fPromo    = isset($input['promo'])     ? (bool)$input['promo']        : null;
-$fPriceMin = isset($input['price_min']) ? (float)$input['price_min']   : null;
-$fPriceMax = isset($input['price_max']) ? (float)$input['price_max']   : null;
+$query    = trim((string) ($input['q'] ?? ''));
+$category = array_values(array_filter((array) ($input['category'] ?? []), 'is_string'));
+$brand    = array_values(array_filter((array) ($input['brand'] ?? []), 'is_string'));
+$tags     = array_values(array_filter((array) ($input['tags'] ?? []), 'is_string'));
+$gender   = isset($input['gender']) ? (string) $input['gender'] : null;
+$onSale   = !empty($input['promo']);
+$priceMin = isset($input['price_min']) ? (float) $input['price_min'] : null;
+$priceMax = isset($input['price_max']) ? (float) $input['price_max'] : null;
 
-if ($q === '') {
-    echo json_encode(['total' => 0, 'results' => [], 'facets' => new stdClass()]);
+// ---------------------------------------------------------------------------
+//  One filter tree
+//
+//  Every clause the shopper controls carries a tag naming the facet it feeds.
+//  That tag is what lets the facet below see past its own clause — so picking
+//  Nike does not make the brand facet forget that Adidas exists.
+// ---------------------------------------------------------------------------
+
+$clauses = [
+    Filter::eq('active', true),
+    Filter::gt('stock', 0),
+];
+
+if ($category !== []) {
+    $clauses[] = Filter::in('category', $category)->tag('category');
+}
+
+if ($brand !== []) {
+    $clauses[] = Filter::in('brand', $brand)->tag('brand');
+}
+
+if ($tags !== []) {
+    // A multi-valued field: this asks for products whose tag list holds any of
+    // the tags picked.
+    $clauses[] = Filter::in('tags', $tags)->tag('tags');
+}
+
+if ($gender !== null && $gender !== '') {
+    $clauses[] = Filter::eq('gender', $gender)->tag('gender');
+}
+
+if ($onSale) {
+    // `promo` is a discount or nothing at all, so "on sale" is presence.
+    $clauses[] = Filter::exists('promo')->tag('promo');
+}
+
+if ($priceMin !== null || $priceMax !== null) {
+    // An open end is allowed, so "under $200" needs no special case.
+    $clauses[] = Filter::between('price', $priceMin, $priceMax)->tag('price');
+}
+
+$sort = match ((string) ($input['sort'] ?? 'relevance')) {
+    'price_asc'  => [Sort::asc('price')],
+    'price_desc' => [Sort::desc('price')],
+    'stock_desc' => [Sort::desc('stock')],
+    default      => [],   // relevance
+};
+
+// ---------------------------------------------------------------------------
+//  The query
+// ---------------------------------------------------------------------------
+
+try {
+    // No open/close, nothing to release: a request opens the directory, reads
+    // what it needs and ends.
+    $engine = SearchEngine::open(__DIR__ . '/search_data');
+
+    $result = $engine->search(
+        query:   $query,        // empty means everything, so this doubles as a
+        limit:   PAGE_SIZE,     // category page with no search box
+        filters: Filter::all(...$clauses),
+        sort:    $sort,
+        facets:  [
+            // Each facet excludes its own clause and keeps every other one, so
+            // the sidebar stays usable after the shopper has used it.
+            'category' => Facet::terms(size: 24, exclude: 'category'),
+            'brand'    => Facet::terms(size: 24, exclude: 'brand'),
+            'gender'   => Facet::terms(exclude: 'gender'),
+            'tags'     => Facet::terms(size: 14, exclude: 'tags'),
+
+            // Statistics rather than counts: a price slider needs the real
+            // bounds of the catalogue, not of the range already chosen — which
+            // is why this one excludes 'price' too.
+            'promo'    => Facet::stats('promo', exclude: 'promo'),
+            'price'    => Facet::stats('price', exclude: 'price'),
+        ],
+        highlight: Highlight::fields(['name', 'description']),
+    );
+} catch (FtsException $e) {
+    http_response_code(400);
+
+    echo json_encode(['error' => $e->getMessage()]);
     exit;
 }
 
 // ---------------------------------------------------------------------------
-//  Filter builder
-//
-//  Each parameter can be null to exclude it.
-//  For adaptive facets, pass null on the facet to be computed.
+//  The response
 // ---------------------------------------------------------------------------
 
-const PROMO_VALUES = [-10, -20, -30, -40, -50];
-const FACET_LIMIT  = 2000;
+$results = [];
 
-function buildFilters(
-    ?array  $cat,
-    ?array  $brand,
-    ?string $gender,
-    ?bool   $promo,
-    ?float  $priceMin,
-    ?float  $priceMax
-): array {
-    $and = [
-        ['field' => 'active', 'op' => '=', 'value' => true],
-        ['field' => 'stock',  'op' => '>',  'value' => 0],
+foreach ($result as $hit) {
+    $product = $hit->document;
+
+    $results[] = [
+        'id'       => $hit->id,
+        'score'    => round($hit->score, 3),
+        'name'     => $product['name'],
+        'category' => $product['category'],
+        'brand'    => $product['brand'],
+        'gender'   => $product['gender'],
+        'color'    => $product['color'] ?? null,
+        'price'    => $product['price'],
+        'promo'    => $product['promo'] ?? null,
+        'stock'    => $product['stock'],
+        'tags'     => $product['tags'] ?? [],
+        'image'    => $product['image'],
+
+        // Already HTML-escaped, with the marks inserted afterwards, so the
+        // page can render them as they are. Absent when the query did not
+        // match that field.
+        'marked_name'        => $hit->highlights['name'] ?? null,
+        'marked_description' => $hit->highlights['description'] ?? null,
     ];
-
-    if ($cat !== null) {
-        $and[] = ['field' => 'category', 'op' => 'in', 'value' => $cat];
-    }
-    if ($brand !== null) {
-        $and[] = ['field' => 'brand', 'op' => 'in', 'value' => $brand];
-    }
-    if ($gender !== null) {
-        $and[] = ['field' => 'gender', 'op' => '=', 'value' => $gender];
-    }
-    if ($promo === true) {
-        $and[] = ['field' => 'promo', 'op' => 'in', 'value' => PROMO_VALUES];
-    }
-    if ($priceMin !== null) {
-        $and[] = ['field' => 'price', 'op' => '>=', 'value' => $priceMin];
-    }
-    if ($priceMax !== null) {
-        $and[] = ['field' => 'price', 'op' => '<=', 'value' => $priceMax];
-    }
-
-    return ['and' => $and];
 }
 
-// ---------------------------------------------------------------------------
-//  Searches
-//
-//  Adaptive facets principle:
-//  Each facet is computed against all active filters EXCEPT its own.
-//  This way, removing/changing a filter does not block the other options.
-//
-//  Optimisation:
-//  If two facets share the same parameters (because their respective filters
-//  were not active), they produce an identical query.
-//  Deduplicated by serialized signature → only one query is executed.
-//  Gain: 2 queries minimum (main + pool), up to 7 if everything is filtered.
-// ---------------------------------------------------------------------------
-
-$engine = new SearchEngine();
-$engine->open(__DIR__ . '/search_data');
-
-$boosts = [
-    'name'        => 3.0,
-    'brand'       => 2.0,
-    'category'    => 1.5,
-    'tags'        => 1.5,
-    'description' => 1.0,
-];
-
-// 1. Main query — all active filters
-$mainResults = $engine->search(
-    query:   $q,
-    limit:   48,
-    boosts:  $boosts,
-    filters: buildFilters($fCat, $fBrand, $fGender, $fPromo, $fPriceMin, $fPriceMax)
-);
-
-// 2. Parameter definition for each facet query
-//    Each facet drops its own filter (null at its position)
-$facetDefs = [
-    'category' => [null,   $fBrand, $fGender, $fPromo, $fPriceMin, $fPriceMax],
-    'brand'    => [$fCat,  null,    $fGender, $fPromo, $fPriceMin, $fPriceMax],
-    'gender'   => [$fCat,  $fBrand, null,     $fPromo, $fPriceMin, $fPriceMax],
-    'promo'    => [$fCat,  $fBrand, $fGender, null,    $fPriceMin, $fPriceMax],
-    'price'    => [$fCat,  $fBrand, $fGender, $fPromo, null,       null      ],
-];
-
-// 3. Deduplication by signature — identical queries only run once
-$queryCache   = [];
-$facetResults = [];
-
-foreach ($facetDefs as $facetName => $params) {
-    $signature = serialize($params);
-
-    if (!isset($queryCache[$signature])) {
-        $queryCache[$signature] = $engine->search(
-            query:   $q,
-            limit:   FACET_LIMIT,
-            boosts:  $boosts,
-            filters: buildFilters(...$params)
-        );
-    }
-
-    $facetResults[$facetName] = $queryCache[$signature];
-}
-
-$engine->close();
-
-// ---------------------------------------------------------------------------
-//  Facet computation
-// ---------------------------------------------------------------------------
-
-// Categories
-$catCounts = [];
-foreach ($facetResults['category'] as $r) {
-    $v = $r['document']['category'] ?? null;
-    if ($v !== null) $catCounts[$v] = ($catCounts[$v] ?? 0) + 1;
-}
-arsort($catCounts);
-
-// Brands
-$brandCounts = [];
-foreach ($facetResults['brand'] as $r) {
-    $v = $r['document']['brand'] ?? null;
-    if ($v !== null) $brandCounts[$v] = ($brandCounts[$v] ?? 0) + 1;
-}
-arsort($brandCounts);
-
-// Gender
-$genderCounts = [];
-foreach ($facetResults['gender'] as $r) {
-    $v = $r['document']['gender'] ?? null;
-    if ($v !== null) $genderCounts[$v] = ($genderCounts[$v] ?? 0) + 1;
-}
-
-// Promo
-$promoCount    = 0;
-$nonPromoCount = 0;
-foreach ($facetResults['promo'] as $r) {
-    if (in_array($r['document']['promo'] ?? null, PROMO_VALUES, true)) {
-        $promoCount++;
-    } else {
-        $nonPromoCount++;
-    }
-}
-
-// Actual price range (without price filter)
-$prices   = array_map(fn($r) => (float)($r['document']['price'] ?? 0), $facetResults['price']);
-$priceMin = $prices ? round((float)min($prices), 2) : 0.0;
-$priceMax = $prices ? round((float)max($prices), 2) : 0.0;
-
-// ---------------------------------------------------------------------------
-//  Response formatting
-// ---------------------------------------------------------------------------
-
-$results = array_map(fn($r) => [
-    'docId'    => $r['docId'],
-    'score'    => $r['score'],
-    'name'     => $r['document']['name'],
-    'category' => $r['document']['category'],
-    'brand'    => $r['document']['brand'],
-    'price'    => $r['document']['price'],
-    'promo'    => $r['document']['promo'],
-    'stock'    => $r['document']['stock'],
-    'gender'   => $r['document']['gender'],
-    'color'    => $r['document']['color'],
-    'image'    => $r['document']['image'],
-], $mainResults);
+$facets = $result->facets;
 
 echo json_encode([
-    'total'   => count($mainResults),
+    // The exact number of matches across the index, not the size of this page.
+    'total'   => $result->total,
+    'took'    => round($result->took, 2),
+    'queries' => 1,
     'results' => $results,
     'facets'  => [
-        'category' => $catCounts,
-        'brand'    => $brandCounts,
-        'gender'   => $genderCounts,
-        'promo'    => [
-            'on_sale'    => $promoCount,
-            'full_price' => $nonPromoCount,
-        ],
-        'price' => [
-            'min' => $priceMin,
-            'max' => $priceMax,
+        'category' => $facets['category'] ?? [],
+        'brand'    => $facets['brand'] ?? [],
+        'gender'   => $facets['gender'] ?? [],
+        'tags'     => $facets['tags'] ?? [],
+
+        // A statistics facet counts the documents that *have* a value, which
+        // for a discount is exactly how many products are on sale.
+        'promo'    => ['on_sale' => $facets['promo']['count'] ?? 0],
+        'price'    => [
+            'min' => round((float) ($facets['price']['min'] ?? 0), 2),
+            'max' => round((float) ($facets['price']['max'] ?? 0), 2),
         ],
     ],
-], JSON_PRETTY_PRINT);
+], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SearchEngine Demo — Footwear & Fashion</title>
+  <title>php-fts — a search engine in pure PHP</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;600&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&display=swap" rel="stylesheet" />
 
@@ -400,6 +400,52 @@
 
     .result-count strong { color: var(--ink); }
 
+    .toolbar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    /* The demo's real point: one query, and how long it took. */
+    .timing {
+      font-size: .75rem;
+      color: var(--ink-muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .timing strong { color: var(--ink); font-weight: 500; }
+
+    .sort-wrap {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: .78rem;
+      color: var(--ink-muted);
+    }
+
+    .sort-wrap select {
+      font-family: inherit;
+      font-size: .8rem;
+      color: var(--ink);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 5px 8px;
+      cursor: pointer;
+      transition: border-color var(--transition);
+    }
+
+    .sort-wrap select:hover { border-color: var(--ink-muted); }
+
+    /* Highlights come back from the engine already escaped, with <mark> around
+       what actually matched. */
+    mark {
+      background: #fdf3d0;
+      color: inherit;
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+
     /* -----------------------------------------------------------------------
        Product grid
     ----------------------------------------------------------------------- */
@@ -572,7 +618,7 @@
 
 <!-- Header -->
 <header class="header">
-  <div class="logo">Search<span>Engine</span> &mdash; Demo</div>
+  <div class="logo">php<span>-fts</span></div>
   <div class="search-wrap">
     <input type="text" id="searchInput" placeholder="Search sneakers, boots, sandals…" autocomplete="off" />
     <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -608,6 +654,14 @@
     <div class="facet-group">
       <span class="facet-label">Gender</span>
       <div id="facetGender"></div>
+    </div>
+
+    <hr class="facet-sep" />
+
+    <!-- Tags: a multi-valued field, so a product is counted under each of its tags -->
+    <div class="facet-group">
+      <span class="facet-label">Tags</span>
+      <div id="facetTags"></div>
     </div>
 
     <hr class="facet-sep" />
@@ -649,6 +703,18 @@
     <div class="active-filters" id="activeFilters"></div>
     <div class="toolbar">
       <div class="result-count" id="resultCount"></div>
+      <div class="toolbar-right">
+        <span class="timing" id="timing"></span>
+        <label class="sort-wrap">
+          <span>Sort</span>
+          <select id="sortSelect">
+            <option value="relevance">Relevance</option>
+            <option value="price_asc">Price, low to high</option>
+            <option value="price_desc">Price, high to low</option>
+            <option value="stock_desc">Stock, most first</option>
+          </select>
+        </label>
+      </div>
     </div>
     <div id="results"></div>
   </main>
@@ -661,10 +727,12 @@
 // ---------------------------------------------------------------------------
 const state = {
   q:        '',
+  sort:     'relevance',
   filters: {
     category: [],
     brand:    [],
     gender:   null,
+    tags:     [],
     promo:    false,
     priceMin: null,
     priceMax: null,
@@ -672,6 +740,8 @@ const state = {
   results:   [],
   facets:    {},
   total:     0,
+  took:      0,
+  queries:   0,
   loading:   false,
   // absolute price bounds (from first search without price filter)
   bounds:    { min: 0, max: 1000 },
@@ -689,17 +759,16 @@ function scheduleSearch(delay = 320) {
 }
 
 async function doSearch() {
-  if (!state.q.trim()) {
-    renderInitial();
-    return;
-  }
-
+  // No early exit on an empty query: an empty query matches everything, so
+  // this page is also a category page — filters, facets and an exact total
+  // with no search box involved.
   state.loading = true;
   renderSkeleton();
 
-  const body = { q: state.q };
+  const body = { q: state.q, sort: state.sort };
   if (state.filters.category.length) body.category  = state.filters.category;
   if (state.filters.brand.length)    body.brand      = state.filters.brand;
+  if (state.filters.tags.length)     body.tags       = state.filters.tags;
   if (state.filters.gender)          body.gender     = state.filters.gender;
   if (state.filters.promo)           body.promo      = true;
   if (state.filters.priceMin !== null) body.price_min = state.filters.priceMin;
@@ -716,6 +785,8 @@ async function doSearch() {
     state.results = data.results  ?? [];
     state.facets  = data.facets   ?? {};
     state.total   = data.total    ?? 0;
+    state.took    = data.took     ?? 0;
+    state.queries = data.queries  ?? 0;
 
     // Set absolute price bounds once (first search, no price filter)
     if (!state.boundsSet && state.facets.price) {
@@ -741,25 +812,11 @@ async function doSearch() {
 function render() {
   renderActiveFilters();
   renderResultCount();
+  renderTiming();
   renderFacets();
   renderProducts();
   renderClearBtn();
   renderSliderFill();
-}
-
-function renderInitial() {
-  document.getElementById('results').innerHTML = `
-    <div class="state-initial">
-      <div class="big-icon">&#x1F45F;</div>
-      <p>Type to search — try <em>sneaker</em>, <em>boot</em> or a brand name.</p>
-    </div>`;
-  document.getElementById('resultCount').textContent = '';
-  document.getElementById('activeFilters').innerHTML = '';
-  document.getElementById('facetCategory').innerHTML = '';
-  document.getElementById('facetBrand').innerHTML    = '';
-  document.getElementById('facetGender').innerHTML   = '';
-  document.getElementById('promoCount').textContent  = '';
-  document.getElementById('clearBtn').classList.remove('visible');
 }
 
 function renderSkeleton() {
@@ -783,9 +840,23 @@ function renderSkeleton() {
 
 function renderResultCount() {
   const el = document.getElementById('resultCount');
+
+  // The exact number of matches in the index, not the size of this page — the
+  // page holds at most 48 of them.
   el.innerHTML = state.total > 0
     ? `<strong>${state.total}</strong> result${state.total > 1 ? 's' : ''} found`
     : '';
+}
+
+function renderTiming() {
+  const el = document.getElementById('timing');
+
+  if (!state.queries) { el.innerHTML = ''; return; }
+
+  // Results, six facets and the highlights, out of one search. 1.x needed six
+  // searches of 2 000 documents each to draw the same sidebar.
+  el.innerHTML = `<strong>${state.queries}</strong> quer${state.queries > 1 ? 'ies' : 'y'}
+                  · <strong>${state.took.toFixed(1)} ms</strong>`;
 }
 
 function renderProducts() {
@@ -821,7 +892,7 @@ function renderProducts() {
             <span class="card-category">${escHtml(p.category)}</span>
             <span class="card-gender">${escHtml(p.gender)}</span>
           </div>
-          <div class="card-name">${escHtml(p.name)}</div>
+          <div class="card-name">${p.marked_name ?? escHtml(p.name)}</div>
           <div class="card-price">
             <span class="price-final ${hasPromo ? 'discounted' : ''}">${fmtFinal}</span>
             ${hasPromo ? `<span class="price-original">${fmtOriginal}</span>
@@ -842,6 +913,7 @@ function renderFacets() {
   renderCheckboxFacet('facetCategory', 'category', state.facets.category ?? {});
   renderCheckboxFacet('facetBrand',    'brand',    state.facets.brand    ?? {});
   renderCheckboxFacet('facetGender',   'gender',   state.facets.gender   ?? {}, true);
+  renderCheckboxFacet('facetTags',     'tags',     state.facets.tags     ?? {});
   renderPromoFacet();
   renderSliderFacet();
 }
@@ -910,6 +982,7 @@ function renderActiveFilters() {
 
   state.filters.category.forEach(v => chips.push({ label: v, action: () => removeArrayFilter('category', v) }));
   state.filters.brand.forEach(v    => chips.push({ label: v, action: () => removeArrayFilter('brand', v) }));
+  state.filters.tags.forEach(v     => chips.push({ label: '#' + v, action: () => removeArrayFilter('tags', v) }));
   if (state.filters.gender) chips.push({ label: state.filters.gender, action: () => { state.filters.gender = null; scheduleSearch(0); } });
   if (state.filters.promo)  chips.push({ label: 'On sale', action: () => { state.filters.promo = false; document.getElementById('promoToggle').classList.remove('active'); scheduleSearch(0); } });
   if (state.filters.priceMin !== null || state.filters.priceMax !== null) {
@@ -933,7 +1006,7 @@ function renderActiveFilters() {
 
 function renderClearBtn() {
   const hasFilters = state.filters.category.length || state.filters.brand.length ||
-    state.filters.gender || state.filters.promo ||
+    state.filters.tags.length || state.filters.gender || state.filters.promo ||
     state.filters.priceMin !== null || state.filters.priceMax !== null;
   document.getElementById('clearBtn').classList.toggle('visible', !!hasFilters);
 }
@@ -965,8 +1038,10 @@ function removeArrayFilter(key, val) {
 function clearAllFilters() {
   state.filters.category = [];
   state.filters.brand    = [];
+  state.filters.tags     = [];
   state.filters.gender   = null;
   state.filters.promo    = false;
+  document.getElementById('promoToggle').classList.remove('active');
   resetPriceFilter(false);
   scheduleSearch(0);
 }
@@ -1033,6 +1108,11 @@ document.getElementById('promoToggle').addEventListener('click', function () {
   scheduleSearch(0);
 });
 
+document.getElementById('sortSelect').addEventListener('change', function () {
+  state.sort = this.value;
+  scheduleSearch(0);
+});
+
 document.getElementById('clearBtn').addEventListener('click', clearAllFilters);
 
 // ---------------------------------------------------------------------------
@@ -1049,7 +1129,10 @@ function escHtml(str) {
 // ---------------------------------------------------------------------------
 //  Init
 // ---------------------------------------------------------------------------
-renderInitial();
+// Straight into a search with an empty query, which matches everything: the
+// page opens on a browsable catalogue with its facets counted, rather than on
+// an invitation to type.
+doSearch();
 </script>
 </body>
 </html>

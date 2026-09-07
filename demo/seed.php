@@ -1,12 +1,17 @@
 <?php
 
 /*
- * ⚠ Still on the 1.x API, and therefore broken on this branch. Ported with
- * demo/search.php, once multi-valued tags are filterable — see the note there.
+ * Builds the demo index.
+ *
+ *     php demo/seed.php
+ *
+ * Generates a few hundred products and writes them into ./search_data, which
+ * is the entire installation procedure: a directory.
  */
 
 require __DIR__ . '/autoload.php';
 
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchEngine;
 
 // ---------------------------------------------------------------------------
@@ -141,13 +146,55 @@ shuffle($products);
 
 // ---------------------------------------------------------------------------
 //  Indexing
+//
+//  The schema is declared rather than inferred. Inference would get all of
+//  this right, but declaring it is what buys the title boost, the range filter
+//  on `promo`, and the guarantee that a later import cannot decide `price` is
+//  a string.
+//
+//  Note `stored('image')`: the URL comes back with every result and is never
+//  searched, so there is no reason to spend n-grams on it.
 // ---------------------------------------------------------------------------
 
-$engine = new SearchEngine();
-$engine->open(__DIR__ . '/search_data');
-$engine->reset();
+$engine = SearchEngine::open(__DIR__ . '/search_data', Schema::make()
+    ->text('name', boost: 3.0)
+    ->text('description')
+    ->keyword('category')
+    ->keyword('brand')
+    ->keyword('gender')
+    ->keyword('color')
+    ->tags('tags')
+    ->number('price')
+    ->number('promo')
+    ->number('stock')
+    ->boolean('active')
+    ->stored('image'));
 
-$docIds = $engine->insertBulk($products);
-$engine->close();
+// Wiped first, so running this twice does not leave the previous run's
+// products behind. A schema is frozen at an index's first commit and clear()
+// releases it, which is what lets this file be edited and re-run.
+$engine->clear();
 
-printf("✓ %d products indexed successfully.\n", count($docIds));
+$started = microtime(true);
+
+// One commit for the whole catalogue: putMany() either lands entirely or
+// leaves the index untouched. A generator rather than the array, because that
+// is what an import from a database would be.
+$engine->putMany((static function () use ($products): Generator {
+    foreach ($products as $index => $product) {
+        // The application's own id. It survives merges, restarts and copying
+        // the directory to another server.
+        yield 'sku-' . ($index + 1) => $product;
+    }
+})());
+
+$elapsed = microtime(true) - $started;
+$stats   = $engine->stats();
+
+printf("✓ %d products indexed in %.2f s\n", $stats['documents'], $elapsed);
+printf("  %d segment(s), %.1f MB on disk, %d fields\n",
+    $stats['segments'],
+    $stats['bytes'] / 1048576,
+    count($stats['fields']),
+);
+printf("  index directory: %s\n", $engine->directory());
