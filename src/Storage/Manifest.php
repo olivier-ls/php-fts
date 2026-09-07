@@ -230,10 +230,23 @@ final class Manifest
 
         $temporary = $path . '.tmp';
 
-        $handle = @fopen($temporary, 'wb');
+        // A leftover temp file is debris from an interrupted commit: it is
+        // named by nothing, so removing it cannot lose anything. is_file()
+        // rather than file_exists(), so that a *symlink* placed here is not
+        // quietly cleaned up but left for the guarded open below to refuse.
+        if (is_file($temporary) && !is_link($temporary)) {
+            @unlink($temporary);
+        }
 
-        if ($handle === false) {
-            throw new StorageException("Unable to write manifest: $temporary");
+        // Guarded like every other file this library creates. `wb` would have
+        // followed a symlink pre-placed at this path and written the manifest
+        // through it, truncating whatever it pointed at — the same class of
+        // bug as issue #3, in the one write path that had not been converted.
+        [$handle, $created] = $this->openIndexFile($temporary);
+
+        if (!$created) {
+            fclose($handle);
+            throw new StorageException("Commit already being written: $temporary");
         }
 
         try {

@@ -1,5 +1,10 @@
 <?php
 
+/*
+ * ⚠ Still on the 1.x API, and therefore broken on this branch. Ported with
+ * demo/search.php, once multi-valued tags are filterable — see the note there.
+ */
+
 require __DIR__ . '/autoload.php';
 
 use Ols\PhpFts\SearchEngine;

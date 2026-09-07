@@ -1,5 +1,15 @@
 <?php
 
+/*
+ * ⚠ Still on the 1.x API, and therefore broken on this branch: the engine it
+ * calls was deleted with the rest of 1.x.
+ *
+ * Not a mechanical port. This file runs five searches and counts facets in
+ * userland, which is precisely what 2.x replaced with one query and
+ * Facet::terms(exclude:). Rewriting it is worth doing properly, and worth
+ * doing once multi-valued tags are filterable — the demo facets on them.
+ */
+
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: POST, OPTIONS');

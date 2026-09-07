@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Exception\CorruptSegmentException;
+use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\HighlightException;
@@ -263,6 +264,7 @@ final class IndexDirectory
      *
      * @param array<string, mixed> $document
      * @throws StorageException
+     * @throws FieldTypeException when a declared field's value is not of its type
      */
     public function put(string|int $id, array $document): void
     {
@@ -274,6 +276,7 @@ final class IndexDirectory
      *
      * @param iterable<string|int, array<string, mixed>> $documents id => document
      * @throws StorageException
+     * @throws FieldTypeException when a declared field's value is not of its type
      */
     public function putMany(iterable $documents): void
     {
@@ -370,6 +373,39 @@ final class IndexDirectory
             $this->maintain();
 
             return true;
+        });
+    }
+
+    /**
+     * Empties the index.
+     *
+     * A commit like any other: it publishes a manifest naming no segments, and
+     * retires the ones that were live rather than deleting their files. A
+     * search that began a moment ago is reading those files, and is entitled to
+     * finish reading them — it sees the index as it was when it started, which
+     * is the same guarantee every other write gives it. The files go with the
+     * grace period, like a merge's inputs.
+     *
+     * The frozen schema goes too. Freezing exists because segments already on
+     * disk were written to it, and after this commit there are none — so an
+     * index wiped and reopened with a different schema is a legitimate way to
+     * change one, and the only one that does not need a second directory.
+     *
+     * @throws StorageException
+     */
+    public function clear(): void
+    {
+        $this->lock->withLock(function (): void {
+            $this->load();
+
+            $now     = time();
+            $retired = $this->manifest->retired;
+
+            foreach ($this->manifest->segments as $entry) {
+                $retired[] = ['name' => $entry['name'], 'at' => $now];
+            }
+
+            $this->commit([], $retired, schema: []);
         });
     }
 

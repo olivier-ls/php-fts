@@ -1,4 +1,6 @@
-> **DESIGN DRAFT — v2.0.** On-disk format specification. Nothing implemented yet.
+> **v2.0 — on-disk format specification.** Implemented on the `2.x` branch,
+> except where a section says otherwise. Written before the code, and kept as
+> the record of what was decided and why.
 
 # Segment format
 
@@ -276,11 +278,16 @@ BM25F normalisation, `k1` / `b`, creation timestamp, segment id.
 
 ## 9. Deletes
 
-`deleted.bin` holds one **bitmap per segment**, one bit per local ordinal:
+One **bitmap per segment**, one bit per local ordinal, carried in the manifest
+next to the segment it belongs to.
 
-```
-[ segmentId u64 ][ bitmapLen u32 ][ bitmap ] …
-```
+**Built as `deleted.bin`, moved into the manifest.** A separate file has to be
+kept in step with the commit that refers to it: publish the new manifest first
+and the tombstones are stale, publish the tombstones first and a reader on the
+old manifest sees documents disappear. Both orders need a second atomicity
+mechanism for a few hundred bytes. In the manifest, a delete is the same single
+atomic `rename()` as every other write, and a reader's snapshot includes its
+tombstones by construction.
 
 Loading is a plain read, and the result drops straight into the bitset algebra
 of §5 as `~$deleted`. No lookup, no set membership test, no per-candidate check.

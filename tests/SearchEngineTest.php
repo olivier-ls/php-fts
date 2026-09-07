@@ -4,377 +4,454 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts\Tests;
 
+use Ols\PhpFts\Exception\FieldTypeException;
+use Ols\PhpFts\Exception\FtsException;
+use Ols\PhpFts\Facet;
+use Ols\PhpFts\Filter;
+use Ols\PhpFts\Highlight;
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchEngine;
 use PHPUnit\Framework\Attributes\Test;
-use PHPUnit\Framework\Attributes\Depends;
 use PHPUnit\Framework\TestCase;
-use RuntimeException;
 
 /**
- * Tests d'intégration pour SearchEngine.
+ * The public surface, exercised the way an application uses it.
  *
- * Note d'architecture : SearchEngine instancie ses dépendances en dur dans le
- * constructeur (pas d'injection). Les tests sont donc nécessairement des tests
- * d'intégration avec de vrais fichiers — notamment trigrams.bin (~810KB).
- *
- * Pour éviter de recréer ce fichier à chaque test, on partage une seule
- * instance via setUpBeforeClass() / tearDownAfterClass(). Les tests qui
- * ont besoin d'un état propre utilisent reset() plutôt qu'un nouveau open().
+ * Deliberately no internals here: no segment, no manifest, no bitset. If
+ * something in this file needs a class from `Index\` to be asserted, the
+ * façade is not finished. What is asserted instead is what the README
+ * promises — that a request can open, write, search and end, and that the
+ * engine holds nothing and needs nothing released.
  */
 class SearchEngineTest extends TestCase
 {
-    private static SearchEngine $engine;
-    private static string       $tmpDir;
-
-    public static function setUpBeforeClass(): void
-    {
-        self::$tmpDir = sys_get_temp_dir() . '/se_test_' . uniqid();
-        self::$engine = new SearchEngine();
-        self::$engine->open(self::$tmpDir);
-    }
-
-    public static function tearDownAfterClass(): void
-    {
-        self::$engine->close();
-        self::removeDir(self::$tmpDir);
-    }
+    private string $dir;
 
     protected function setUp(): void
     {
-        // Repart d'un index vide avant chaque test
-        self::$engine->reset();
+        $this->dir = sys_get_temp_dir() . '/fts_engine_' . uniqid();
     }
 
-    // =========================================================================
-    // Helpers
-    // =========================================================================
-
-    private static function removeDir(string $path): void
+    protected function tearDown(): void
     {
-        if (!file_exists($path)) {
-            return;
-        }
-        foreach (scandir($path) as $entry) {
-            if ($entry === '.' || $entry === '..') continue;
-            $full = "$path/$entry";
-            is_dir($full) ? self::removeDir($full) : unlink($full);
-        }
-        rmdir($path);
-    }
-
-    // =========================================================================
-    // open()
-    // =========================================================================
-
-    #[Test]
-    public function open_creates_expected_binary_files(): void
-    {
-        foreach (['documents.bin', 'tombstones.bin', 'postings.bin', 'trigrams.bin'] as $file) {
-            $this->assertFileExists(self::$tmpDir . '/' . $file);
-        }
-    }
-
-    #[Test]
-    public function open_throws_when_not_open(): void
-    {
-        $engine = new SearchEngine();
-
-        $this->expectException(RuntimeException::class);
-        $engine->insert(['name' => 'test']);
-    }
-
-    // =========================================================================
-    // insert() + search()
-    // =========================================================================
-
-    #[Test]
-    public function insert_returns_an_integer_doc_id(): void
-    {
-        $docId = self::$engine->insert(['name' => 'chaussure cuir noir']);
-
-        $this->assertIsInt($docId);
-    }
-
-    #[Test]
-    public function search_finds_inserted_document(): void
-    {
-        self::$engine->insert(['name' => 'chaussure cuir noir']);
-
-        $results = self::$engine->search('chaussure');
-
-        $this->assertNotEmpty($results);
-        $this->assertSame('chaussure cuir noir', $results[0]['document']['name']);
-    }
-
-    #[Test]
-    public function search_returns_empty_on_no_match(): void
-    {
-        self::$engine->insert(['name' => 'chaussure cuir']);
-
-        $results = self::$engine->search('vélo');
-
-        $this->assertSame([], $results);
-    }
-
-    #[Test]
-    public function search_returns_empty_on_blank_query(): void
-    {
-        self::$engine->insert(['name' => 'chaussure']);
-
-        $this->assertSame([], self::$engine->search(''));
-        $this->assertSame([], self::$engine->search('!!!'));
-    }
-
-    #[Test]
-    public function search_result_contains_doc_id_score_and_document(): void
-    {
-        self::$engine->insert(['name' => 'sac cuir']);
-
-        $result = self::$engine->search('sac')[0];
-
-        $this->assertArrayHasKey('docId',    $result);
-        $this->assertArrayHasKey('score',    $result);
-        $this->assertArrayHasKey('document', $result);
-        $this->assertIsFloat($result['score']);
-    }
-
-    #[Test]
-    public function search_score_is_between_0_and_100(): void
-    {
-        self::$engine->insert(['name' => 'veste cuir marron']);
-
-        $score = self::$engine->search('cuir')[0]['score'];
-
-        $this->assertGreaterThanOrEqual(0.0, $score);
-        $this->assertLessThanOrEqual(100.0, $score);
-    }
-
-    #[Test]
-    public function search_respects_limit(): void
-    {
-        for ($i = 0; $i < 10; $i++) {
-            self::$engine->insert(['name' => "produit numero $i"]);
+        foreach (glob($this->dir . '/*') ?: [] as $file) {
+            @unlink($file);
         }
 
-        $results = self::$engine->search('produit', limit: 3);
-
-        $this->assertCount(3, $results);
+        @rmdir($this->dir . '/.lock');
+        @rmdir($this->dir);
     }
 
-    #[Test]
-    public function insert_bulk_inserts_all_documents(): void
+    private function engine(?Schema $schema = null): SearchEngine
     {
-        $docIds = self::$engine->insertBulk([
-            ['name' => 'alpha'],
-            ['name' => 'beta'],
-            ['name' => 'gamma'],
+        return SearchEngine::open($this->dir, $schema);
+    }
+
+    private function catalogue(): SearchEngine
+    {
+        $engine = $this->engine();
+
+        $engine->putMany([
+            'sku-1' => ['title' => 'Brown leather shoe', 'brand' => 'Adidas', 'price' => 129.90, 'stock' => 42],
+            'sku-2' => ['title' => 'Black leather boot', 'brand' => 'Adidas', 'price' => 189.00, 'stock' => 0],
+            'sku-3' => ['title' => 'Canvas sneaker',     'brand' => 'Nike',   'price' => 79.00,  'stock' => 7],
+            'jp-1'  => ['title' => '革靴 ブラウン',        'brand' => 'Nike',   'price' => 19800.0, 'stock' => 3],
         ]);
 
-        $this->assertCount(3, $docIds);
-        $this->assertNotEmpty(self::$engine->search('alpha'));
-        $this->assertNotEmpty(self::$engine->search('beta'));
+        return $engine;
     }
 
     // =========================================================================
-    // delete()
+    // Opening
     // =========================================================================
 
     #[Test]
-    public function delete_removes_document_from_search_results(): void
+    public function opening_creates_the_directory(): void
     {
-        $docId = self::$engine->insert(['name' => 'bottine cuir']);
+        $engine = $this->engine();
 
-        self::$engine->delete($docId);
-
-        $this->assertSame([], self::$engine->search('bottine'));
+        $this->assertDirectoryExists($this->dir);
+        $this->assertSame(0, $engine->count());
+        $this->assertSame($this->dir, $engine->directory());
     }
 
     #[Test]
-    public function delete_does_not_affect_other_documents(): void
+    public function an_index_is_searchable_the_moment_it_is_opened(): void
     {
-        $docId = self::$engine->insert(['name' => 'ceinture cuir']);
-        self::$engine->insert(['name' => 'portefeuille cuir']);
+        // Empty, not broken: a first request that searches before anything was
+        // ever written should get no results, not an exception.
+        $result = $this->engine()->search('leather');
 
-        self::$engine->delete($docId);
-
-        $this->assertNotEmpty(self::$engine->search('portefeuille'));
-    }
-
-    // =========================================================================
-    // update()
-    // =========================================================================
-
-    #[Test]
-    public function update_makes_old_content_unsearchable(): void
-    {
-        $docId = self::$engine->insert(['name' => 'manteau laine']);
-
-        self::$engine->update($docId, ['name' => 'manteau cuir']);
-
-        $this->assertSame([], self::$engine->search('laine'));
+        $this->assertSame(0, $result->total);
+        $this->assertTrue($result->isEmpty());
     }
 
     #[Test]
-    public function update_makes_new_content_searchable(): void
+    public function a_second_engine_sees_what_the_first_committed(): void
     {
-        $docId = self::$engine->insert(['name' => 'manteau laine']);
+        $this->engine()->put('sku-1', ['title' => 'Brown leather shoe']);
 
-        self::$engine->update($docId, ['name' => 'manteau cuir']);
-
-        $this->assertNotEmpty(self::$engine->search('cuir'));
-    }
-
-    // =========================================================================
-    // count() + fragmentationRate()
-    // =========================================================================
-
-    #[Test]
-    public function count_reflects_inserts_and_deletes(): void
-    {
-        self::$engine->insert(['name' => 'a']);
-        self::$engine->insert(['name' => 'b']);
-        $docId = self::$engine->insert(['name' => 'c']);
-
-        self::$engine->delete($docId);
-
-        $this->assertSame(2, self::$engine->count());
+        // No shared state between the two objects, and nothing to flush: a
+        // commit is on disk when put() returns, which is what makes the
+        // "open, work, end" request model work at all.
+        $this->assertSame(1, $this->engine()->count());
+        $this->assertSame(1, $this->engine()->search('leather')->total);
     }
 
     #[Test]
-    public function fragmentation_rate_is_zero_with_no_deletions(): void
+    public function reopening_with_a_contradicting_schema_is_refused(): void
     {
-        self::$engine->insert(['name' => 'x']);
+        $this->engine(Schema::make()->text('title'))->put('sku-1', ['title' => 'Shoe']);
 
-        $this->assertSame(0, self::$engine->fragmentationRate());
-    }
+        $this->expectException(FtsException::class);
+        $this->expectExceptionMessage('frozen at the first commit');
 
-    #[Test]
-    public function fragmentation_rate_is_100_when_all_deleted(): void
-    {
-        $id1 = self::$engine->insert(['name' => 'x']);
-        $id2 = self::$engine->insert(['name' => 'y']);
-        self::$engine->delete($id1);
-        self::$engine->delete($id2);
-
-        $this->assertSame(100, self::$engine->fragmentationRate());
+        $this->engine(Schema::make()->text('title')->number('price'));
     }
 
     // =========================================================================
-    // search() avec filtres
+    // Writing
     // =========================================================================
 
     #[Test]
-    public function search_filter_equals_keeps_matching_documents(): void
+    public function a_document_goes_in_under_an_id_of_your_own(): void
     {
-        self::$engine->insert(['name' => 'sac', 'active' => true]);
-        self::$engine->insert(['name' => 'sac', 'active' => false]);
+        $engine = $this->engine();
+        $engine->put('sku-4471', ['title' => 'Brown leather shoe', 'price' => 129.90]);
 
-        $results = self::$engine->search('sac', filters: [
-            'and' => [['field' => 'active', 'op' => '=', 'value' => true]],
-        ]);
-
-        $this->assertCount(1, $results);
-        $this->assertTrue($results[0]['document']['active']);
+        $this->assertTrue($engine->has('sku-4471'));
+        $this->assertSame('Brown leather shoe', $engine->get('sku-4471')['title']);
+        $this->assertNull($engine->get('sku-nope'));
     }
 
     #[Test]
-    public function search_filter_range_keeps_matching_documents(): void
+    public function an_integer_id_is_a_string_id(): void
     {
-        self::$engine->insert(['name' => 'article', 'price' => 80]);
-        self::$engine->insert(['name' => 'article', 'price' => 200]);
+        $engine = $this->engine();
+        $engine->put(42, ['title' => 'Shoe']);
 
-        $results = self::$engine->search('article', filters: [
-            'and' => [
-                ['field' => 'price', 'op' => '>=', 'value' => 50],
-                ['field' => 'price', 'op' => '<=', 'value' => 100],
-            ],
-        ]);
-
-        $this->assertCount(1, $results);
-        $this->assertSame(80, $results[0]['document']['price']);
+        $this->assertTrue($engine->has(42));
+        $this->assertTrue($engine->has('42'));
+        $this->assertSame('42', $engine->search('shoe')->hits[0]->id);
     }
 
     #[Test]
-    public function search_filter_in_keeps_matching_documents(): void
+    public function putting_the_same_id_twice_leaves_one_document(): void
     {
-        self::$engine->insert(['name' => 'article', 'category' => 'Chaussures']);
-        self::$engine->insert(['name' => 'article', 'category' => 'Vêtements']);
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'Brown leather shoe']);
+        $engine->put('sku-1', ['title' => 'Black canvas sneaker']);
 
-        $results = self::$engine->search('article', filters: [
-            'and' => [['field' => 'category', 'op' => 'in', 'value' => ['Chaussures', 'Sport']]],
-        ]);
+        $this->assertSame(1, $engine->count());
+        $this->assertSame('Black canvas sneaker', $engine->get('sku-1')['title']);
 
-        $this->assertCount(1, $results);
-        $this->assertSame('Chaussures', $results[0]['document']['category']);
+        // The old copy is gone from the terms too, not just from the docstore.
+        $this->assertSame(0, $engine->search('leather')->total);
+        $this->assertSame(1, $engine->search('sneaker')->total);
     }
 
     #[Test]
-    public function search_filter_rejects_document_with_missing_field(): void
+    public function insert_generates_an_id_and_hands_it_back(): void
     {
-        self::$engine->insert(['name' => 'article']); // pas de champ 'active'
+        $engine = $this->engine();
 
-        $results = self::$engine->search('article', filters: [
-            'and' => [['field' => 'active', 'op' => '=', 'value' => true]],
-        ]);
+        $first  = $engine->insert(['title' => 'Brown leather shoe']);
+        $second = $engine->insert(['title' => 'Black leather boot']);
 
-        $this->assertSame([], $results);
+        $this->assertNotSame($first, $second);
+        $this->assertSame(2, $engine->count());
+        $this->assertSame('Brown leather shoe', $engine->get($first)['title']);
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $first);
     }
 
     #[Test]
-    public function search_filter_or_keeps_at_least_one_match(): void
+    public function a_batch_is_one_commit(): void
     {
-        self::$engine->insert(['name' => 'article', 'brand' => 'Adidas']);
-        self::$engine->insert(['name' => 'article', 'brand' => 'Nike']);
-        self::$engine->insert(['name' => 'article', 'brand' => 'Puma']);
+        $engine = $this->catalogue();
 
-        $results = self::$engine->search('article', filters: [
-            'or' => [
-                ['field' => 'brand', 'op' => '=', 'value' => 'Adidas'],
-                ['field' => 'brand', 'op' => '=', 'value' => 'Puma'],
-            ],
-        ]);
+        $this->assertSame(4, $engine->count());
+        $this->assertSame(1, $engine->stats()['segments']);
+    }
 
-        $brands = array_column(array_column($results, 'document'), 'brand');
-        sort($brands);
+    #[Test]
+    public function a_generator_can_be_imported_without_being_materialised(): void
+    {
+        $engine = $this->engine();
 
-        $this->assertSame(['Adidas', 'Puma'], $brands);
+        $engine->putMany((static function (): \Generator {
+            foreach (range(1, 50) as $n) {
+                yield "sku-$n" => ['title' => "Product $n", 'price' => $n * 1.5];
+            }
+        })());
+
+        $this->assertSame(50, $engine->count());
+        $this->assertSame(50, $engine->search('product')->total);
+    }
+
+    #[Test]
+    public function a_refused_document_takes_its_whole_batch_with_it(): void
+    {
+        $engine = $this->engine(Schema::make()->text('title')->number('price'));
+
+        try {
+            $engine->putMany([
+                'sku-1' => ['title' => 'Shoe', 'price' => 129.90],
+                'sku-2' => ['title' => 'Boot', 'price' => 'sur devis'],
+            ]);
+
+            $this->fail('Expected the batch to be refused.');
+        } catch (FieldTypeException $e) {
+            $this->assertStringContainsString("'price'", $e->getMessage());
+        }
+
+        // Not half an import: nothing is published rather than one of the two,
+        // because nothing would tell the caller which half landed.
+        $this->assertSame(0, $engine->count());
+        $this->assertFalse($engine->has('sku-1'));
+    }
+
+    #[Test]
+    public function deleting_removes_a_document_from_results_and_from_counts(): void
+    {
+        $engine = $this->catalogue();
+
+        $this->assertTrue($engine->delete('sku-1'));
+        $this->assertFalse($engine->delete('sku-1'));
+
+        $this->assertSame(3, $engine->count());
+        $this->assertFalse($engine->has('sku-1'));
+        $this->assertSame(1, $engine->search('leather')->total);
+    }
+
+    #[Test]
+    public function clear_empties_the_index_and_leaves_it_usable(): void
+    {
+        $engine = $this->catalogue();
+        $engine->clear();
+
+        $this->assertSame(0, $engine->count());
+        $this->assertSame(0, $engine->search('leather')->total);
+        $this->assertFalse($engine->has('sku-1'));
+        $this->assertSame(0, $engine->stats()['segments']);
+
+        $engine->put('sku-9', ['title' => 'Brown leather shoe']);
+
+        $this->assertSame(1, $engine->search('leather')->total);
+    }
+
+    #[Test]
+    public function a_cleared_index_can_be_reopened_with_a_different_schema(): void
+    {
+        $engine = $this->engine(Schema::make()->text('title'));
+        $engine->put('sku-1', ['title' => 'Shoe']);
+        $engine->clear();
+
+        // The freeze exists because segments were written to that schema, and
+        // after a clear there are none. So this is the one way to change a
+        // schema without a second directory.
+        $reopened = $this->engine(Schema::make()->text('title')->number('price'));
+        $reopened->put('sku-1', ['title' => 'Shoe', 'price' => 129.90]);
+
+        $this->assertSame(1, $reopened->search('shoe', filters: Filter::lt('price', 200))->total);
     }
 
     // =========================================================================
-    // compact()
+    // Searching
     // =========================================================================
 
     #[Test]
-    public function compact_preserves_non_deleted_documents(): void
+    public function a_search_returns_hits_with_their_id_score_and_document(): void
     {
-        self::$engine->insert(['name' => 'survie apres compaction']);
-        $toDelete = self::$engine->insert(['name' => 'a supprimer']);
-        self::$engine->delete($toDelete);
+        $result = $this->catalogue()->search('leather');
 
-        self::$engine->compact();
+        $this->assertSame(2, $result->total);
+        $this->assertCount(2, $result);
 
-        $this->assertNotEmpty(self::$engine->search('survie'));
+        foreach ($result as $hit) {
+            $this->assertContains($hit->id, ['sku-1', 'sku-2']);
+            $this->assertGreaterThan(0.0, $hit->score);
+            $this->assertArrayHasKey('title', $hit->document);
+        }
     }
 
     #[Test]
-    public function compact_removes_deleted_documents_from_results(): void
+    public function a_typo_still_finds_the_document(): void
     {
-        $toDelete = self::$engine->insert(['name' => 'disparu apres compaction']);
-        self::$engine->delete($toDelete);
-
-        self::$engine->compact();
-
-        $this->assertSame([], self::$engine->search('disparu'));
+        // The reason n-grams are indexed rather than words: a misspelling still
+        // shares most of them.
+        $this->assertSame(2, $this->catalogue()->search('lether')->total);
     }
 
     #[Test]
-    public function compact_resets_fragmentation_rate_to_zero(): void
+    public function japanese_needs_no_configuration(): void
     {
-        $id = self::$engine->insert(['name' => 'test']);
-        self::$engine->delete($id);
+        $this->assertSame(1, $this->catalogue()->search('革靴')->total);
+    }
 
-        self::$engine->compact();
+    #[Test]
+    public function the_total_is_the_whole_index_and_not_the_page(): void
+    {
+        $engine = $this->engine();
 
-        $this->assertSame(0, self::$engine->fragmentationRate());
+        $engine->putMany((static function (): \Generator {
+            foreach (range(1, 30) as $n) {
+                yield "sku-$n" => ['title' => "Leather shoe number $n"];
+            }
+        })());
+
+        $result = $engine->search('leather', limit: 5);
+
+        $this->assertSame(30, $result->total);
+        $this->assertCount(5, $result->hits);
+    }
+
+    #[Test]
+    public function offset_pages_through_the_ranking(): void
+    {
+        $engine = $this->engine();
+
+        $engine->putMany((static function (): \Generator {
+            foreach (range(1, 10) as $n) {
+                yield "sku-$n" => ['title' => "Leather shoe number $n"];
+            }
+        })());
+
+        $ids = static fn(int $offset): array => array_map(
+            static fn($hit): string => $hit->id,
+            $engine->search('leather', limit: 4, offset: $offset)->hits
+        );
+
+        $this->assertCount(4, $ids(0));
+        $this->assertCount(4, $ids(4));
+        $this->assertCount(2, $ids(8));
+        $this->assertSame([], array_intersect($ids(0), $ids(4)));
+    }
+
+    #[Test]
+    public function an_empty_query_matches_everything_so_filters_work_alone(): void
+    {
+        $result = $this->catalogue()->search('', filters: Filter::eq('brand', 'Nike'));
+
+        $this->assertSame(2, $result->total);
+    }
+
+    #[Test]
+    public function filters_facets_boosts_and_highlights_all_arrive(): void
+    {
+        // One call using every argument at once: the façade's job is to pass
+        // them through, and this is what would catch a swapped parameter.
+        $result = $this->catalogue()->search(
+            query:     'leather',
+            limit:     1,
+            filters:   Filter::all(Filter::eq('brand', 'Adidas'), Filter::gt('stock', 0)),
+            facets:    ['brand' => Facet::terms()],
+            boosts:    ['title' => 5.0],
+            highlight: Highlight::fields(['title'])->tags('<b>', '</b>'),
+        );
+
+        $this->assertSame(1, $result->total);
+        $this->assertCount(1, $result->hits);
+        $this->assertSame('sku-1', $result->hits[0]->id);
+        $this->assertSame('Brown <b>leather</b> shoe', $result->hits[0]->highlights['title']);
+        $this->assertSame(['Adidas' => 1], $result->facets['brand']);
+    }
+
+    #[Test]
+    public function a_result_reports_how_long_it_took(): void
+    {
+        $this->assertGreaterThan(0.0, $this->catalogue()->search('leather')->took);
+    }
+
+    // =========================================================================
+    // Introspection and maintenance
+    // =========================================================================
+
+    #[Test]
+    public function the_engine_is_countable(): void
+    {
+        $this->assertCount(4, $this->catalogue());
+    }
+
+    #[Test]
+    public function stats_describe_the_index_on_disk(): void
+    {
+        $stats = $this->catalogue()->stats();
+
+        $this->assertSame(4, $stats['documents']);
+        $this->assertSame(0, $stats['deleted']);
+        $this->assertSame(1, $stats['segments']);
+        $this->assertGreaterThan(0, $stats['bytes']);
+        $this->assertFalse($stats['needsOptimize']);
+    }
+
+    #[Test]
+    public function stats_count_a_deleted_document_as_deleted(): void
+    {
+        $engine = $this->catalogue();
+        $engine->delete('sku-1');
+
+        $stats = $engine->stats();
+
+        $this->assertSame(3, $stats['documents']);
+        $this->assertSame(1, $stats['deleted']);
+    }
+
+    #[Test]
+    public function optimize_merges_and_changes_nothing_a_caller_can_see(): void
+    {
+        $engine = $this->engine();
+
+        $engine->put('sku-1', ['title' => 'Brown leather shoe']);
+        $engine->put('sku-2', ['title' => 'Black leather boot']);
+        $engine->put('sku-3', ['title' => 'Canvas sneaker']);
+
+        $this->assertSame(3, $engine->stats()['segments']);
+
+        $before = $engine->search('leather');
+        $engine->optimize();
+        $after = $engine->search('leather');
+
+        $this->assertSame(1, $engine->stats()['segments']);
+        $this->assertSame($before->total, $after->total);
+        $this->assertSame(
+            array_map(static fn($hit): string => $hit->id, $before->hits),
+            array_map(static fn($hit): string => $hit->id, $after->hits),
+        );
+    }
+
+    #[Test]
+    public function optimize_on_a_healthy_index_does_nothing(): void
+    {
+        $engine = $this->catalogue();
+        $engine->optimize();
+
+        $this->assertSame(4, $engine->count());
+        $this->assertSame(1, $engine->stats()['segments']);
+    }
+
+    #[Test]
+    public function the_schema_is_readable_whether_declared_or_inferred(): void
+    {
+        $declared = $this->engine(Schema::make()->text('title')->number('price'));
+        $declared->put('sku-1', ['title' => 'Shoe', 'price' => 129.90]);
+
+        $this->assertSame('number', $declared->schema()->typeOf('price'));
+        $this->assertFalse($declared->schema()->isInferred());
+    }
+
+    #[Test]
+    public function an_inferred_schema_reads_the_types_off_the_documents(): void
+    {
+        $engine = $this->catalogue();
+
+        $this->assertTrue($engine->schema()->isInferred());
+        $this->assertSame('number', $engine->schema()->typeOf('price'));
+
+        // A string infers to keyword — an exact value to filter and facet on —
+        // and is still indexed, which is why searching it works above. What
+        // declaring text() buys is the boost and the length normalisation, not
+        // the searching.
+        $this->assertSame('keyword', $engine->schema()->typeOf('title'));
+        $this->assertContains('title', $engine->schema()->searchableFields());
     }
 }

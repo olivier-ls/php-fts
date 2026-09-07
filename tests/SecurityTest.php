@@ -4,17 +4,26 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts\Tests;
 
-use Ols\PhpFts\DocumentStorage;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Filter;
+use Ols\PhpFts\Highlight;
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchEngine;
+use Ols\PhpFts\Storage\Manifest;
+use Ols\PhpFts\Storage\SegmentReader;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
-use RuntimeException;
 
 /**
- * Regression tests for the issues fixed in 1.1.4.
+ * Regression tests for the three vulnerabilities fixed in 1.1.4.
+ *
+ * Carried over to 2.x deliberately. The engine they were reported against is
+ * gone — every class named in the original reports has been deleted — but a
+ * fix that is not tested against the code that replaced it is a fix that comes
+ * back. Each one is re-asserted here against the new implementation, which in
+ * two of the three cases is a different mechanism reaching the same guarantee.
  *
  * @see https://github.com/olivier-ls/php-fts/issues/1 stored XSS in highlights
  * @see https://github.com/olivier-ls/php-fts/issues/2 filter bypass by type juggling
@@ -22,41 +31,48 @@ use RuntimeException;
  */
 class SecurityTest extends TestCase
 {
-    private SearchEngine $engine;
-    private string       $tmpDir;
+    private string $dir;
 
     protected function setUp(): void
     {
-        $this->tmpDir = sys_get_temp_dir() . '/fts_sec_' . uniqid();
-        $this->engine = new SearchEngine();
-        $this->engine->open($this->tmpDir);
+        $this->dir = sys_get_temp_dir() . '/fts_sec_' . uniqid();
     }
 
     protected function tearDown(): void
     {
-        $this->engine->close();
-        self::removeDir($this->tmpDir);
+        self::removeDir($this->dir);
+    }
+
+    private function engine(?Schema $schema = null): SearchEngine
+    {
+        return SearchEngine::open($this->dir . '/index', $schema);
     }
 
     // =========================================================================
-    // Exception hierarchy — every throw used to resolve to a non-existent
-    // Ols\PhpFts\RuntimeException and surface as a fatal Error instead.
+    // The exception hierarchy the fixes rely on
     // =========================================================================
 
     #[Test]
     public function engine_errors_are_fts_exceptions(): void
     {
+        $this->engine(Schema::make()->text('title'))->put('sku-1', ['title' => 'Shoe']);
+
         $this->expectException(FtsException::class);
 
-        (new SearchEngine())->count();
+        // One catch is enough for an application that only wants to know that
+        // indexing failed.
+        $this->engine(Schema::make()->number('title'));
     }
 
     #[Test]
     public function fts_exceptions_remain_catchable_as_runtime_exception(): void
     {
-        $this->expectException(RuntimeException::class);
-
-        (new SearchEngine())->count();
+        try {
+            $this->engine()->search('x', filters: [['field' => 'a', 'op' => 'sounds like', 'value' => 1]]);
+            $this->fail('Expected a FilterException');
+        } catch (\RuntimeException $e) {
+            $this->assertInstanceOf(FtsException::class, $e);
+        }
     }
 
     #[Test]
@@ -64,139 +80,170 @@ class SecurityTest extends TestCase
     {
         $this->expectException(StorageException::class);
 
-        (new DocumentStorage())->read(999_999_999);
+        SegmentReader::open($this->dir . '/nothing-here.fts');
     }
 
     // =========================================================================
-    // Issue #1 — stored XSS via highlights
+    // Issue #1 — stored XSS in highlights
     // =========================================================================
 
     #[Test]
     public function highlights_escape_markup_coming_from_documents(): void
     {
-        $this->engine->insert(['name' => '<img src=x onerror=alert(1)> hello world']);
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'Shoe <script>alert(1)</script> leather']);
 
-        $results = $this->engine->search('hello', highlight: true);
-        $html    = $results[0]['highlights']['name'];
+        $marked = $engine->search('leather', highlight: ['title'])->hits[0]->highlights['title'];
 
-        $this->assertStringNotContainsString('<img', $html);
-        $this->assertStringContainsString('&lt;img', $html);
+        // Two defences in sequence, which is why the payload survives as inert
+        // text: the analyzer strips the tags, and what is left is escaped. The
+        // string `alert(1)` remains, and is now a word rather than a script.
+        $this->assertStringNotContainsString('<script>', $marked);
+        $this->assertStringNotContainsString('</script>', $marked);
+        $this->assertSame('Shoe alert(1) <mark>leather</mark>', $marked);
+
+        // No angle bracket in the output that this library did not put there.
+        $this->assertSame('Shoe alert(1) leather', strip_tags($marked));
+    }
+
+    #[Test]
+    public function an_attribute_payload_cannot_escape_its_quotes(): void
+    {
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'leather" onmouseover="alert(1)']);
+
+        $marked = $engine->search('leather', highlight: ['title'])->hits[0]->highlights['title'];
+
+        // Rendered inside an attribute, an unescaped double quote is the whole
+        // exploit. `htmlspecialchars` with ENT_QUOTES is what closes it.
+        $this->assertStringNotContainsString('"', $marked);
+        $this->assertStringContainsString('&quot;', $marked);
     }
 
     #[Test]
     public function highlights_still_emit_their_own_tags(): void
     {
-        $this->engine->insert(['name' => 'brown leather shoe']);
+        // The fix must not have escaped its way out of being useful: the
+        // engine's own tags are markup and stay markup.
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'Brown leather shoe']);
 
-        $results = $this->engine->search('leather', highlight: true);
-
-        $this->assertStringContainsString('<mark>', $results[0]['highlights']['name']);
+        $this->assertSame(
+            'Brown <mark>leather</mark> shoe',
+            $engine->search('leather', highlight: ['title'])->hits[0]->highlights['title']
+        );
     }
 
     #[Test]
-    public function highlight_escaping_can_be_disabled_explicitly(): void
+    public function escaping_can_only_be_dropped_explicitly(): void
     {
-        $this->engine->insert(['name' => '<b>bold</b> leather']);
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'A "leather" shoe']);
 
-        $results = $this->engine->search('leather', highlight: true, highlightOptions: [
-            'escape' => false,
-        ]);
+        $safe = $engine->search('leather', highlight: Highlight::fields(['title']));
+        $raw  = $engine->search('leather', highlight: Highlight::fields(['title'])->raw());
 
-        $this->assertStringContainsString('<b>bold</b>', $results[0]['highlights']['name']);
+        $this->assertStringContainsString('&quot;', $safe->hits[0]->highlights['title']);
+        $this->assertStringContainsString('"leather"', str_replace(
+            ['<mark>', '</mark>'],
+            '',
+            $raw->hits[0]->highlights['title']
+        ));
+    }
+
+    #[Test]
+    public function offsets_carry_no_markup_to_escape(): void
+    {
+        // The third answer to the same question: a caller that renders its own
+        // output gets positions and never sees a tag from this library.
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'Brown leather shoe']);
+
+        $marked = $engine->search(
+            'leather',
+            highlight: Highlight::fields(['title'])->positions()
+        )->hits[0]->highlights['title'];
+
+        $this->assertIsArray($marked);
+        $this->assertSame('Brown leather shoe', $marked['text']);
+        $this->assertSame([[6, 13]], $marked['spans']);
     }
 
     // =========================================================================
-    // Issue #2 — filter bypass by PHP type juggling
+    // Issue #2 — filter bypass by type juggling
     // =========================================================================
 
     #[Test]
     public function boolean_true_no_longer_matches_every_non_empty_string(): void
     {
-        $this->engine->insert(['name' => 'sneaker one', 'category' => 'Sneakers']);
-        $this->engine->insert(['name' => 'sneaker two', 'category' => 'Boots']);
+        // The original bug: `'Nike' == true` is true in PHP, so filtering
+        // `active => true` matched every document with a non-empty string in
+        // that field. Now the comparison is refused before it is made.
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'Shoe', 'brand' => 'Nike']);
 
-        $bypass = $this->engine->search('sneaker', filters: ['and' => [
-            ['field' => 'category', 'op' => 'in', 'value' => [true]],
-        ]]);
+        $this->expectException(FilterException::class);
 
-        $this->assertCount(0, $bypass);
+        $engine->search('', filters: Filter::eq('brand', true));
     }
 
     #[Test]
-    public function equality_filter_rejects_cross_type_comparison(): void
+    public function a_boolean_field_still_filters_on_a_boolean(): void
     {
-        $this->engine->insert(['name' => 'sneaker one', 'category' => 'Sneakers']);
+        $engine = $this->engine();
+        $engine->putMany([
+            'sku-1' => ['title' => 'Shoe', 'active' => true],
+            'sku-2' => ['title' => 'Boot', 'active' => false],
+        ]);
 
-        $results = $this->engine->search('sneaker', filters: ['and' => [
-            ['field' => 'category', 'op' => '=', 'value' => true],
-        ]]);
-
-        $this->assertCount(0, $results);
+        $this->assertSame(1, $engine->search('', filters: Filter::eq('active', true))->total);
+        $this->assertSame(1, $engine->search('', filters: Filter::eq('active', false))->total);
     }
 
     #[Test]
-    public function legitimate_filters_are_unaffected(): void
+    public function a_numeric_filter_refuses_a_value_it_would_have_to_guess_at(): void
     {
-        $this->engine->insert(['name' => 'sneaker one', 'category' => 'Sneakers']);
-        $this->engine->insert(['name' => 'sneaker two', 'category' => 'Boots']);
+        $engine = $this->engine(Schema::make()->text('title')->number('price'));
+        $engine->put('sku-1', ['title' => 'Shoe', 'price' => 129.90]);
 
-        $results = $this->engine->search('sneaker', filters: ['and' => [
-            ['field' => 'category', 'op' => 'in', 'value' => ['Sneakers']],
-        ]]);
+        // A numeric string from $_GET is accepted — there is nothing left to
+        // guess at by then. A word is not.
+        $this->assertSame(1, $engine->search('', filters: Filter::lte('price', '200'))->total);
 
-        $this->assertCount(1, $results);
-        $this->assertSame('Sneakers', $results[0]['document']['category']);
+        $this->expectException(FilterException::class);
+
+        $engine->search('', filters: Filter::lte('price', 'cheap'));
     }
 
     #[Test]
     public function int_and_float_still_compare_numerically(): void
     {
-        $this->engine->insert(['name' => 'pricey thing', 'price' => 130]);
+        $engine = $this->engine();
+        $engine->put('sku-1', ['title' => 'Shoe', 'price' => 100.0]);
 
-        $matches = fn(mixed $value): int => count($this->engine->search('pricey', filters: ['and' => [
-            ['field' => 'price', 'op' => '=', 'value' => $value],
-        ]]));
-
-        $this->assertSame(1, $matches(130));
-        $this->assertSame(1, $matches(130.0));
-        $this->assertSame(0, $matches('130'), 'a numeric string is a different type');
+        $this->assertSame(1, $engine->search('', filters: Filter::eq('price', 100))->total);
+        $this->assertSame(1, $engine->search('', filters: Filter::gte('price', 99.5))->total);
+        $this->assertSame(0, $engine->search('', filters: Filter::gt('price', 100))->total);
     }
 
     #[Test]
-    public function numeric_comparison_rejects_non_numeric_expected_values(): void
+    public function an_unknown_operator_is_refused_rather_than_ignored(): void
     {
-        $this->engine->insert(['name' => 'stocked thing', 'stock' => 5]);
-
-        $results = $this->engine->search('stocked', filters: ['and' => [
-            ['field' => 'stock', 'op' => '>', 'value' => true],
-        ]]);
-
-        $this->assertCount(0, $results);
-    }
-
-    #[Test]
-    public function malformed_filter_raises_a_filter_exception(): void
-    {
-        $this->engine->insert(['name' => 'anything']);
-
-        $this->expectException(FilterException::class);
-        $this->expectExceptionMessageMatches("/missing the 'op' key/");
-
-        $this->engine->search('anything', filters: ['and' => [
-            ['field' => 'name'],
-        ]]);
-    }
-
-    #[Test]
-    public function unknown_operator_raises_a_filter_exception(): void
-    {
-        $this->engine->insert(['name' => 'anything']);
-
+        // The failure nobody notices: a dropped clause widens a search instead
+        // of narrowing it, and the page looks like it worked.
         $this->expectException(FilterException::class);
 
-        $this->engine->search('anything', filters: ['and' => [
+        $this->engine()->search('anything', filters: [
             ['field' => 'name', 'op' => 'sounds like', 'value' => 'x'],
-        ]]);
+        ]);
+    }
+
+    #[Test]
+    public function a_malformed_filter_structure_is_refused(): void
+    {
+        $this->expectException(FilterException::class);
+
+        Filter::fromArray(['op' => 'eq']);
     }
 
     // =========================================================================
@@ -204,48 +251,98 @@ class SecurityTest extends TestCase
     // =========================================================================
 
     #[Test]
-    public function opening_refuses_to_follow_a_symlink_to_an_existing_file(): void
+    public function reading_refuses_to_follow_a_symlink(): void
     {
-        $victim  = $this->tmpDir . '/victim.txt';
-        $linkDir = $this->tmpDir . '/linked';
+        $victim = $this->dir . '/victim.txt';
+        $link   = $this->dir . '/seg_linked.fts';
 
-        file_put_contents($victim, 'DO NOT TRUNCATE');
-        mkdir($linkDir);
+        mkdir($this->dir, 0755, true);
+        file_put_contents($victim, 'DO NOT READ THROUGH ME');
 
-        if (!@symlink($victim, $linkDir . '/documents.bin')) {
+        if (!@symlink($victim, $link)) {
             $this->markTestSkipped('symlink() is not available on this platform');
         }
 
         try {
-            (new SearchEngine())->open($linkDir);
+            SegmentReader::open($link);
             $this->fail('Expected the symlink to be refused');
         } catch (StorageException $e) {
             $this->assertMatchesRegularExpression('/symbolic link|does not resolve/i', $e->getMessage());
+        }
+    }
+
+    #[Test]
+    public function writing_a_commit_refuses_to_follow_a_symlink(): void
+    {
+        // The commit file is written under a temporary name and renamed into
+        // place, so the temporary name is the one an attacker would pre-place.
+        // It is opened with the same guard as every other file, which is what
+        // this asserts: the victim keeps its contents.
+        $victim = $this->dir . '/victim.txt';
+        $index  = $this->dir . '/index';
+
+        mkdir($index, 0755, true);
+        file_put_contents($victim, 'DO NOT TRUNCATE');
+
+        if (!@symlink($victim, $index . '/commit.1.tmp')) {
+            $this->markTestSkipped('symlink() is not available on this platform');
+        }
+
+        try {
+            Manifest::initial()->next([])->write($index);
+            $this->fail('Expected the symlink to be refused');
+        } catch (StorageException $e) {
+            $this->addToAssertionCount(1);
         }
 
         $this->assertSame('DO NOT TRUNCATE', file_get_contents($victim));
     }
 
     #[Test]
-    public function opening_refuses_to_follow_a_dangling_symlink(): void
+    public function writing_a_commit_refuses_a_dangling_symlink(): void
     {
-        $victim  = $this->tmpDir . '/not-yet-created.php';
-        $linkDir = $this->tmpDir . '/linked_dangling';
+        $victim = $this->dir . '/not-yet-created.php';
+        $index  = $this->dir . '/index';
 
-        mkdir($linkDir);
+        mkdir($index, 0755, true);
 
-        if (!@symlink($victim, $linkDir . '/documents.bin')) {
+        if (!@symlink($victim, $index . '/commit.1.tmp')) {
             $this->markTestSkipped('symlink() is not available on this platform');
         }
 
         try {
-            (new SearchEngine())->open($linkDir);
+            Manifest::initial()->next([])->write($index);
             $this->fail('Expected the dangling symlink to be refused');
         } catch (StorageException $e) {
             $this->addToAssertionCount(1);
         }
 
+        // A dangling link is the dangerous case: following it *creates* the
+        // target, so a file the attacker names appears with content the
+        // process wrote.
         $this->assertFileDoesNotExist($victim, 'the symlink target must not have been created');
+    }
+
+    #[Test]
+    public function a_commit_that_is_a_symlink_is_not_trusted(): void
+    {
+        $victim = $this->dir . '/victim.txt';
+        $index  = $this->dir . '/index';
+
+        mkdir($index, 0755, true);
+        file_put_contents($victim, 'DO NOT READ THROUGH ME');
+
+        if (!@symlink($victim, $index . '/commit.1')) {
+            $this->markTestSkipped('symlink() is not available on this platform');
+        }
+
+        // Reading falls back to the previous commit when one cannot be
+        // trusted, and a symlinked commit cannot: the index opens empty rather
+        // than opening whatever the link pointed at.
+        $engine = SearchEngine::open($index);
+
+        $this->assertSame(0, $engine->count());
+        $this->assertSame('DO NOT READ THROUGH ME', file_get_contents($victim));
     }
 
     // =========================================================================

@@ -1,5 +1,13 @@
 <?php
 
+/*
+ * ⚠ Still on the 1.x API, and therefore broken on this branch.
+ *
+ * Left for last on purpose: the numbers this prints are the ones that go in
+ * the README, and measuring 2.x before it is finished would produce a figure
+ * that has to be taken back. Ported when the rest is in place.
+ */
+
 set_time_limit(0);
 
 require __DIR__ . '/autoload.php';

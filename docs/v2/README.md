@@ -1,6 +1,13 @@
-> **⚠ DESIGN DRAFT — v2.0**
-> This is the *target* README for php-fts 2.0. Nothing here is implemented yet.
-> It exists to lock the public API before a single line of storage code is written.
+> **⚠ WORK IN PROGRESS — v2.0**
+> This is the *target* README for php-fts 2.0, written first to lock the public
+> API. Most of it now describes code that exists: the engine, the schema,
+> filters, facets, highlighting and the segment format are implemented and
+> tested on the `2.x` branch.
+>
+> Still unwritten, and marked as such below where it appears: `Sort` and the
+> `sort:` argument, multi-valued `tags` as a filterable column, per-field
+> analyzer overrides, and `UPGRADE.md`.
+>
 > The shipped documentation is still [`/README.md`](../../README.md) (1.x).
 
 ---
@@ -114,7 +121,7 @@ folding is not implemented yet.
 Need control? Override per field:
 
 ```php
-Schema::make()->text('title', analyzer: Analyzer::japanese())
+Schema::make()->text('title', analyzer: Analyzer::japanese())   // not implemented yet
 ```
 
 ---
@@ -193,7 +200,8 @@ $engine = SearchEngine::open('./search_data', Schema::make()
     ->text('description')
     ->keyword('brand')            // exact match, filterable, facetable
     ->keyword('category')
-    ->tags('tags')                // array of keywords
+    ->tags('tags')                // array of keywords — stored and searchable
+                                  // today; filterable and facetable next
     ->number('price')             // filterable, sortable, range facets
     ->number('stock')
     ->boolean('active')
@@ -305,7 +313,7 @@ $result = $engine->search(
     boosts:    ['title' => 3.0],
     filters:   Filter::eq('active', true),
     facets:    ['brand', 'category'],
-    sort:      [Sort::score(), Sort::asc('price')],
+    sort:      [Sort::score(), Sort::asc('price')],   // not implemented yet
     highlight: ['title', 'description'],
 );
 ```
@@ -332,7 +340,8 @@ An empty query matches everything, so filters and facets work on their own —
 category pages, admin tables, faceted browsing:
 
 ```php
-$engine->search('', filters: Filter::eq('category', 'Shoes'), sort: [Sort::asc('price')]);
+$engine->search('', filters: Filter::eq('category', 'Shoes'));
+$engine->search('', filters: Filter::eq('category', 'Shoes'), sort: [Sort::asc('price')]);   // sort: not yet
 ```
 
 ---
@@ -590,13 +599,17 @@ across the whole index.
 
 ```
 search_data/
-  commit.7          manifest — the list of live segments
+  commit.7          manifest — live segments, their tombstones, the schema
   seg_a1f.fts       a segment: terms, postings, doc-values, documents
-  deleted.bin       tombstones
 ```
 
-An idle index is typically **three files**. Copy the directory to another server
+An idle index is typically **two files**. Copy the directory to another server
 and it works — the format is byte-order independent.
+
+Tombstones live in the manifest rather than in a file of their own. A separate
+one would have to be kept in step with the commit that referred to it, which is
+a second atomicity problem to solve; inside the manifest, deleting a document
+is the same single atomic `rename()` as every other write.
 
 ---
 
