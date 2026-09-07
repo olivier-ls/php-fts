@@ -95,7 +95,14 @@ class LockManager
      * Executes a callable under lock.
      * Guarantees release even if an exception is thrown.
      *
-     * @throws LockException
+     * Anything the callable throws is propagated unchanged — the lock is
+     * released on the way out, nothing is swallowed. Declared as \Throwable
+     * because that is what actually leaves this method; annotating only
+     * LockException would tell callers their own exceptions cannot escape,
+     * which is untrue and would hide it from static analysis.
+     *
+     * @throws LockException if the lock cannot be acquired
+     * @throws \Throwable    whatever the callable throws
      */
     public function withLock(callable $fn): mixed
     {

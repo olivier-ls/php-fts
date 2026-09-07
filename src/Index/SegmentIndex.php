@@ -140,24 +140,14 @@ final class SegmentIndex
     ): SearchResult {
         $started = hrtime(true);
 
-        [$matches, $scores] = $this->matchQuery($query);
-
-        foreach ($filters as $filter) {
-            $matches = $matches->and($this->evaluate($filter));
-        }
+        [$matches, $scores] = $this->select($query, $filters);
 
         $total = $matches->count();
 
         $counted = [];
 
         foreach ($facets as $field) {
-            $column = $this->column($field);
-
-            if ($column instanceof KeywordColumn) {
-                $counted[$field] = $column->facet($matches);
-            } elseif ($column instanceof NumericColumn) {
-                $counted[$field] = $column->stats($matches);
-            }
+            $counted[$field] = $this->facetOn($field, $matches);
         }
 
         $hits = [];
@@ -173,6 +163,81 @@ final class SegmentIndex
         }
 
         return new SearchResult($hits, $total, $counted, (hrtime(true) - $started) / 1e6);
+    }
+
+    // -------------------------------------------------------------------------
+    // Used by the multi-segment layer, which has to combine several segments
+    // before it can rank or count anything. Not part of the public surface.
+    // -------------------------------------------------------------------------
+
+    /**
+     * The documents in this segment matching a query and its filters.
+     *
+     * @param array<int, array{field: string, op: string, value: mixed}> $filters
+     * @param Bitset|null $deleted documents the manifest marks as deleted
+     *
+     * @return array{0: Bitset, 1: array<int, int>} the matches, and term counts
+     * @internal
+     * @throws CorruptSegmentException
+     * @throws FilterException
+     */
+    public function select(string $query, array $filters = [], ?Bitset $deleted = null): array
+    {
+        [$matches, $scores] = $this->matchQuery($query);
+
+        foreach ($filters as $filter) {
+            $matches = $matches->and($this->evaluate($filter));
+        }
+
+        if ($deleted !== null) {
+            $matches = $matches->andNot($deleted);
+        }
+
+        return [$matches, $scores];
+    }
+
+    /**
+     * @return array<string|int, mixed> term counts for a keyword field, statistics for a numeric one
+     * @internal
+     * @throws CorruptSegmentException
+     */
+    public function facetOn(string $field, Bitset $matches): array
+    {
+        $column = $this->column($field);
+
+        return match (true) {
+            $column instanceof KeywordColumn => $column->facet($matches, size: 0),
+            $column instanceof NumericColumn => $column->stats($matches),
+            default                          => [],
+        };
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     * @internal
+     * @throws CorruptSegmentException
+     */
+    public function documentAt(int $ordinal): ?array
+    {
+        return $this->documents->get($ordinal);
+    }
+
+    /**
+     * @internal
+     * @throws CorruptSegmentException
+     */
+    public function keyAt(int $ordinal): string
+    {
+        return $this->keyOf($ordinal);
+    }
+
+    /**
+     * @internal
+     * @throws CorruptSegmentException
+     */
+    public function ordinalFor(string $id): ?int
+    {
+        return $this->ordinalOf($id);
     }
 
     // -------------------------------------------------------------------------
