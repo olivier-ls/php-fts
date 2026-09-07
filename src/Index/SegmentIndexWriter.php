@@ -84,6 +84,18 @@ final class SegmentIndexWriter
     /** @var array<string, true> ids already used, to catch duplicates */
     private array $seen = [];
 
+    /** Whether the documents were carried across rather than analysed. */
+    private bool $carried = false;
+
+    /** @var array<string, array<int, int>> term => ordinal => field mask */
+    private array $carriedPostings = [];
+
+    /** @var array<int, array<int, int>> ordinal => bit => length */
+    private array $carriedLengths = [];
+
+    /** @var array<int, array<string, mixed>> ordinal => field => column value */
+    private array $carriedColumns = [];
+
     /** The schema actually written, declared or inferred. */
     private ?Schema $effectiveSchema = null;
 
@@ -157,6 +169,74 @@ final class SegmentIndexWriter
         return count($this->documents);
     }
 
+    // -------------------------------------------------------------------------
+    // The carried path: a document that has already been indexed once.
+    //
+    // A merge has no text to analyse — `source()` decides what is stored, and a
+    // field excluded from it still has terms and a column. So instead of being
+    // re-analysed, a document is *carried*: its postings, its field lengths and
+    // its column values are read out of the segment it came from and handed
+    // over as they are. Everything below the collection step is shared with
+    // put(), so both paths produce the same layout by construction rather than
+    // by two implementations agreeing.
+    // -------------------------------------------------------------------------
+
+    /**
+     * One document, already indexed, coming across from another segment.
+     *
+     * @param array<string, mixed> $stored  the document as it should stay stored
+     * @param array<int, int>      $lengths bit => how many terms in that field
+     * @param array<string, mixed> $columns field => the value its column holds
+     *
+     * @internal for SegmentMerger
+     * @throws StorageException
+     */
+    public function carry(string $id, array $stored, array $lengths, array $columns): void
+    {
+        if ($id === '') {
+            throw new StorageException('Document ids cannot be empty');
+        }
+
+        if (isset($this->seen[$id])) {
+            throw new StorageException("Duplicate document id in this batch: '$id'");
+        }
+
+        // No coercion: these values were coerced when they were first indexed,
+        // against this same frozen schema. Running them through again would at
+        // best be work and at worst would refuse, on a merge, a document the
+        // index already holds.
+        $this->seen[$id]        = true;
+        $this->keys[]           = $id;
+        $this->documents[]      = $stored;
+        $this->carriedLengths[] = $lengths;
+        $this->carriedColumns[] = $columns;
+        $this->carried          = true;
+    }
+
+    /**
+     * The postings of a whole segment being carried, added to what is already
+     * accumulated.
+     *
+     * Per segment rather than per document, because that is the order they are
+     * read in — see SegmentIndex::postingsByTerm(). The ordinals are the
+     * *new* ones, which only the caller knows.
+     *
+     * @param array<string, array<int, int>> $postings term => ordinal => field mask
+     *
+     * @internal for SegmentMerger
+     */
+    public function carryPostings(array $postings): void
+    {
+        foreach ($postings as $term => $byOrdinal) {
+            foreach ($byOrdinal as $ordinal => $mask) {
+                // A term found in several fields keeps one posting with several
+                // bits set, exactly as the analysing path builds it.
+                $this->carriedPostings[$term][$ordinal] =
+                    ($this->carriedPostings[$term][$ordinal] ?? 0) | $mask;
+            }
+        }
+    }
+
     /**
      * Writes the segment.
      *
@@ -177,6 +257,14 @@ final class SegmentIndexWriter
             // With no schema, everything is inferred and the result is turned
             // into one, so declared and inferred indexes take the same path
             // from here on.
+            if ($this->carried && $this->schema === null) {
+                // Impossible by construction — a merge only happens after a
+                // commit, and a commit freezes a schema — but inferring from
+                // carried documents would read a `source()`-narrowed copy and
+                // quietly give a field a different type. Better to say so.
+                throw new StorageException('Carried documents need the frozen schema; none was given');
+            }
+
             $schema = $this->schema ?? Schema::inferred($this->inferFields());
 
             $this->effectiveSchema = $schema;
@@ -371,32 +459,12 @@ final class SegmentIndexWriter
         $searchable = $schema->searchableFields();
         $maskWidth  = max(1, (int) ceil(count($searchable) / 8));
 
-        /** @var array<string, array<int, int>> term => ordinal => field bitmap */
-        $postings = [];
-
-        /** @var array<int, array<int, int>> ordinal => bit => terms in that field */
-        $lengths = [];
-
-        /** @var array<int, int> bit => summed lengths across the segment */
-        $sums = array_fill(0, max(1, count($searchable)), 0);
-
-        foreach ($this->documents as $ordinal => $document) {
-            foreach ($searchable as $bit => $field) {
-                $terms = $this->analyzer->analyze($this->textOf($document[$field] ?? null));
-
-                // Recorded now because it cannot be recovered from the postings
-                // without walking every one of them, and BM25F needs a length
-                // per field, not per document.
-                $lengths[$ordinal][$bit] = count($terms);
-                $sums[$bit]             += count($terms);
-
-                foreach ($terms as $term) {
-                    // A term found in several fields keeps one posting with
-                    // several bits set, rather than one posting per field.
-                    $postings[$term][$ordinal] = ($postings[$term][$ordinal] ?? 0) | (1 << $bit);
-                }
-            }
-        }
+        // The two ways a segment can come by its postings. Everything after
+        // this line is shared, so a carried segment and an analysed one cannot
+        // disagree about the layout — there is only one encoder.
+        [$postings, $lengths, $sums] = $this->carried
+            ? $this->carriedTerms($searchable)
+            : $this->analysedTerms($searchable);
 
         // Sorted bytewise, which the dictionary requires and which UTF-8 makes
         // the same as sorting by code point.
@@ -464,6 +532,89 @@ final class SegmentIndexWriter
         $this->termLengthSum    = array_sum($sums);
     }
 
+    /**
+     * Analyses every document, field by field.
+     *
+     * @param string[] $searchable bit => field name
+     * @return array{0: array<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     */
+    private function analysedTerms(array $searchable): array
+    {
+        /** @var array<string, array<int, int>> term => ordinal => field bitmap */
+        $postings = [];
+
+        /** @var array<int, array<int, int>> ordinal => bit => terms in that field */
+        $lengths = [];
+
+        /** @var array<int, int> bit => summed lengths across the segment */
+        $sums = array_fill(0, max(1, count($searchable)), 0);
+
+        foreach ($this->documents as $ordinal => $document) {
+            foreach ($searchable as $bit => $field) {
+                $terms = $this->analyzer->analyze($this->textOf($document[$field] ?? null));
+
+                // Recorded now because it cannot be recovered from the postings
+                // without walking every one of them, and BM25F needs a length
+                // per field, not per document.
+                $lengths[$ordinal][$bit] = count($terms);
+                $sums[$bit]             += count($terms);
+
+                foreach ($terms as $term) {
+                    // A term found in several fields keeps one posting with
+                    // several bits set, rather than one posting per field.
+                    $postings[$term][$ordinal] = ($postings[$term][$ordinal] ?? 0) | (1 << $bit);
+                }
+            }
+        }
+
+        return [$postings, $lengths, $sums];
+    }
+
+    /**
+     * The postings and lengths that came across from other segments.
+     *
+     * Nothing is analysed and nothing is recomputed: a term the source segment
+     * held is a term this one holds, and a field length measured once is
+     * measured. The sums are re-added because they are a property of *this*
+     * segment, whose documents are a subset of the sources' — anything deleted
+     * along the way must not still be in the average BM25 normalises against.
+     *
+     * @param string[] $searchable bit => field name
+     * @return array{0: array<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     */
+    private function carriedTerms(array $searchable): array
+    {
+        $sums    = array_fill(0, max(1, count($searchable)), 0);
+        $lengths = [];
+
+        foreach ($this->carriedLengths as $ordinal => $byBit) {
+            foreach (array_keys($sums) as $bit) {
+                $length = $byBit[$bit] ?? 0;
+
+                $lengths[$ordinal][$bit] = $length;
+                $sums[$bit]             += $length;
+            }
+        }
+
+        return [$this->carriedPostings, $lengths, $sums];
+    }
+
+
+    /**
+     * The value a column should record for one document.
+     *
+     * The document is the source of truth when it was analysed here, and the
+     * *old column* is when it was carried across. That distinction is the fix
+     * for `source()`: a field the schema does not store is not in the document
+     * a merge reads back, but its value never left the columnar side of the
+     * segment, so it is still there to be copied.
+     */
+    private function valueForColumn(int $ordinal, string $field): mixed
+    {
+        return $this->carried
+            ? ($this->carriedColumns[$ordinal][$field] ?? null)
+            : ($this->documents[$ordinal][$field] ?? null);
+    }
 
     /**
      * @param Schema $schema decides which fields earn a column
@@ -481,8 +632,8 @@ final class SegmentIndexWriter
             if ($type === 'number' || $type === 'boolean') {
                 $column = new NumericColumnWriter();
 
-                foreach ($this->documents as $ordinal => $document) {
-                    $value = $document[$field] ?? null;
+                foreach (array_keys($this->documents) as $ordinal) {
+                    $value = $this->valueForColumn($ordinal, $field);
 
                     $column->add($ordinal, match (true) {
                         is_bool($value)               => $value ? 1.0 : 0.0,
@@ -498,8 +649,8 @@ final class SegmentIndexWriter
             if ($type === 'keyword') {
                 $column = new KeywordColumnWriter();
 
-                foreach ($this->documents as $ordinal => $document) {
-                    $value = $document[$field] ?? null;
+                foreach (array_keys($this->documents) as $ordinal) {
+                    $value = $this->valueForColumn($ordinal, $field);
                     $column->add($ordinal, is_string($value) ? $value : null);
                 }
 
@@ -513,8 +664,8 @@ final class SegmentIndexWriter
             if ($type === 'tags') {
                 $column = new TagColumnWriter();
 
-                foreach ($this->documents as $ordinal => $document) {
-                    $value = $document[$field] ?? null;
+                foreach (array_keys($this->documents) as $ordinal) {
+                    $value = $this->valueForColumn($ordinal, $field);
 
                     // A single string is a one-element list. The writer accepts
                     // it, so a document whose one tag arrived unwrapped is not a

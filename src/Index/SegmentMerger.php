@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Analysis\Analyzer;
+use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Schema;
 
@@ -12,19 +13,41 @@ use Ols\PhpFts\Schema;
  * Combines several segments into one, dropping the documents they no longer
  * hold.
  *
- * ── How it does it, and what that costs ─────────────────────────────────────
+ * ── Why it does not re-index ────────────────────────────────────────────────
  *
- * By re-indexing: the live documents are read out of the source segments and
- * fed to a fresh SegmentIndexWriter. A faster merger would splice the term
- * dictionaries and posting lists together directly, without analysing any text
- * again — that is what a mature engine does, and it is several times quicker.
+ * It used to. The live documents were read back out of the source segments and
+ * fed to a fresh SegmentIndexWriter, which analysed them again — appealing,
+ * because a merge could then not produce a segment that differed from what a
+ * fresh index would have produced.
  *
- * Re-indexing was chosen anyway, for now, because it cannot produce a segment
- * that differs from what a fresh index would have produced. A dictionary splice
- * has to get ordinal remapping, skip tables and value dictionaries all exactly
- * right, and every one of those is a place to be subtly wrong in a way no test
- * would obviously catch. The direct merge is worth doing once there is a
- * differential test to hold it against.
+ * It was also wrong, and not subtly. **The documents are not necessarily
+ * there.** `source()` decides what the docstore keeps, and a field left out of
+ * it is still indexed and still has a column — that is the whole point of it:
+ * search the description, do not store a second copy of it. Re-indexing read
+ * back a document with that field missing and produced a segment without its
+ * terms and without its column. With `source(false)` there were no documents at
+ * all, so the first automatic merge turned a working index into one that
+ * matched nothing. Silently, because a merge needs no permission and reports no
+ * result.
+ *
+ * So a document is **carried** instead. Everything a merge needs is already on
+ * disk in a form that does not involve text:
+ *
+ *   - the postings *are* the terms — walking them yields (term, ordinal, field
+ *     mask), which is exactly what the writer accumulates;
+ *   - the field lengths BM25F needs were measured once and recorded;
+ *   - a column holds its own values, so it can be read into the next column;
+ *   - the stored document, the keys — copied as they are.
+ *
+ * Nothing is analysed, so nothing depends on what `source()` kept. It is also
+ * several times quicker, which was the other argument for doing it this way,
+ * and the one that mattered less.
+ *
+ * What it costs is that the ordinal remapping has to be right, and there is no
+ * cheap way to be sure by inspection. Hence the differential test: an index
+ * merged from three segments must answer identically to the same documents
+ * indexed in one commit, term by term, filter by filter, facet by facet, and
+ * with `source()` set every way it can be.
  *
  * ── What a merge actually achieves ──────────────────────────────────────────
  *
@@ -57,25 +80,57 @@ final class SegmentMerger
      */
     public function merge(array $sources, array $deletions, string $path, ?Schema $schema = null): int
     {
-        $writer = new SegmentIndexWriter($this->analyzer, $schema);
+        $schema ??= $this->schemaOf($sources);
+        $writer   = new SegmentIndexWriter($this->analyzer, $schema);
+
+        $columns = [];
+
+        foreach ($schema->fields() as $field => $definition) {
+            if ($definition['filterable']) {
+                $columns[] = (string) $field;
+            }
+        }
 
         foreach ($sources as $position => $segment) {
             $deleted = $deletions[$position] ?? null;
             $count   = $segment->count();
+
+            // The new ordinal each surviving document lands on. Built before
+            // the postings are walked, because a posting names a source
+            // ordinal and has to be translated as it is read — and because a
+            // deleted document has no new ordinal at all, which is how its
+            // postings stop existing rather than being filtered out forever.
+            $remap = [];
+            $next  = $writer->count();
 
             for ($ordinal = 0; $ordinal < $count; $ordinal++) {
                 if ($deleted !== null && $deleted->has($ordinal)) {
                     continue;
                 }
 
-                $document = $segment->documentAt($ordinal);
+                $carried = [];
 
-                if ($document === null) {
-                    continue;
+                foreach ($columns as $field) {
+                    $carried[$field] = $segment->columnValue($field, $ordinal);
                 }
 
-                $writer->put($segment->keyAt($ordinal), $document);
+                $writer->carry(
+                    $segment->keyAt($ordinal),
+                    $segment->documentAt($ordinal) ?? [],
+                    $segment->fieldLengths($ordinal),
+                    $carried,
+                );
+
+                $remap[$ordinal] = $next++;
             }
+
+            if ($remap === []) {
+                // Entirely deleted: no postings to carry, and no dictionary to
+                // walk for them.
+                continue;
+            }
+
+            $this->carryPostings($writer, $segment, $remap);
         }
 
         if ($writer->count() === 0) {
@@ -87,5 +142,56 @@ final class SegmentMerger
         $writer->write($path);
 
         return $writer->count();
+    }
+
+    /**
+     * Walks one segment's dictionary and hands its postings over, translated.
+     *
+     * A term whose every document was deleted disappears here rather than
+     * being written with an empty list: `$live` ends up empty and the term is
+     * never added.
+     *
+     * @param array<int, int> $remap source ordinal => new ordinal
+     * @throws CorruptSegmentException
+     */
+    private function carryPostings(SegmentIndexWriter $writer, SegmentIndex $segment, array $remap): void
+    {
+        $postings = [];
+
+        foreach ($segment->postingsByTerm() as $term => $byOrdinal) {
+            $live = [];
+
+            foreach ($byOrdinal as $ordinal => $mask) {
+                if (isset($remap[$ordinal])) {
+                    $live[$remap[$ordinal]] = $mask;
+                }
+            }
+
+            if ($live !== []) {
+                $postings[$term] = $live;
+            }
+        }
+
+        $writer->carryPostings($postings);
+    }
+
+    /**
+     * The schema to write, when the caller did not say.
+     *
+     * Taken from the sources rather than inferred, and they agree by
+     * construction: an index freezes its schema at its first commit and hands
+     * that one to every segment written afterwards. A merge that re-inferred
+     * could give a field a different type than the segments it is replacing —
+     * which is the drift the freeze exists to prevent.
+     *
+     * @param SegmentIndex[] $sources
+     */
+    private function schemaOf(array $sources): ?Schema
+    {
+        foreach ($sources as $segment) {
+            return $segment->schema();
+        }
+
+        return null;
     }
 }

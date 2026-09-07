@@ -407,6 +407,114 @@ final class SegmentIndex
             : $column->facet($matches, size: 0);
     }
 
+    // -------------------------------------------------------------------------
+    // What a merge reads out of a finished segment.
+    //
+    // A merge used to re-index: it read the documents back and analysed them
+    // again. That cannot work, because the documents are not necessarily there
+    // — `source()` decides what is stored, and a field excluded from it still
+    // has terms and a column. Re-indexing dropped both, so an index using
+    // `source(false)` stopped matching anything at its first merge.
+    //
+    // What is on disk is enough without the text: the postings *are* the terms,
+    // the column holds the value, the lengths are recorded per field. These
+    // read them back out so the merger can carry them across as they are. See
+    // SegmentMerger.
+    // -------------------------------------------------------------------------
+
+    /**
+     * Every term in this segment, with the documents holding it and the fields
+     * they hold it in.
+     *
+     * A generator, and deliberately per term rather than per document: that is
+     * the order the dictionary is laid out in, and it is also the shape the
+     * writer accumulates. Transposing it to per-document would hold the whole
+     * thing twice at the peak of a merge, which on a 128 MB shared host is the
+     * difference between merging and dying.
+     *
+     * @internal for SegmentMerger
+     * @return \Generator<string, array<int, int>> term => ordinal => field mask
+     * @throws CorruptSegmentException
+     */
+    public function postingsByTerm(): \Generator
+    {
+        // A schema with one searchable field writes no masks, because every
+        // mask would hold the same single bit. Carried across, that bit still
+        // has to be set: bit 0 is that one field.
+        $masked = $this->usesFieldMasks();
+
+        foreach ($this->terms()->iterate() as $term => $payload) {
+            $entry  = self::decodeEntry($payload);
+            $cursor = PostingsCursor::open(
+                $this->segment->read('postings', $entry['offset'], $entry['length'])
+            );
+
+            $masks = $masked
+                ? $this->segment->read('fieldmask', $entry['masks'], $entry['documents'] * $this->maskWidth)
+                : null;
+
+            $byOrdinal = [];
+            $index     = 0;
+
+            while ($cursor->current() !== PostingsFormat::END) {
+                $byOrdinal[$cursor->current()] = $masks === null ? 1 : $this->maskAt($masks, $index);
+
+                $index++;
+                $cursor->next();
+            }
+
+            yield (string) $term => $byOrdinal;
+        }
+    }
+
+    /**
+     * How many terms one document holds in each field.
+     *
+     * @internal for SegmentMerger
+     * @return array<int, int> bit => length
+     * @throws CorruptSegmentException
+     */
+    public function fieldLengths(int $ordinal): array
+    {
+        return $this->fieldLengthsOf($ordinal);
+    }
+
+    /**
+     * The value one document holds in one column, ready to be written to the
+     * same kind of column again.
+     *
+     * This is what makes a filter survive a merge on a field the schema does
+     * not store: the value never leaves the columnar side of the segment.
+     *
+     * @internal for SegmentMerger
+     * @throws CorruptSegmentException
+     */
+    public function columnValue(string $field, int $ordinal): mixed
+    {
+        $column = $this->column($field);
+
+        return match (true) {
+            $column instanceof NumericColumn => $column->get($ordinal),
+            $column instanceof KeywordColumn => $column->get($ordinal),
+            $column instanceof TagColumn     => $column->get($ordinal),
+            default                          => null,
+        };
+    }
+
+    /**
+     * The mask vocabulary this segment was written with: bit => field name.
+     *
+     * A merge compares it across its sources, because a carried mask is only
+     * meaningful if every segment numbers its fields the same way.
+     *
+     * @internal for SegmentMerger
+     * @return string[]
+     */
+    public function maskVocabulary(): array
+    {
+        return $this->searchableFields;
+    }
+
     /**
      * @return array<string|int, mixed> term counts for a keyword field, statistics for a numeric one
      * @internal
@@ -798,10 +906,14 @@ final class SegmentIndex
 
         $payload = $this->terms()->get($term);
 
-        if ($payload === null) {
-            return $this->termCache[$term] = null;
-        }
+        return $this->termCache[$term] = $payload === null ? null : self::decodeEntry($payload);
+    }
 
+    /**
+     * @return array{documents: int, offset: int, length: int, masks: int}
+     */
+    private static function decodeEntry(string $payload): array
+    {
         // Decoded in separate statements rather than inside one array literal:
         // every call advances $position, and relying on evaluation order to get
         // them in sequence is the kind of cleverness that breaks silently.
@@ -814,7 +926,7 @@ final class SegmentIndex
         // Segments written before field masks existed stop here.
         $masks = $position < strlen($payload) ? Varint::decode($payload, $position) : 0;
 
-        return $this->termCache[$term] = [
+        return [
             'documents' => $documents,
             'offset'    => $offset,
             'length'    => $length,
