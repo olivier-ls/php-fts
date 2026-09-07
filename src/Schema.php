@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts;
 
+use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FtsException;
 
 /**
@@ -63,6 +64,9 @@ final class Schema
 
     /** @var string[]|null|false null = everything, false = nothing, list = those fields */
     private array|null|false $source = null;
+
+    /** Whether the engine guessed this schema rather than the caller writing it. */
+    private bool $inferred = false;
 
     private function __construct()
     {
@@ -265,13 +269,76 @@ final class Schema
     }
 
     /**
+     * A document normalised to this schema's types, or an exception naming what
+     * was wrong with it.
+     *
+     * ── Why coerce rather than merely check ─────────────────────────────────
+     *
+     * Because a converted value has to be the *only* value. The term index, the
+     * doc-values column and the document store all read the document, and if
+     * each interprets `['Puma']` its own way you get a brand that is findable
+     * by typing its name, absent from the facet that would let you click it,
+     * and invisible to the filter behind it. Normalising once, here, is what
+     * makes those three agree by construction.
+     *
+     * So `$hit->document['price']` comes back as 129.9 even though `'129.90'`
+     * went in. That is what declaring a schema buys: the index normalises.
+     *
+     * ── What is converted, and what is refused ──────────────────────────────
+     *
+     * The rule is: convert what is unambiguous, refuse what would need a guess.
+     * Numeric strings are the case that matters most, because a DECIMAL column
+     * arrives from PDO as `'129.90'` until someone turns on native types — and
+     * an engine that rejects the first SQL result set it is handed has failed
+     * before it started. `'yes'` for a boolean, by contrast, is someone's
+     * convention, not a fact, and gets refused.
+     *
+     * A null, and an absent field, are always legal. Not every product has
+     * every column, and a schema is not the place to require one.
+     *
+     * A field the schema does not mention passes through untouched, which is
+     * the arbitration made everywhere else: kept and returned, never searched
+     * or filtered.
+     *
+     * @param array<string, mixed> $document
+     * @param string               $id       the caller's id, for the message
+     *
+     * @return array<string, mixed>
+     * @throws FieldTypeException
+     */
+    public function coerce(array $document, string $id): array
+    {
+        // An inferred schema is a guess, and refusing a value against a guess
+        // would turn the turnkey path into the strict one. Left untouched, too,
+        // rather than leniently converted: normalising `'129.90'` into 129.9
+        // when nobody asked would silently drop the caller's own formatting.
+        if ($this->inferred) {
+            return $document;
+        }
+
+        $coerced = [];
+
+        foreach ($document as $field => $value) {
+            $field      = (string) $field;
+            $definition = $this->fields[$field] ?? null;
+
+            $coerced[$field] = $definition === null
+                ? $value
+                : $this->coerceField($id, $field, $definition['type'], $value);
+        }
+
+        return $coerced;
+    }
+
+    /**
      * @return array<string, mixed>
      */
     public function toArray(): array
     {
         return [
-            'fields' => $this->fields,
-            'source' => $this->source,
+            'fields'   => $this->fields,
+            'source'   => $this->source,
+            'inferred' => $this->inferred,
         ];
     }
 
@@ -305,6 +372,8 @@ final class Schema
             $schema = $schema->source($source === false ? false : $source);
         }
 
+        $schema->inferred = (bool) ($data['inferred'] ?? false);
+
         return $schema;
     }
 
@@ -326,7 +395,21 @@ final class Schema
             };
         }
 
+        $schema->inferred = true;
+
         return $schema;
+    }
+
+    /**
+     * Whether this schema was guessed rather than written.
+     *
+     * The one place it matters is coercion: an inferred schema never refuses a
+     * value, because the type it would be refusing against is itself a guess
+     * made from the first batch the index happened to receive.
+     */
+    public function isInferred(): bool
+    {
+        return $this->inferred;
     }
 
     public function isEmpty(): bool
@@ -335,6 +418,242 @@ final class Schema
     }
 
     // -------------------------------------------------------------------------
+
+    /**
+     * @throws FieldTypeException
+     */
+    private function coerceField(string $id, string $field, string $type, mixed $value): mixed
+    {
+        if ($value === null) {
+            return null;
+        }
+
+        return match ($type) {
+            'number'  => $this->coerceNumber($id, $field, $value),
+            'boolean' => $this->coerceBoolean($id, $field, $value),
+            'keyword' => $this->coerceKeyword($id, $field, $value),
+            'tags'    => $this->coerceTags($id, $field, $value),
+            'text'    => $this->coerceText($id, $field, $value),
+            default   => $this->coerceStored($id, $field, $value),
+        };
+    }
+
+    /**
+     * @throws FieldTypeException
+     */
+    private function coerceNumber(string $id, string $field, mixed $value): int|float
+    {
+        if (is_int($value)) {
+            return $value;
+        }
+
+        if (is_float($value)) {
+            if (!is_finite($value)) {
+                throw $this->refuse($id, $field, 'number', 'a float that is not finite');
+            }
+
+            return $value;
+        }
+
+        if (is_bool($value)) {
+            return $value ? 1 : 0;
+        }
+
+        // is_numeric covers '12', '129.90', '1e3', ' 12' and '0x1A'-free hex,
+        // which is exactly the set a database driver hands back as text. The
+        // unary plus then yields an int or a float as the string warrants.
+        if (is_string($value) && is_numeric($value)) {
+            $number = +$value;
+
+            if (is_float($number) && !is_finite($number)) {
+                throw $this->refuse($id, $field, 'number', 'a value too large to hold');
+            }
+
+            return $number;
+        }
+
+        throw $this->refuse($id, $field, 'number', $this->describe($value));
+    }
+
+    /**
+     * @throws FieldTypeException
+     */
+    private function coerceBoolean(string $id, string $field, mixed $value): bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if ($value === 0 || $value === 1) {
+            return $value === 1;
+        }
+
+        if (is_string($value)) {
+            // The forms a database actually returns for a boolean column, and
+            // nothing more: 'yes' and 'on' are someone's convention rather than
+            // a fact, and guessing at them is how a filter quietly inverts.
+            return match (strtolower(trim($value))) {
+                '1', 'true'  => true,
+                '0', 'false' => false,
+                default      => throw $this->refuse(
+                    $id,
+                    $field,
+                    'boolean',
+                    'the string ' . var_export($value, true) . ", which is not one of '1', '0', 'true', 'false'"
+                ),
+            };
+        }
+
+        throw $this->refuse($id, $field, 'boolean', $this->describe($value));
+    }
+
+    /**
+     * @throws FieldTypeException
+     */
+    private function coerceKeyword(string $id, string $field, mixed $value): string
+    {
+        if (is_string($value)) {
+            return $value;
+        }
+
+        if (is_int($value) || (is_float($value) && is_finite($value))) {
+            return (string) $value;
+        }
+
+        if (is_array($value)) {
+            throw $this->refuse(
+                $id,
+                $field,
+                'keyword',
+                'a list. A keyword holds one value; declare the field with tags() to hold several'
+            );
+        }
+
+        throw $this->refuse($id, $field, 'keyword', $this->describe($value));
+    }
+
+    /**
+     * @return string[]
+     * @throws FieldTypeException
+     */
+    private function coerceTags(string $id, string $field, mixed $value): array
+    {
+        if (is_string($value)) {
+            return [$value];
+        }
+
+        if (!is_array($value)) {
+            throw $this->refuse($id, $field, 'tags', $this->describe($value));
+        }
+
+        $tags = [];
+
+        foreach ($value as $item) {
+            if (is_string($item)) {
+                $tags[] = $item;
+                continue;
+            }
+
+            if (is_int($item) || (is_float($item) && is_finite($item))) {
+                $tags[] = (string) $item;
+                continue;
+            }
+
+            throw $this->refuse($id, $field, 'tags', 'a list containing ' . $this->describe($item));
+        }
+
+        return $tags;
+    }
+
+    /**
+     * @return string|string[]
+     * @throws FieldTypeException
+     */
+    private function coerceText(string $id, string $field, mixed $value): string|array
+    {
+        if (is_string($value)) {
+            return $value;
+        }
+
+        if (is_int($value) || (is_float($value) && is_finite($value))) {
+            return (string) $value;
+        }
+
+        if (is_array($value)) {
+            // Kept as a list rather than joined: the analyser joins it with a
+            // space of its own, and the caller gets back what they put in.
+            return $this->coerceTags($id, $field, $value);
+        }
+
+        throw $this->refuse($id, $field, 'text', $this->describe($value));
+    }
+
+    /**
+     * A stored field is not interpreted, so the only question is whether JSON
+     * can hold it. What is refused here is what JSON would otherwise mangle in
+     * silence: an object becomes `[]`, a closure becomes `[]`, a resource
+     * becomes 0, and the caller finds out months later.
+     *
+     * @throws FieldTypeException
+     */
+    private function coerceStored(string $id, string $field, mixed $value, int $depth = 0): mixed
+    {
+        if (is_array($value)) {
+            if ($depth > 32) {
+                throw $this->refuse($id, $field, 'stored', 'a structure nested too deeply to encode');
+            }
+
+            foreach ($value as $item) {
+                $this->coerceStored($id, $field, $item, $depth + 1);
+            }
+
+            return $value;
+        }
+
+        if (is_float($value) && !is_finite($value)) {
+            throw $this->refuse($id, $field, 'stored', 'a float that is not finite');
+        }
+
+        if (is_object($value) && !$value instanceof \JsonSerializable && !$value instanceof \stdClass) {
+            throw $this->refuse($id, $field, 'stored', $this->describe($value));
+        }
+
+        if (is_resource($value)) {
+            throw $this->refuse($id, $field, 'stored', 'a resource');
+        }
+
+        return $value;
+    }
+
+    private function refuse(string $id, string $field, string $type, string $received): FieldTypeException
+    {
+        return new FieldTypeException(
+            "Field '$field' of document '$id' is declared $type but received $received"
+        );
+    }
+
+    private function describe(mixed $value): string
+    {
+        if (is_string($value)) {
+            $shown = strlen($value) > 40 ? substr($value, 0, 40) . '…' : $value;
+
+            return 'the string ' . var_export($shown, true);
+        }
+
+        if (is_bool($value)) {
+            return 'a boolean';
+        }
+
+        if (is_array($value)) {
+            return 'a list';
+        }
+
+        if (is_object($value)) {
+            return 'an instance of ' . get_debug_type($value);
+        }
+
+        return get_debug_type($value);
+    }
 
     /**
      * @throws FtsException

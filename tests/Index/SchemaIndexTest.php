@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts\Tests\Index;
 
+use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
+use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Index\IndexDirectory;
 use Ols\PhpFts\Schema;
 use PHPUnit\Framework\Attributes\Test;
@@ -367,8 +369,127 @@ class SchemaIndexTest extends TestCase
     }
 
     // =========================================================================
+    // A declared type is enforced
+    // =========================================================================
+
+    #[Test]
+    public function a_value_of_the_wrong_type_names_the_document_and_the_field(): void
+    {
+        $index = IndexDirectory::open($this->dir, $this->schema());
+
+        $this->expectException(FieldTypeException::class);
+        $this->expectExceptionMessage("Field 'price' of document 'sku-9' is declared number but received the string 'sur devis'");
+
+        $index->put('sku-9', ['title' => 'Bespoke boot', 'price' => 'sur devis']);
+    }
+
+    #[Test]
+    public function a_refused_document_leaves_the_index_exactly_as_it_was(): void
+    {
+        $index = IndexDirectory::open($this->dir, $this->schema());
+        $index->putMany($this->products());
+
+        $generation = $index->generation();
+
+        try {
+            $index->putMany([
+                'sku-3' => ['title' => 'Red canvas sneaker', 'price' => 59.00],
+                'sku-4' => ['title' => 'Bespoke boot', 'price' => 'sur devis'],
+            ]);
+            $this->fail('the batch should have been refused');
+        } catch (FieldTypeException) {
+            // Expected. A batch is one commit, so a document it cannot hold
+            // takes the whole batch with it rather than committing half of it.
+        }
+
+        $this->assertSame($generation, $index->generation(), 'nothing was published');
+        $this->assertSame(2, $index->count());
+        $this->assertFalse($index->has('sku-3'), 'not even the document that was fine');
+    }
+
+    #[Test]
+    public function a_numeric_string_from_a_database_is_accepted_and_normalised(): void
+    {
+        // What PDO hands back for a DECIMAL column until someone turns on
+        // native types. Refusing this would break the first thing every user
+        // does with the library.
+        $index = IndexDirectory::open($this->dir, $this->schema());
+        $index->put('sku-1', [
+            'title'  => 'Brown leather shoe',
+            'price'  => '129.90',
+            'active' => '1',
+        ]);
+
+        $document = $index->get('sku-1');
+
+        $this->assertSame(129.90, $document['price'], 'stored as the number it is');
+        $this->assertTrue($document['active']);
+        $this->assertSame(
+            1,
+            $index->search('', filters: [['field' => 'price', 'op' => '<=', 'value' => 200]])->total
+        );
+    }
+
+    #[Test]
+    public function a_keyword_and_its_facet_can_no_longer_disagree(): void
+    {
+        // The bug this replaced: a list given to a keyword field was joined and
+        // indexed by the term writer but dropped by the column writer, so the
+        // value was findable by typing it, absent from its own facet, and
+        // invisible to the filter behind that facet.
+        $index = IndexDirectory::open($this->dir, $this->schema());
+
+        try {
+            $index->put('sku-1', ['title' => 'Brown leather shoe', 'brand' => ['Puma']]);
+            $this->fail('a list given to a keyword should have been refused');
+        } catch (FieldTypeException $e) {
+            $this->assertStringContainsString('tags()', $e->getMessage(), 'and it says what to do instead');
+        }
+
+        // Declared properly, the three paths agree.
+        $index->put('sku-2', ['title' => 'Blue suede boot', 'brand' => 'Puma']);
+
+        $this->assertSame(1, $index->search('Puma')->total);
+        $this->assertSame(
+            1,
+            $index->search('', filters: [['field' => 'brand', 'op' => '=', 'value' => 'Puma']])->total
+        );
+        $this->assertSame(['Puma' => 1], $index->search('', facets: ['brand'])->facets['brand']);
+    }
+
+    #[Test]
+    public function a_document_json_cannot_hold_is_named(): void
+    {
+        // Invalid UTF-8 gets as far as the encoder, which used to report that
+        // some document, somewhere in the batch, was unencodable.
+        $index = IndexDirectory::open($this->dir, $this->schema());
+
+        $this->expectException(StorageException::class);
+        $this->expectExceptionMessage("Document 'sku-9' could not be encoded");
+
+        $index->put('sku-9', ['title' => "caf\xE9 crème"]);
+    }
+
+    // =========================================================================
     // Inference is still the default
     // =========================================================================
+
+    #[Test]
+    public function an_inferred_schema_refuses_nothing(): void
+    {
+        // The turnkey path keeps exactly the tolerance it had. Refusing a value
+        // against a type guessed from the first batch would be the wrong way
+        // round, and normalising it would drop the caller's own formatting.
+        $index = IndexDirectory::open($this->dir);
+        $index->putMany($this->products());
+
+        $index->put('sku-3', ['title' => 42, 'brand' => ['Puma'], 'price' => 'cher']);
+
+        $this->assertSame(3, $index->count());
+        $this->assertSame(['title' => 42, 'brand' => ['Puma'], 'price' => 'cher'], $index->get('sku-3'));
+        $this->assertTrue($index->schema()->isInferred());
+    }
+
 
     #[Test]
     public function without_a_schema_the_types_are_still_inferred(): void

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Analysis\Analyzer;
+use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\Storage\SegmentWriter;
@@ -122,7 +123,9 @@ final class SegmentIndexWriter
 
     /**
      * @param array<string, mixed> $document
+     *
      * @throws StorageException
+     * @throws FieldTypeException when a declared field's value is not of its type
      */
     public function put(string|int $id, array $document): void
     {
@@ -136,9 +139,17 @@ final class SegmentIndexWriter
             throw new StorageException("Duplicate document id in this batch: '$id'");
         }
 
+        // Checked here rather than at write(): this is where the id, the field
+        // and the caller's own loop are all still in view. By write() the batch
+        // is half-built and the message could only say that something,
+        // somewhere, was of the wrong type.
+        //
+        // Normalising here also means the term index, the columns and the
+        // document store all read one already-agreed value, instead of each
+        // making up its own mind about what `['Puma']` was supposed to be.
         $this->seen[$id]   = true;
         $this->keys[]      = $id;
-        $this->documents[] = $document;
+        $this->documents[] = $this->schema?->coerce($document, $id) ?? $document;
     }
 
     public function count(): int
@@ -173,7 +184,7 @@ final class SegmentIndexWriter
             $this->writeTermsAndPostings($segment, $documentCount, $schema);
             $this->writeColumns($segment, $schema, $documentCount);
 
-            $segment->addSection('docs', DocumentStore::encode($this->storedDocuments($schema)));
+            $segment->addSection('docs', DocumentStore::encode($this->storedDocuments($schema), $this->keys));
             $segment->addSection('keys', $this->encodeKeys());
             $segment->addSection('meta', (string) json_encode([
                 'documentCount'    => $documentCount,

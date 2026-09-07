@@ -194,6 +194,41 @@ want:
 ->text('title', b: 0.4)               // its length matters less than a description's
 ```
 
+### What a declared schema enforces
+
+Declaring a schema is saying "I know my data", so the engine takes you at your
+word and refuses a value that does not match — naming the document, the field
+and what it received:
+
+```
+FieldTypeException: Field 'price' of document 'sku-4471' is declared number
+but received the string 'sur devis'
+```
+
+The rule is: **convert what is unambiguous, refuse what would need a guess.**
+A `DECIMAL` column arrives from PDO as `'129.90'` and a `TINYINT(1)` as `'1'`,
+so those are converted; `'yes'` for a boolean is someone's convention rather
+than a fact, so it is refused. A field given a list where one value was
+declared is refused with the fix in the message — `declare the field with
+tags()`.
+
+Values are normalised **once**, before anything is written, so the term index,
+the filter columns and the returned document can never disagree about what a
+value was. `$hit->document['price']` comes back as `129.9` even though
+`'129.90'` went in. That is part of what a schema buys you.
+
+A missing field and an explicit `null` are always legal — not every product has
+every column, and requiring one is your application's job, not the index's. A
+refused document takes its whole batch with it: a batch is one commit, so
+nothing is published rather than half of it.
+
+**None of this applies when you declare nothing.** An inferred schema never
+refuses anything: refusing a value against a type guessed from whichever batch
+happened to arrive first would be exactly backwards. The turnkey path stays
+forgiving.
+
+### Freezing
+
 A schema is frozen the first time the index commits, and every later batch and
 every merge uses that one — otherwise inference would read a different batch
 and a filter that worked yesterday would fail today. Reopening with a

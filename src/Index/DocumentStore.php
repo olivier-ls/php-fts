@@ -109,14 +109,17 @@ final class DocumentStore
      * Encodes a whole store.
      *
      * @param array<int, array<string, mixed>|null> $documents in document order
+     * @param array<int, string>                    $labels    the callers' ids,
+     *        used only to name a document that fails to encode
+     *
      * @throws StorageException
      */
-    public static function encode(array $documents): string
+    public static function encode(array $documents, array $labels = []): string
     {
         $offsets  = '';
         $payloads = '';
 
-        foreach ($documents as $document) {
+        foreach ($documents as $ordinal => $document) {
             $offsets .= pack('V', strlen($payloads));
 
             if ($document === null) {
@@ -126,7 +129,13 @@ final class DocumentStore
             $json = json_encode($document, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
             if ($json === false) {
-                throw new StorageException('Document could not be encoded: ' . json_last_error_msg());
+                // Named, because the alternative is learning that one document
+                // out of five thousand holds a byte that is not valid UTF-8.
+                $named = isset($labels[$ordinal]) ? "'{$labels[$ordinal]}'" : "at position $ordinal";
+
+                throw new StorageException(
+                    "Document $named could not be encoded: " . json_last_error_msg()
+                );
             }
 
             $payloads .= $json;
