@@ -33,6 +33,16 @@ final class CollectionStatistics
         public readonly int $documentCount,
         public readonly float $averageLength,
         public readonly array $documentFrequencies = [],
+
+        /**
+         * Mean terms per field, by mask bit — what BM25F normalises each field
+         * against. A title averages a handful of terms and a description
+         * hundreds, so normalising both against one figure would make every
+         * title look short and every description look long.
+         *
+         * @var array<int, float>
+         */
+        public readonly array $fieldAverages = [],
     ) {
     }
 
@@ -41,13 +51,27 @@ final class CollectionStatistics
         return $this->documentFrequencies[$term] ?? 0;
     }
 
+    public function fieldAverage(int $bit): float
+    {
+        return $this->fieldAverages[$bit] ?? 0.0;
+    }
+
     /**
      * Adds one segment's contribution.
      *
+     * Averages are recombined from totals rather than averaged, which is the
+     * same care the numeric facet needs: the mean of two means is not the mean
+     * unless both sides hold the same number of documents.
+     *
      * @param array<string, int> $documentFrequencies
+     * @param array<int, int>    $fieldLengthSums bit => summed lengths
      */
-    public function plus(int $documents, int $termLengthSum, array $documentFrequencies): self
-    {
+    public function plus(
+        int $documents,
+        int $termLengthSum,
+        array $documentFrequencies,
+        array $fieldLengthSums = [],
+    ): self {
         $merged = $this->documentFrequencies;
 
         foreach ($documentFrequencies as $term => $frequency) {
@@ -57,15 +81,32 @@ final class CollectionStatistics
         $count = $this->documentCount + $documents;
         $total = (int) round($this->averageLength * $this->documentCount) + $termLengthSum;
 
+        $fieldTotals = [];
+
+        foreach ($this->fieldAverages as $bit => $average) {
+            $fieldTotals[$bit] = (int) round($average * $this->documentCount);
+        }
+
+        foreach ($fieldLengthSums as $bit => $sum) {
+            $fieldTotals[$bit] = ($fieldTotals[$bit] ?? 0) + $sum;
+        }
+
+        $fieldAverages = [];
+
+        foreach ($fieldTotals as $bit => $fieldTotal) {
+            $fieldAverages[$bit] = $count > 0 ? $fieldTotal / $count : 0.0;
+        }
+
         return new self(
             $count,
             $count > 0 ? $total / $count : 0.0,
             $merged,
+            $fieldAverages,
         );
     }
 
     public static function empty(): self
     {
-        return new self(0, 0.0, []);
+        return new self(0, 0.0, [], []);
     }
 }

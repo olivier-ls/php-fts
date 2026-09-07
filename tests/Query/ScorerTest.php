@@ -145,6 +145,116 @@ class ScorerTest extends TestCase
         );
     }
 
+    // =========================================================================
+    // BM25F
+    // =========================================================================
+
+    #[Test]
+    public function a_boosted_field_contributes_more(): void
+    {
+        $scorer = new Scorer();
+
+        $inTitle       = $scorer->fieldedFrequency(0b01, [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 100], [0 => 10.0, 1 => 100.0]);
+        $inDescription = $scorer->fieldedFrequency(0b10, [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 100], [0 => 10.0, 1 => 100.0]);
+
+        $this->assertGreaterThan($inDescription, $inTitle);
+    }
+
+    #[Test]
+    public function a_term_in_two_fields_beats_the_same_term_in_one(): void
+    {
+        $scorer = new Scorer();
+        $boosts = [0 => 1.0, 1 => 1.0];
+
+        $both = $scorer->fieldedFrequency(0b11, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]);
+        $one  = $scorer->fieldedFrequency(0b01, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]);
+
+        $this->assertGreaterThan($one, $both);
+    }
+
+    #[Test]
+    public function combining_fields_saturates_rather_than_adding_up(): void
+    {
+        // The whole point of BM25F, and precisely what 1.x got wrong by scoring
+        // each field separately and averaging. Two fields matching is worth more
+        // than one, but not twice as much.
+        $scorer = new Scorer();
+        $boosts = [0 => 1.0, 1 => 1.0];
+        $idf    = 2.0;
+
+        $one  = $scorer->fieldedScore($idf, $scorer->fieldedFrequency(0b01, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]));
+        $both = $scorer->fieldedScore($idf, $scorer->fieldedFrequency(0b11, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]));
+
+        $this->assertGreaterThan($one, $both);
+        $this->assertLessThan($one * 2.0, $both, 'twice the fields must not be twice the score');
+    }
+
+    #[Test]
+    public function each_field_is_normalised_against_its_own_average(): void
+    {
+        // A title of five terms is short; a description of five terms is very
+        // short. Normalising both against one figure would make every title look
+        // brief and every description look enormous.
+        $scorer = new Scorer();
+        $boosts = [0 => 1.0, 1 => 1.0];
+
+        // Same field length, wildly different averages.
+        $shortField = $scorer->fieldedFrequency(0b01, $boosts, [0 => 5, 1 => 5], [0 => 5.0, 1 => 500.0]);
+        $longField  = $scorer->fieldedFrequency(0b10, $boosts, [0 => 5, 1 => 5], [0 => 5.0, 1 => 500.0]);
+
+        $this->assertGreaterThan(
+            $shortField,
+            $longField,
+            'five terms in a field that usually holds five hundred is unusually precise'
+        );
+    }
+
+    #[Test]
+    public function a_field_the_document_does_not_hold_contributes_nothing(): void
+    {
+        $scorer = new Scorer();
+
+        $this->assertSame(
+            0.0,
+            $scorer->fieldedFrequency(0b00, [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0])
+        );
+
+        $this->assertSame(0.0, $scorer->fieldedScore(2.0, 0.0));
+    }
+
+    #[Test]
+    public function one_neutral_field_scores_the_same_either_way(): void
+    {
+        // Turning boosts on must not silently rescale every result.
+        $scorer = new Scorer();
+        $idf    = 1.7;
+
+        $fielded = $scorer->fieldedScore(
+            $idf,
+            $scorer->fieldedFrequency(0b01, [0 => 1.0], [0 => 100], [0 => 100.0])
+        );
+
+        $this->assertEqualsWithDelta($scorer->score($idf, 100, 100.0), $fielded, 1.0E-9);
+    }
+
+    #[Test]
+    public function a_fielded_score_is_never_negative_or_nan(): void
+    {
+        $scorer = new Scorer();
+
+        foreach ([0.0, 0.5, 20.0] as $idf) {
+            foreach ([0b00, 0b01, 0b11] as $mask) {
+                foreach ([[0 => 0.0, 1 => 0.0], [0 => 3.0, 1 => 1.0]] as $boosts) {
+                    $combined = $scorer->fieldedFrequency($mask, $boosts, [0 => 0, 1 => 0], [0 => 0.0, 1 => 0.0]);
+                    $score    = $scorer->fieldedScore($idf, $combined);
+
+                    $this->assertGreaterThanOrEqual(0.0, $score);
+                    $this->assertFalse(is_nan($score));
+                }
+            }
+        }
+    }
+
     #[Test]
     public function a_score_is_never_negative(): void
     {

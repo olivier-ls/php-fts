@@ -79,6 +79,14 @@ final class SegmentIndexWriter
     /** Summed document lengths, for the average BM25 normalises against. */
     private int $termLengthSum = 0;
 
+    /** @var string[] bit => field name, the mask vocabulary */
+    private array $searchableFields = [];
+
+    /** @var array<int, int> bit => summed lengths */
+    private array $fieldLengthSums = [];
+
+    private int $maskWidth = 1;
+
     /**
      * @param array<string, string>|null $fields field => type, to use instead of
      *        inferring. The index freezes its field types at its first commit and
@@ -150,15 +158,18 @@ final class SegmentIndexWriter
 
             $this->effectiveFields = $fields;
 
-            $this->writeTermsAndPostings($segment, $documentCount);
+            $this->writeTermsAndPostings($segment, $documentCount, $fields);
             $this->writeColumns($segment, $fields, $documentCount);
 
             $segment->addSection('docs', DocumentStore::encode($this->documents));
             $segment->addSection('keys', $this->encodeKeys());
             $segment->addSection('meta', (string) json_encode([
-                'documentCount' => $documentCount,
-                'termLengthSum' => $this->termLengthSum,
-                'fields'        => $fields,
+                'documentCount'    => $documentCount,
+                'termLengthSum'    => $this->termLengthSum,
+                'fields'           => $fields,
+                'searchableFields' => $this->searchableFields,
+                'fieldLengthSums'  => $this->fieldLengthSums,
+                'maskWidth'        => $this->maskWidth,
             ]));
 
             $segment->commit();
@@ -210,6 +221,14 @@ final class SegmentIndexWriter
                     continue;
                 }
 
+                if (is_array($value)) {
+                    // A list of tags contributes terms, so it needs a type and a
+                    // mask bit. Inference used to skip it, which meant it was
+                    // indexed but invisible to the schema.
+                    $tooLong[$field] = true;
+                    continue;
+                }
+
                 if (!is_string($value)) {
                     continue;
                 }
@@ -253,26 +272,54 @@ final class SegmentIndexWriter
      *
      * @throws StorageException
      */
-    private function writeTermsAndPostings(SegmentWriter $segment, int $documentCount): void
+    /**
+     * Analyses every document field by field, then writes the dictionary, the
+     * posting lists, the field masks and the field lengths.
+     *
+     * ── Why fields are analysed separately ─────────────────────────────────
+     *
+     * Scoring has to know *where* a term was found: matching in a title means
+     * more than matching in a description, and that is what `boosts` is for.
+     * So each searchable field is analysed on its own, and for every
+     * (term, document) pair the fields holding it are recorded as a bitmap.
+     *
+     * The mask lives in its own section rather than interleaved with the
+     * postings. Selecting candidates reads only the compact delta stream; the
+     * masks are touched for the handful of documents that reach scoring.
+     * Interleaving would have hurt both the compression and the skipping.
+     *
+     * @param array<string, string> $fields the effective schema
+     * @throws StorageException
+     */
+    private function writeTermsAndPostings(SegmentWriter $segment, int $documentCount, array $fields): void
     {
-        /** @var array<string, int[]> term => ordinals, ascending */
+        $searchable = $this->searchableFields($fields);
+        $maskWidth  = max(1, (int) ceil(count($searchable) / 8));
+
+        /** @var array<string, array<int, int>> term => ordinal => field bitmap */
         $postings = [];
 
-        /** @var int[] ordinal => how many terms the document produced */
+        /** @var array<int, array<int, int>> ordinal => bit => terms in that field */
         $lengths = [];
 
+        /** @var array<int, int> bit => summed lengths across the segment */
+        $sums = array_fill(0, max(1, count($searchable)), 0);
+
         foreach ($this->documents as $ordinal => $document) {
-            $terms = $this->analyzer->analyze($this->textOf($document));
+            foreach ($searchable as $bit => $field) {
+                $terms = $this->analyzer->analyze($this->textOf($document[$field] ?? null));
 
-            // BM25 penalises a document for being longer than average, which is
-            // what stops a long description from outranking a precise title
-            // simply by colliding with more of the query by accident. The count
-            // has to be recorded now: it cannot be recovered from the postings
-            // without walking every one of them.
-            $lengths[$ordinal] = count($terms);
+                // Recorded now because it cannot be recovered from the postings
+                // without walking every one of them, and BM25F needs a length
+                // per field, not per document.
+                $lengths[$ordinal][$bit] = count($terms);
+                $sums[$bit]             += count($terms);
 
-            foreach ($terms as $term) {
-                $postings[$term][] = $ordinal;
+                foreach ($terms as $term) {
+                    // A term found in several fields keeps one posting with
+                    // several bits set, rather than one posting per field.
+                    $postings[$term][$ordinal] = ($postings[$term][$ordinal] ?? 0) | (1 << $bit);
+                }
             }
         }
 
@@ -283,39 +330,88 @@ final class SegmentIndexWriter
 
         $dictionary   = new BlockDictionaryWriter();
         $encodedLists = '';
+        $masks        = '';
 
         foreach ($terms as $term) {
-            $term    = (string) $term;
-            $ordinals = $postings[$term];
+            $term = (string) $term;
+
+            $byOrdinal = $postings[$term];
+            ksort($byOrdinal);
+
+            $ordinals = array_keys($byOrdinal);
             $encoded  = PostingsWriter::encode($ordinals);
 
-            // The payload is everything a search needs before touching the
-            // postings: how many documents (for scoring), and where the list is.
+            // Everything a search needs before touching the postings: how many
+            // documents hold the term, where its list is, and where its masks
+            // are.
             $dictionary->add($term, Varint::encode(count($ordinals))
                 . Varint::encode(strlen($encodedLists))
-                . Varint::encode(strlen($encoded)));
+                . Varint::encode(strlen($encoded))
+                . Varint::encode(strlen($masks)));
 
             $encodedLists .= $encoded;
+
+            foreach ($byOrdinal as $mask) {
+                for ($byte = 0; $byte < $maskWidth; $byte++) {
+                    $masks .= chr(($mask >> ($byte * 8)) & 0xFF);
+                }
+            }
         }
 
         $segment->addSection('terms', $dictionary->finish());
         $segment->addSection('postings', $encodedLists);
 
-        // Fixed width, addressed by document number — the same rule as the
-        // doc-values columns. Clamped at 65 535, which a document would have to
-        // be about ten thousand words long to reach.
-        $packed  = '';
-        $total   = 0;
+        // With one searchable field every mask byte holds the same single bit,
+        // so it says nothing — and BM25F over one neutral field gives exactly
+        // the number plain BM25 gives. Measured on a 2 000-product catalogue
+        // with three fields the masks came to 23% of the segment, so a schema
+        // that does not need them should not carry them.
+        if (count($searchable) > 1) {
+            $segment->addSection('fieldmask', $masks);
+        }
+
+        // Fixed width, addressed by document number then field — the same rule
+        // as the doc-values columns. Clamped at 65 535 terms in one field, which
+        // a value would have to be about ten thousand words long to reach.
+        $packed = '';
 
         for ($ordinal = 0; $ordinal < $documentCount; $ordinal++) {
-            $length  = min(0xFFFF, $lengths[$ordinal] ?? 0);
-            $packed .= pack('v', $length);
-            $total  += $length;
+            foreach (array_keys($sums) as $bit) {
+                $packed .= pack('v', min(0xFFFF, $lengths[$ordinal][$bit] ?? 0));
+            }
         }
 
         $segment->addSection('lengths', $packed);
 
-        $this->termLengthSum = $total;
+        $this->searchableFields = $searchable;
+        $this->fieldLengthSums  = $sums;
+        $this->maskWidth        = $maskWidth;
+        $this->termLengthSum    = array_sum($sums);
+    }
+
+    /**
+     * The fields that contribute terms, in a fixed order.
+     *
+     * Sorted by name so that a field's bit is the same in every segment of an
+     * index — the schema is frozen, so the list is too, and a mask written by
+     * one segment means the same thing when a merged segment reads it.
+     *
+     * @param array<string, string> $fields
+     * @return string[] bit => field name
+     */
+    private function searchableFields(array $fields): array
+    {
+        $searchable = [];
+
+        foreach ($fields as $field => $type) {
+            if ($type === 'text' || $type === 'keyword') {
+                $searchable[] = $field;
+            }
+        }
+
+        sort($searchable, SORT_STRING);
+
+        return $searchable;
     }
 
     /**
@@ -376,23 +472,26 @@ final class SegmentIndexWriter
     }
 
     /**
-     * Everything in a document that should be searchable, as one string.
+     * One field's value as searchable text.
      *
-     * @param array<string, mixed> $document
+     * A list of tags becomes its items joined by a space, so each is analysed
+     * as its own word rather than running into its neighbour.
      */
-    private function textOf(array $document): string
+    private function textOf(mixed $value): string
     {
+        if (is_string($value)) {
+            return $value;
+        }
+
+        if (!is_array($value)) {
+            return '';
+        }
+
         $parts = [];
 
-        foreach ($document as $value) {
-            if (is_string($value)) {
-                $parts[] = $value;
-            } elseif (is_array($value)) {
-                foreach ($value as $item) {
-                    if (is_string($item)) {
-                        $parts[] = $item;
-                    }
-                }
+        foreach ($value as $item) {
+            if (is_string($item)) {
+                $parts[] = $item;
             }
         }
 

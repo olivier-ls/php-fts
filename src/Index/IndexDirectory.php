@@ -352,6 +352,7 @@ final class IndexDirectory
         int $offset = 0,
         array $filters = [],
         array $facets = [],
+        array $boosts = [],
     ): SearchResult {
         $started = hrtime(true);
 
@@ -375,6 +376,7 @@ final class IndexDirectory
                 $filters,
                 $this->deletions[$position],
                 $statistics,
+                $boosts,
             );
 
             $total += $matches->count();
@@ -428,6 +430,7 @@ final class IndexDirectory
                 max(0, $live),
                 $segment->termLengthSum(),
                 $terms === [] ? [] : $segment->documentFrequencies($terms),
+                $segment->fieldLengthSums(),
             );
         }
 

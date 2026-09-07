@@ -548,6 +548,137 @@ class IndexDirectoryTest extends TestCase
     }
 
     // =========================================================================
+    // Field weighting
+    // =========================================================================
+
+    private function twoFieldCatalogue(): IndexDirectory
+    {
+        $index = $this->index();
+
+        $index->putMany([
+            'titre'  => [
+                'title'       => 'Cuir veritable',
+                'description' => 'Chaussure de ville confortable et durable pour toutes occasions',
+            ],
+            'descr'  => [
+                'title'       => 'Sandale ete',
+                'description' => 'Semelle souple, dessus en cuir veritable tanne vegetal, finition soignee',
+            ],
+            'autre1' => ['title' => 'Botte pluie', 'description' => 'Caoutchouc impermeable'],
+            'autre2' => ['title' => 'Basket toile', 'description' => 'Textile respirant'],
+        ]);
+
+        return $index;
+    }
+
+    /**
+     * @param array<string, float> $boosts
+     * @return array<string, float> id => score
+     */
+    private function scores(IndexDirectory $index, string $query, array $boosts = []): array
+    {
+        $scores = [];
+
+        foreach ($index->search($query, boosts: $boosts) as $hit) {
+            $scores[$hit->id] = $hit->score;
+        }
+
+        return $scores;
+    }
+
+    #[Test]
+    public function boosting_a_field_can_reverse_the_ranking(): void
+    {
+        // The same two documents, one holding the query in its title and one in
+        // its description. Which comes first is now the caller's decision.
+        $index = $this->twoFieldCatalogue();
+
+        $neutral     = $this->scores($index, 'cuir veritable');
+        $titleFirst  = $this->scores($index, 'cuir veritable', ['title' => 5.0]);
+        $bodyFirst   = $this->scores($index, 'cuir veritable', ['description' => 5.0]);
+
+        $this->assertGreaterThan($neutral['descr'], $neutral['titre'], 'the shorter field wins by default');
+        $this->assertGreaterThan($titleFirst['descr'], $titleFirst['titre']);
+        $this->assertGreaterThan($bodyFirst['titre'], $bodyFirst['descr'], 'boosting the description flips it');
+    }
+
+    #[Test]
+    public function no_boosts_means_every_field_weighs_the_same(): void
+    {
+        $index = $this->twoFieldCatalogue();
+
+        $this->assertSame(
+            $this->scores($index, 'cuir veritable'),
+            $this->scores($index, 'cuir veritable', ['title' => 1.0, 'description' => 1.0])
+        );
+    }
+
+    #[Test]
+    public function a_boost_naming_an_unknown_field_is_ignored(): void
+    {
+        // A caller reusing one set of boosts across several indexes should not
+        // have to know which fields each one holds.
+        $index = $this->twoFieldCatalogue();
+
+        $this->assertSame(
+            $this->scores($index, 'cuir veritable'),
+            $this->scores($index, 'cuir veritable', ['nonexistent' => 9.0])
+        );
+    }
+
+    #[Test]
+    public function a_list_of_tags_is_searchable_and_can_be_boosted(): void
+    {
+        // 1.x indexed array fields but dropped them the moment any boost was
+        // passed, so `tags` silently stopped contributing — and its own demo
+        // passed `'tags' => 1.5`, which therefore did nothing at all.
+        $index = $this->index();
+
+        $index->putMany([
+            'a' => ['title' => 'Chaussure classique', 'tags' => ['luxe', 'artisanal']],
+            'b' => ['title' => 'Chaussure sport', 'tags' => ['course', 'leger']],
+        ]);
+
+        $this->assertSame('a', $index->search('luxe')->hits[0]->id, 'tags are searchable');
+
+        $boosted = $this->scores($index, 'luxe', ['tags' => 5.0]);
+        $plain   = $this->scores($index, 'luxe');
+
+        $this->assertGreaterThan($plain['a'], $boosted['a'], 'and boosting them changes the score');
+    }
+
+    #[Test]
+    public function boosted_scores_survive_a_merge_unchanged(): void
+    {
+        // Field bits are assigned from the frozen schema in a fixed order, so a
+        // mask written by one segment means the same thing to a merged one. If
+        // it did not, boosts would quietly start weighting the wrong field.
+        $index = $this->index();
+
+        $index->putMany([
+            'titre' => ['title' => 'Cuir veritable', 'description' => 'Chaussure de ville confortable'],
+        ]);
+        $index->putMany([
+            'descr' => ['title' => 'Sandale ete', 'description' => 'Dessus en cuir veritable tanne'],
+        ]);
+
+        $this->assertGreaterThan(1, $index->stats()['segments']);
+
+        $before = $this->scores($index, 'cuir veritable', ['title' => 5.0]);
+
+        $index->optimize();
+        $this->assertSame(1, $index->stats()['segments']);
+
+        $after = $this->scores($index, 'cuir veritable', ['title' => 5.0]);
+
+        $this->assertSame(array_keys($before), array_keys($after), 'same order');
+
+        foreach ($before as $id => $score) {
+            $this->assertEqualsWithDelta($score, $after[$id], 1.0E-9, "score of $id");
+        }
+    }
+
+    // =========================================================================
     // Merging
     // =========================================================================
 

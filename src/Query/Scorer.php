@@ -108,4 +108,73 @@ final class Scorer
     {
         return $idfSum * $this->lengthFactor($length, $averageLength);
     }
+
+    /**
+     * BM25F: one term's contribution when fields carry different weights.
+     *
+     *     tf~(t,d) = Σ  boost_f · tf(t,d,f) / (1 − b + b · len_f(d) / avglen_f)
+     *               f
+     *
+     *     score(t,d) = IDF(t) · tf~ · (k1 + 1) / (k1 + tf~)
+     *
+     * ── Why the saturation comes last ──────────────────────────────────────
+     *
+     * That ordering is the whole difference between BM25F and scoring each
+     * field separately then averaging, and it is exactly what 1.x got wrong.
+     *
+     * Its `boosts` branch scored every field on its own and divided by the sum
+     * of all the boosts — including fields that matched nothing. So adding an
+     * unrelated text field to your documents lowered the score of every result,
+     * which is not a weighting, it is a dilution. It also skipped array fields
+     * entirely as soon as any boost was passed, so `tags` silently stopped
+     * contributing.
+     *
+     * Here the weighted frequencies are added up *first* and saturated once, so
+     * a term in the title and in the description contributes more than either
+     * alone, but not proportionally more — which is what saturation is for.
+     *
+     * Term frequency is 0 or 1 per field, because the analyzer deduplicates, so
+     * the mask bit is the frequency.
+     *
+     * @param int          $mask     which fields hold the term, one bit each
+     * @param float[]      $boosts   bit => weight
+     * @param int[]        $lengths  bit => terms this document has in that field
+     * @param float[]      $averages bit => mean across the index
+     */
+    public function fieldedFrequency(int $mask, array $boosts, array $lengths, array $averages): float
+    {
+        $combined = 0.0;
+
+        foreach ($boosts as $bit => $boost) {
+            if ((($mask >> $bit) & 1) === 0) {
+                continue;
+            }
+
+            $average = $averages[$bit] ?? 0.0;
+
+            $normalisation = $average > 0.0
+                ? 1.0 - $this->b + $this->b * (($lengths[$bit] ?? 0) / $average)
+                : 1.0;
+
+            $combined += $boost / $normalisation;
+        }
+
+        return $combined;
+    }
+
+    /**
+     * Saturates a combined frequency and weights it by rarity.
+     *
+     * With a single field of boost 1 and average length, this gives exactly the
+     * same number as score() — so turning boosts on does not silently rescale
+     * every result.
+     */
+    public function fieldedScore(float $idf, float $combinedFrequency): float
+    {
+        if ($combinedFrequency <= 0.0) {
+            return 0.0;
+        }
+
+        return $idf * $combinedFrequency * ($this->k1 + 1.0) / ($this->k1 + $combinedFrequency);
+    }
 }

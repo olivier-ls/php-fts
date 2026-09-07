@@ -52,12 +52,17 @@ use Ols\PhpFts\Storage\Varint;
  * CollectionStatistics gathered across every segment, and only falls back to
  * its own numbers when it really is the whole index.
  *
+ * Scoring is field-aware: every posting carries a bitmap of which fields hold
+ * the term, so `boosts: ['title' => 3.0]` weights a title match above a
+ * description one — and each field is normalised against its own average
+ * length, because a title of five terms is not short the way a description of
+ * five terms would be.
+ *
  * ── What is deliberately provisional ────────────────────────────────────────
  *
- * Scoring has no notion of fields yet, so `boosts: ['title' => 3.0]` cannot
- * work: that needs a field mask stored per posting, which is the next piece.
  * The filter format is a flat list of ANDed clauses, standing in for the
- * nested, fluent builder the public API will offer.
+ * nested, fluent builder the public API will offer. There is one `b` for every
+ * field rather than one per field, which BM25F allows.
  */
 final class SegmentIndex
 {
@@ -89,10 +94,21 @@ final class SegmentIndex
     /** Reverse of the key dictionary, built on first use. @var string[]|null */
     private ?array $keysByOrdinal = null;
 
-    /** @var array<string, array{documents: int, offset: int, length: int}|null> */
+    /** @var array<string, array{documents: int, offset: int, length: int, masks: int}|null> */
     private array $termCache = [];
 
     private ?string $lengths = null;
+
+    /** @var array<int, array<int, int>> ordinal => bit => field length */
+    private array $fieldLengthCache = [];
+
+    /** @var string[] bit => field name */
+    private array $searchableFields = [];
+
+    /** @var array<int, int> bit => summed field length */
+    private array $fieldLengthSums = [];
+
+    private int $maskWidth = 1;
 
     private int $termLengthSum = 0;
 
@@ -113,11 +129,14 @@ final class SegmentIndex
             throw new CorruptSegmentException('Segment metadata is missing or unreadable');
         }
 
-        $this->documentCount = (int) $meta['documentCount'];
-        $this->termLengthSum = (int) ($meta['termLengthSum'] ?? 0);
-        $this->fields        = $meta['fields'];
-        $this->documents     = DocumentStore::open($segment, 'docs');
-        $this->scorer        = new Scorer();
+        $this->documentCount    = (int) $meta['documentCount'];
+        $this->termLengthSum    = (int) ($meta['termLengthSum'] ?? 0);
+        $this->fields           = $meta['fields'];
+        $this->searchableFields = array_values($meta['searchableFields'] ?? []);
+        $this->fieldLengthSums  = $meta['fieldLengthSums'] ?? [];
+        $this->maskWidth        = max(1, (int) ($meta['maskWidth'] ?? 1));
+        $this->documents        = DocumentStore::open($segment, 'docs');
+        $this->scorer           = new Scorer();
     }
 
     /**
@@ -172,10 +191,11 @@ final class SegmentIndex
         int $offset = 0,
         array $filters = [],
         array $facets = [],
+        array $boosts = [],
     ): SearchResult {
         $started = hrtime(true);
 
-        [$matches, $scores] = $this->select($query, $filters);
+        [$matches, $scores] = $this->select($query, $filters, boosts: $boosts);
 
         $total = $matches->count();
 
@@ -225,10 +245,12 @@ final class SegmentIndex
         array $filters = [],
         ?Bitset $deleted = null,
         ?CollectionStatistics $statistics = null,
+        array $boosts = [],
     ): array {
         [$matches, $scores] = $this->matchQuery(
             $query,
             $statistics ?? new CollectionStatistics($this->documentCount, $this->averageLength()),
+            $boosts,
         );
 
         foreach ($filters as $filter) {
@@ -324,6 +346,18 @@ final class SegmentIndex
     }
 
     /**
+     * Summed field lengths, by mask bit, so per-field averages can be taken
+     * across segments.
+     *
+     * @return array<int, int>
+     * @internal
+     */
+    public function fieldLengthSums(): array
+    {
+        return $this->fieldLengthSums;
+    }
+
+    /**
      * The terms a query analyses to, using this segment's analyzer.
      *
      * @return string[]
@@ -346,7 +380,7 @@ final class SegmentIndex
      * @return array{0: Bitset, 1: array<int, float>} the matches, and their BM25 scores
      * @throws CorruptSegmentException
      */
-    private function matchQuery(string $query, CollectionStatistics $statistics): array
+    private function matchQuery(string $query, CollectionStatistics $statistics, array $boosts = []): array
     {
         $terms = $this->analyzer->analyze($query);
 
@@ -359,6 +393,9 @@ final class SegmentIndex
 
         /** @var array<int, float> ordinal => summed IDF of those terms */
         $weights = [];
+
+        $weightByBit = $this->boostsByBit($boosts);
+        $averages    = $this->fieldAverages($statistics);
 
         foreach ($terms as $term) {
             $entry = $this->entryFor($term);
@@ -378,12 +415,31 @@ final class SegmentIndex
                 $this->segment->read('postings', $entry['offset'], $entry['length'])
             );
 
+            $masks = $this->masksFor($entry);
+            $index = 0;
+
             while ($cursor->current() !== PostingsFormat::END) {
                 $ordinal = $cursor->current();
 
-                $held[$ordinal]    = ($held[$ordinal] ?? 0) + 1;
-                $weights[$ordinal] = ($weights[$ordinal] ?? 0.0) + $idf;
+                $held[$ordinal] = ($held[$ordinal] ?? 0) + 1;
 
+                if ($masks === null) {
+                    // A segment written before field masks existed: fall back to
+                    // plain BM25, which normalises against the whole document.
+                    $weights[$ordinal] = ($weights[$ordinal] ?? 0.0) + $idf;
+                } else {
+                    $combined = $this->scorer->fieldedFrequency(
+                        $this->maskAt($masks, $index),
+                        $weightByBit,
+                        $this->fieldLengthsOf($ordinal),
+                        $averages,
+                    );
+
+                    $weights[$ordinal] = ($weights[$ordinal] ?? 0.0)
+                        + $this->scorer->fieldedScore($idf, $combined);
+                }
+
+                $index++;
                 $cursor->next();
             }
         }
@@ -410,6 +466,7 @@ final class SegmentIndex
 
         $matches       = Bitset::empty($this->documentCount);
         $scores        = [];
+        $fielded       = $this->usesFieldMasks();
         $averageLength = $statistics->averageLength > 0.0
             ? $statistics->averageLength
             : $this->averageLength();
@@ -420,14 +477,130 @@ final class SegmentIndex
             }
 
             $matches->set($ordinal);
-            $scores[$ordinal] = $this->scorer->score(
-                $weights[$ordinal],
-                $this->lengthOf($ordinal),
-                $averageLength,
-            );
+
+            // With masks the per-term scores are already normalised per field
+            // and saturated, so they only need adding up. Without them the
+            // accumulated IDF still has to be scaled by the document's length.
+            $scores[$ordinal] = $fielded
+                ? $weights[$ordinal]
+                : $this->scorer->score($weights[$ordinal], $this->lengthOf($ordinal), $averageLength);
         }
 
         return [$matches, $scores];
+    }
+
+    /**
+     * Query boosts, translated from field names to mask bits.
+     *
+     * Every searchable field appears, so a field nobody boosted still
+     * contributes at weight 1. A boost naming a field that does not exist is
+     * ignored rather than rejected: a caller reusing one set of boosts across
+     * several indexes should not have to know which fields each one holds.
+     *
+     * @param array<string, float> $boosts
+     * @return array<int, float>
+     */
+    private function boostsByBit(array $boosts): array
+    {
+        $byBit = [];
+
+        foreach ($this->searchableFields as $bit => $field) {
+            $byBit[$bit] = (float) ($boosts[$field] ?? 1.0);
+        }
+
+        return $byBit;
+    }
+
+    /**
+     * @return array<int, float>
+     */
+    private function fieldAverages(CollectionStatistics $statistics): array
+    {
+        $averages = [];
+
+        foreach ($this->searchableFields as $bit => $field) {
+            $averages[$bit] = $statistics->fieldAverage($bit)
+                ?: ($this->documentCount > 0 ? ($this->fieldLengthSums[$bit] ?? 0) / $this->documentCount : 0.0);
+        }
+
+        return $averages;
+    }
+
+    /**
+     * One term's field masks, or null when the segment has none.
+     *
+     * Read in one go per term: the masks sit in their own section in posting
+     * order, so a term's slice is contiguous.
+     *
+     * @param array{documents: int, offset: int, length: int, masks: int} $entry
+     * @throws CorruptSegmentException
+     */
+    private function masksFor(array $entry): ?string
+    {
+        if (!$this->usesFieldMasks()) {
+            return null;
+        }
+
+        return $this->segment->read(
+            'fieldmask',
+            $entry['masks'],
+            $entry['documents'] * $this->maskWidth
+        );
+    }
+
+    /**
+     * Whether this segment carries field masks at all.
+     *
+     * A schema with one searchable field does not: every mask byte would hold
+     * the same single bit, and BM25F over one neutral field gives exactly what
+     * plain BM25 gives. Scoring then takes the unfielded path, which normalises
+     * against the whole document instead of per field — the same answer, and
+     * 23% of a segment saved.
+     */
+    private function usesFieldMasks(): bool
+    {
+        return count($this->searchableFields) > 1 && $this->segment->has("fieldmask");
+    }
+
+    private function maskAt(string $masks, int $index): int
+    {
+        $mask = 0;
+
+        for ($byte = 0; $byte < $this->maskWidth; $byte++) {
+            $position = $index * $this->maskWidth + $byte;
+
+            if ($position < strlen($masks)) {
+                $mask |= ord($masks[$position]) << ($byte * 8);
+            }
+        }
+
+        return $mask;
+    }
+
+    /**
+     * How many terms one document holds in each field.
+     *
+     * @return array<int, int>
+     * @throws CorruptSegmentException
+     */
+    private function fieldLengthsOf(int $ordinal): array
+    {
+        if (isset($this->fieldLengthCache[$ordinal])) {
+            return $this->fieldLengthCache[$ordinal];
+        }
+
+        $count = max(1, count($this->searchableFields));
+
+        $this->lengths ??= $this->segment->has('lengths')
+            ? $this->segment->read('lengths')
+            : '';
+
+        $packed = substr($this->lengths, $ordinal * $count * 2, $count * 2);
+        $values = strlen($packed) === $count * 2
+            ? array_values(unpack('v' . $count, $packed))
+            : array_fill(0, $count, 0);
+
+        return $this->fieldLengthCache[$ordinal] = $values;
     }
 
     /**
@@ -438,7 +611,7 @@ final class SegmentIndex
      * segment, and once to walk the postings. Without the cache that would be
      * two dictionary lookups per term per segment.
      *
-     * @return array{documents: int, offset: int, length: int}|null
+     * @return array{documents: int, offset: int, length: int, masks: int}|null
      * @throws CorruptSegmentException
      */
     private function entryFor(string $term): ?array
@@ -453,12 +626,23 @@ final class SegmentIndex
             return $this->termCache[$term] = null;
         }
 
+        // Decoded in separate statements rather than inside one array literal:
+        // every call advances $position, and relying on evaluation order to get
+        // them in sequence is the kind of cleverness that breaks silently.
         $position = 0;
 
+        $documents = Varint::decode($payload, $position);
+        $offset    = Varint::decode($payload, $position);
+        $length    = Varint::decode($payload, $position);
+
+        // Segments written before field masks existed stop here.
+        $masks = $position < strlen($payload) ? Varint::decode($payload, $position) : 0;
+
         return $this->termCache[$term] = [
-            'documents' => Varint::decode($payload, $position),
-            'offset'    => Varint::decode($payload, $position),
-            'length'    => Varint::decode($payload, $position),
+            'documents' => $documents,
+            'offset'    => $offset,
+            'length'    => $length,
+            'masks'     => $masks,
         ];
     }
 
