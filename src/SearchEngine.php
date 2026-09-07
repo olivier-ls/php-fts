@@ -8,6 +8,7 @@ use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\HighlightException;
+use Ols\PhpFts\Exception\SortException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Index\IndexDirectory;
 
@@ -210,6 +211,7 @@ final class SearchEngine implements \Countable
      *         boosts:    ['title' => 3.0],
      *         filters:   Filter::eq('active', true),
      *         facets:    ['brand', 'category'],
+     *         sort:      [Sort::asc('price')],
      *         highlight: ['title', 'description'],
      *     );
      *
@@ -228,8 +230,15 @@ final class SearchEngine implements \Countable
      * @param array<string,float> $boosts    per-field weights, overriding the schema's
      * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
      *
+     * @param Sort|array<mixed>   $sort      criteria, in order of precedence.
+     *        Relevance by default. Sorting is the engine's job rather than the
+     *        caller's because it is the same problem as pagination: twenty hits
+     *        sorted by price are the twenty best-scoring documents arranged by
+     *        price, not the twenty cheapest matches. See Sort.
+     *
      * @throws FilterException        when a filter is malformed or mistyped
      * @throws HighlightException     when a field asked for cannot be highlighted
+     * @throws SortException          when a field cannot be sorted on
      * @throws CorruptSegmentException
      */
     public function search(
@@ -240,8 +249,18 @@ final class SearchEngine implements \Countable
         array $facets = [],
         array $boosts = [],
         Highlight|array $highlight = [],
+        Sort|array $sort = [],
     ): SearchResult {
-        return $this->index->search($query, $limit, $offset, $filters, $facets, $boosts, $highlight);
+        return $this->index->search(
+            $query,
+            $limit,
+            $offset,
+            $filters,
+            $facets,
+            $boosts,
+            $highlight,
+            $sort,
+        );
     }
 
     /**

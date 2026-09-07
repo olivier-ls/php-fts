@@ -9,6 +9,7 @@ use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\HighlightException;
+use Ols\PhpFts\Exception\SortException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
@@ -20,6 +21,7 @@ use Ols\PhpFts\Query\Highlighter;
 use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
+use Ols\PhpFts\Sort;
 use Ols\PhpFts\Storage\Manifest;
 
 /**
@@ -465,10 +467,12 @@ final class IndexDirectory
      *        flat list of clauses, which are ANDed
      * @param array<mixed>        $facets  field names, or name => Facet
      * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
+     * @param Sort|array<mixed>   $sort      criteria, in order of precedence
      *
      * @throws CorruptSegmentException
      * @throws FilterException
      * @throws HighlightException
+     * @throws SortException
      */
     public function search(
         string $query = '',
@@ -478,8 +482,10 @@ final class IndexDirectory
         array $facets = [],
         array $boosts = [],
         Highlight|array $highlight = [],
+        Sort|array $sort = [],
     ): SearchResult {
-        $started = hrtime(true);
+        $started  = hrtime(true);
+        $criteria = Sort::normalise($sort);
 
         // Parsed once here rather than once per segment: a malformed filter is
         // the caller's mistake, and it should be reported before any file is
@@ -557,8 +563,18 @@ final class IndexDirectory
                 );
             }
 
+            // One chunked read per sort criterion per segment, then a rank per
+            // matching document. The heap stays bounded, so a category page
+             // ordered by price still materialises only its own page.
+            $keys = $segment->sortKeys($criteria, $matches);
+
             foreach ($matches->iterate() as $ordinal) {
-                $top->offer($scores[$ordinal] ?? 0.0, $position, $ordinal);
+                $top->offer(
+                    $segment->rankOf($criteria, $keys, $scores, $ordinal),
+                    $position,
+                    $ordinal,
+                    $scores[$ordinal] ?? 0.0,
+                );
             }
         }
 
@@ -572,7 +588,7 @@ final class IndexDirectory
         $markers = [];
         $marked  = $highlight === null ? [] : array_fill_keys($terms, true);
 
-        foreach (array_slice($top->drain(), max(0, $offset)) as [$score, $position, $ordinal]) {
+        foreach (array_slice($top->drain(), max(0, $offset)) as [, $position, $ordinal, $score]) {
             $document = $this->segments[$position]->documentAt($ordinal);
 
             if ($document === null) {

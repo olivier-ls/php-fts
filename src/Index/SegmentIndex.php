@@ -9,6 +9,7 @@ use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\HighlightException;
+use Ols\PhpFts\Exception\SortException;
 use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
 use Ols\PhpFts\Highlight;
@@ -19,6 +20,7 @@ use Ols\PhpFts\Query\Scorer;
 use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
+use Ols\PhpFts\Sort;
 use Ols\PhpFts\Storage\SegmentReader;
 use Ols\PhpFts\Storage\Varint;
 
@@ -208,10 +210,12 @@ final class SegmentIndex
      *        flat list of clauses, which are ANDed
      * @param array<mixed>        $facets  field names, or name => Facet
      * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
+     * @param Sort|array<mixed>   $sort      criteria, in order of precedence
      *
      * @throws CorruptSegmentException
      * @throws FilterException
      * @throws HighlightException
+     * @throws SortException
      */
     public function search(
         string $query = '',
@@ -221,8 +225,10 @@ final class SegmentIndex
         array $facets = [],
         array $boosts = [],
         Highlight|array $highlight = [],
+        Sort|array $sort = [],
     ): SearchResult {
-        $started = hrtime(true);
+        $started  = hrtime(true);
+        $criteria = Sort::normalise($sort);
 
         // Verified before a single posting list is read: a field that cannot be
         // highlighted is the caller's mistake, and it should be reported as
@@ -252,7 +258,7 @@ final class SegmentIndex
 
         $hits = [];
 
-        foreach ($this->page($matches, $scores, $limit, $offset) as $ordinal => $score) {
+        foreach ($this->page($matches, $scores, $limit, $offset, $criteria) as $ordinal => $score) {
             $document = $this->documents->get($ordinal);
 
             if ($document === null) {
@@ -1256,23 +1262,97 @@ final class SegmentIndex
      * matches.
      *
      * @param array<int, float> $scores
+     * @param Sort[]            $criteria
      * @return array<int, float> ordinal => score
+     * @throws SortException
      */
-    private function page(Bitset $matches, array $scores, int $limit, int $offset): array
+    private function page(Bitset $matches, array $scores, int $limit, int $offset, array $criteria = []): array
     {
-        $top = new TopK(max(0, $offset) + max(0, $limit));
+        $top  = new TopK(max(0, $offset) + max(0, $limit));
+        $keys = $this->sortKeys($criteria, $matches);
 
         foreach ($matches->iterate() as $ordinal) {
-            $top->offer($scores[$ordinal] ?? 0.0, 0, $ordinal);
+            $score = $scores[$ordinal] ?? 0.0;
+
+            $top->offer($this->rankOf($criteria, $keys, $scores, $ordinal), 0, $ordinal, $score);
         }
 
         $page = [];
 
-        foreach (array_slice($top->drain(), max(0, $offset)) as [$score, , $ordinal]) {
+        foreach (array_slice($top->drain(), max(0, $offset)) as [, , $ordinal, $score]) {
             $page[$ordinal] = $score;
         }
 
         return $page;
+    }
+
+    /**
+     * The column values every sort criterion needs, read once per criterion.
+     *
+     * @param Sort[] $criteria
+     * @return array<int, array<int, float>> criterion position => ordinal => value
+     * @throws SortException
+     * @throws CorruptSegmentException
+     * @internal used by the multi-segment layer too
+     */
+    public function sortKeys(array $criteria, Bitset $matches): array
+    {
+        $keys = [];
+
+        foreach ($criteria as $position => $criterion) {
+            if ($criterion->isScore()) {
+                continue;
+            }
+
+            $field  = (string) $criterion->field;
+            $column = $this->column($field);
+
+            if ($column === null) {
+                throw new SortException("No sortable column for field '$field'" . $this->becauseInferred($field));
+            }
+
+            if (!$column instanceof NumericColumn) {
+                // Deliberate, and stated in Sort: ordering text means ordering
+                // it *correctly*, which is a different job per script and is
+                // not one this release does.
+                throw new SortException(
+                    "Cannot sort by '$field': only numeric fields can be sorted. "
+                    . 'Sort on a number, or on a numeric field your application derives from the text'
+                );
+            }
+
+            $keys[$position] = $column->values($matches);
+        }
+
+        return $keys;
+    }
+
+    /**
+     * One candidate's rank: every criterion reduced to bigger-is-better.
+     *
+     * @param Sort[]                          $criteria
+     * @param array<int, array<int, float>>   $keys
+     * @param array<int, float>               $scores
+     * @return float[]
+     * @internal used by the multi-segment layer too
+     */
+    public function rankOf(array $criteria, array $keys, array $scores, int $ordinal): array
+    {
+        if ($criteria === []) {
+            return [$scores[$ordinal] ?? 0.0];
+        }
+
+        $rank = [];
+
+        foreach ($criteria as $position => $criterion) {
+            $rank[] = $criterion->rankOf(
+                $criterion->isScore()
+                    ? ($scores[$ordinal] ?? 0.0)
+                    : ($keys[$position][$ordinal] ?? null)
+            );
+        }
+
+        return $rank;
     }
 
     private function terms(): BlockDictionaryReader

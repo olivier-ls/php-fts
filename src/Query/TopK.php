@@ -9,9 +9,21 @@ namespace Ols\PhpFts\Query;
  *
  *     $top = new TopK(20);
  *     foreach ($candidates as [$score, $segment, $ordinal]) {
- *         $top->offer($score, $segment, $ordinal);
+ *         $top->offer([$score], $segment, $ordinal);
  *     }
  *     $top->drain();      // best first
+ *
+ * ── What "best" means here: nothing ─────────────────────────────────────────
+ *
+ * A candidate arrives with a **rank**: a list of numbers where bigger is
+ * better, compared left to right. One number is relevance. `[-price]` is
+ * cheapest first. `[$score, -$price]` is by relevance, ties broken by price.
+ *
+ * This class knows none of that. Direction, absent values and relevance are
+ * all turned into numbers by Sort before they get here, which is why sorting
+ * by a column costs this file nothing and why the heap stays bounded whatever
+ * the order asked for — the property below is the one that matters, and it
+ * survives sorting.
  *
  * ── Why not score everything and sort ──────────────────────────────────────
  *
@@ -27,15 +39,20 @@ namespace Ols\PhpFts\Query;
  *
  * ── Ties ────────────────────────────────────────────────────────────────────
  *
- * Equal scores are broken by segment and then by document number, so a query
+ * Equal ranks are broken by segment and then by document number, so a query
  * run twice returns the same page in the same order. Without that, two
- * documents scoring identically could swap places between requests for no
+ * documents ranking identically could swap places between requests for no
  * reason a user could see — and a paginated list would show one of them twice
  * and the other never.
+ *
+ * That tie-break is stable *within* an index but not across a merge, which
+ * renumbers documents. It only shows when a sort leaves genuine ties — every
+ * product at the same price, say — and the fix is the caller's: add a
+ * criterion that distinguishes them.
  */
 final class TopK
 {
-    /** @var \SplMinHeap<array{0: float, 1: int, 2: int}> */
+    /** @var \SplMinHeap<array{0: float[], 1: int, 2: int, 3: float}> */
     private \SplMinHeap $heap;
 
     private int $size;
@@ -46,8 +63,8 @@ final class TopK
 
         $this->heap = new class extends \SplMinHeap {
             /**
-             * @param array{0: float, 1: int, 2: int} $a
-             * @param array{0: float, 1: int, 2: int} $b
+             * @param array{0: float[], 1: int, 2: int, 3: float} $a
+             * @param array{0: float[], 1: int, 2: int, 3: float} $b
              */
             protected function compare(mixed $a, mixed $b): int
             {
@@ -58,26 +75,38 @@ final class TopK
             }
 
             /**
-             * @param array{0: float, 1: int, 2: int} $candidate
-             * @return array{0: float, 1: int, 2: int}
+             * @param array{0: float[], 1: int, 2: int, 3: float} $candidate
+             * @return array<int, float|int>
              */
             private static function rank(array $candidate): array
             {
-                // Higher score first; then the earlier segment, then the lower
-                // document number, so the order never depends on chance.
-                return [$candidate[0], -$candidate[1], -$candidate[2]];
+                // The rank vector first, then the earlier segment, then the
+                // lower document number, so the order never depends on chance.
+                // Flattened into one list because PHP compares lists element by
+                // element and stops at the first difference, which is exactly
+                // the ordering wanted.
+                return [...$candidate[0], -$candidate[1], -$candidate[2]];
             }
         };
     }
 
-    public function offer(float $score, int $segment, int $ordinal): void
+    /**
+     * @param float[] $rank  bigger is better, compared left to right
+     * @param float   $score the relevance to report for this candidate, which
+     *        is not necessarily what it is ranked by. It travels with the
+     *        candidate because the caller cannot look it up afterwards: scores
+     *        are computed per segment, and by the time a page is assembled the
+     *        segment that produced them has been left behind. Ignored by every
+     *        comparison here.
+     */
+    public function offer(array $rank, int $segment, int $ordinal, float $score = 0.0): void
     {
         if ($this->size === 0) {
             return;
         }
 
         if ($this->heap->count() < $this->size) {
-            $this->heap->insert([$score, $segment, $ordinal]);
+            $this->heap->insert([$rank, $segment, $ordinal, $score]);
 
             return;
         }
@@ -85,12 +114,12 @@ final class TopK
         // Only worth keeping if it beats the worst one held.
         $worst = $this->heap->top();
 
-        if ([$score, -$segment, -$ordinal] <= [$worst[0], -$worst[1], -$worst[2]]) {
+        if ([...$rank, -$segment, -$ordinal] <= [...$worst[0], -$worst[1], -$worst[2]]) {
             return;
         }
 
         $this->heap->extract();
-        $this->heap->insert([$score, $segment, $ordinal]);
+        $this->heap->insert([$rank, $segment, $ordinal, $score]);
     }
 
     public function count(): int
@@ -101,7 +130,7 @@ final class TopK
     /**
      * The candidates held, best first. Consumes the heap.
      *
-     * @return array<int, array{0: float, 1: int, 2: int}>
+     * @return array<int, array{0: float[], 1: int, 2: int, 3: float}>
      */
     public function drain(): array
     {

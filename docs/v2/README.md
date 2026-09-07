@@ -4,8 +4,9 @@
 > filters, facets, highlighting and the segment format are implemented and
 > tested on the `2.x` branch.
 >
-> Still unwritten, and marked as such below where it appears: `Sort` and the
-> `sort:` argument, per-field analyzer overrides, and `UPGRADE.md`.
+> Still unwritten, and marked as such below where it appears: alphabetical
+> sorting (numeric sorting is in), per-field analyzer overrides, and
+> `UPGRADE.md`.
 >
 > The shipped documentation is still [`/README.md`](../../README.md) (1.x).
 
@@ -311,7 +312,7 @@ $result = $engine->search(
     boosts:    ['title' => 3.0],
     filters:   Filter::eq('active', true),
     facets:    ['brand', 'category'],
-    sort:      [Sort::score(), Sort::asc('price')],   // not implemented yet
+    sort:      [Sort::score(), Sort::asc('price')],
     highlight: ['title', 'description'],
 );
 ```
@@ -338,9 +339,44 @@ An empty query matches everything, so filters and facets work on their own —
 category pages, admin tables, faceted browsing:
 
 ```php
-$engine->search('', filters: Filter::eq('category', 'Shoes'));
-$engine->search('', filters: Filter::eq('category', 'Shoes'), sort: [Sort::asc('price')]);   // sort: not yet
+$engine->search('', filters: Filter::eq('category', 'Shoes'), sort: [Sort::asc('price')]);
 ```
+
+### Sorting
+
+```php
+use Ols\PhpFts\Sort;
+
+$engine->search('', sort: [Sort::asc('price')]);                  // cheapest first
+$engine->search('shoe', sort: [Sort::score(), Sort::asc('price')]);   // relevance, ties by price
+```
+
+Relevance by default. Criteria apply in the order given, so the second only
+settles what the first leaves equal. A document with **no value** in the sorted
+field goes last, whichever direction was asked for — "cheapest first" should
+not open on a page of products with no price.
+
+**This has to be the engine's job.** Twenty hits sorted by price are the twenty
+best-*scoring* documents arranged by price, not the twenty cheapest matches, and
+no amount of local sorting turns one into the other. Getting it right means
+ordering every match, and only the engine holds every match. Sorting here also
+keeps the memory bounded: a category page ordered by price still materialises
+only its own page, not the eight thousand documents behind it.
+
+**Numeric fields only** — a price, a stock level, a timestamp. That is what
+catalogues order by, and it sorts the same in every language.
+
+Alphabetical ordering is not here yet, because it is not one feature. Done
+properly it sorts on the *folded* value, which the analyzer already computes:
+that is what puts `École` next to `ecole`, and `Ёлка` next to `Ель` instead of
+before `Абрикос`. It works for Latin, Greek and Cyrillic, and for Japanese
+written in kana — Unicode happens to order the kana in gojūon sequence. It does
+**not** work for Han: the sort key of 革靴 is its reading, which is not in the
+characters and is ambiguous even to a reader. Chinese sorts by pinyin and
+Japanese kanji by reading, both of which need a phonetic dictionary this library
+will not ship. The answer there is the one production systems use, and the
+reason every Japanese address form has a kana field: sort on a reading your
+application supplies.
 
 ---
 

@@ -222,6 +222,55 @@ final class NumericColumn
      * @return array{count: int, min: float|null, max: float|null, sum: float, avg: float|null}
      * @throws CorruptSegmentException
      */
+    /**
+     * The values of the documents given, keyed by document.
+     *
+     * What a sort reads. Documents with no value are simply absent from the
+     * result, which is what lets the caller treat "no price" as its own case
+     * rather than as a zero — a product with no price is not free.
+     *
+     * Read in one chunked pass over the column rather than one seek per
+     * document: a sort over eight thousand matches is eight thousand values,
+     * and asking for them one at a time would be eight thousand reads of eight
+     * bytes.
+     *
+     * @param Bitset|null $documents the documents to read; null reads them all
+     * @return array<int, float> document => value
+     * @throws CorruptSegmentException
+     */
+    public function values(?Bitset $documents = null): array
+    {
+        $presence = $this->presence->bytes();
+        $selected = $documents?->bytes();
+        $found    = [];
+
+        for ($start = 0; $start < $this->documentCount; $start += self::CHUNK) {
+            $size   = min(self::CHUNK, $this->documentCount - $start);
+            $values = unpack(
+                'e' . $size,
+                $this->segment->read($this->section, $this->valuesOffset + $start * 8, $size * 8)
+            );
+
+            for ($i = 0; $i < $size; $i++) {
+                $document = $start + $i;
+                $index    = $document >> 3;
+                $mask     = 1 << ($document & 7);
+
+                if ((ord($presence[$index]) & $mask) === 0) {
+                    continue;
+                }
+
+                if ($selected !== null && (ord($selected[$index]) & $mask) === 0) {
+                    continue;
+                }
+
+                $found[$document] = $values[$i + 1];
+            }
+        }
+
+        return $found;
+    }
+
     public function stats(?Bitset $documents = null): array
     {
         $presence = $this->presence->bytes();
