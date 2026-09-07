@@ -435,7 +435,7 @@ final class SegmentIndex
      * A generator, and deliberately per term rather than per document: that is
      * the order the dictionary is laid out in, and it is also the shape the
      * writer accumulates. Transposing it to per-document would hold the whole
-     * thing twice at the peak of a merge, which on a 128 MB shared host is the
+     * thing twice at the peak of a merge, which on a memory-bound host is the
      * difference between merging and dying.
      *
      * @internal for SegmentMerger

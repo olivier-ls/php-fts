@@ -397,9 +397,10 @@ steady state: 3 to 10 segments, each merge amortised O(log n) per document
 
 ### What a merge is allowed to cost
 
-An automatic merge runs inside somebody's `put()`, in an HTTP request that on
-shared hosting has 128 MB and an application already living in it. Its size is
-the one thing the caller never chose. So it holds nothing it can stream:
+An automatic merge runs inside somebody's `put()`, in an HTTP request working to
+whatever `memory_limit` the host set, with an application already living in it.
+Its size is the one thing the caller never chose. So it holds nothing it can
+stream:
 
 - **Postings.** Every source dictionary is sorted and readable in order, so the
   sources are walked in lockstep — a k-way merge that takes the smallest term at
@@ -467,6 +468,27 @@ Measured end to end, importing the 45 000-product catalogue at 2 000 a commit:
 \* not the merge: at 40 MB it is `putMany()`'s own batch of 2 000 documents that
 does not fit, which is the caller's to choose and does fit at 500 a commit
 (13 segments, 22 MB peak).
+
+### How much memory a shared host actually gives
+
+**512 MB, not 128.** Measured on the OVH cluster this library is developed
+against (`ssh02.cluster105.gra`, PHP 8.3), on the CLI and over HTTP alike —
+the two are separate `php.ini` files and both say `512M`. 128 MB is where
+cheaper plans and older offers sit, and is still the figure worth designing
+against, but it had been an *assumption* here for the whole of v2 and it was
+wrong for the host actually in use.
+
+Which is why nothing hard-codes either number: `MergePolicy` reads
+`memory_limit` when it matters. On 512 MB its derived cap lands near 130 000
+documents, so `maxAutoMergeDocuments` is what binds and the mechanism does
+nothing at all. That is the correct outcome — it earns its place on the hosts
+that need it and stays out of the way on the ones that do not.
+
+What the same measurement did settle is the **timing** verdict, deferred since
+the design: the full 45 625-product import on that shared host runs in 49.5 s
+(923 docs/s) against 39.8 s on an idle local SSD, at an identical 66 MB peak and
+byte-identical output. Network storage does not collapse indexing throughput,
+and memory figures really are the same everywhere.
 
 ---
 

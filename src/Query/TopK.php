@@ -30,8 +30,8 @@ namespace Ols\PhpFts\Query;
  * That is what the code did before, and it is fine until a query matches a lot
  * of documents. Returning a page of twenty out of eight thousand matches meant
  * building an array of eight thousand scores and sorting it — O(n log n) time
- * and O(n) memory to throw away 99.75% of the work. On shared hosting with a
- * 128 MB limit, the memory is the part that bites.
+ * and O(n) memory to throw away 99.75% of the work. On shared hosting, where
+ * every request works to a `memory_limit`, the memory is the part that bites.
  *
  * A bounded min-heap costs O(n log K) time and O(K) memory: each candidate is
  * compared against the worst one currently held, and only gets in if it beats

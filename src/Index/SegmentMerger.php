@@ -160,10 +160,12 @@ final class SegmentMerger
      * remapped, and the result handed to the writer to accumulate. Correct,
      * and unaffordable. A posting is a slot in a nested PHP array and costs
      * about 75 bytes there; a real catalogue of 45 000 products holds some
-     * nine million of them, so the accumulation alone reached 700 MB. Shared
-     * hosting gives a request 128 MB, and a merge is the one operation whose
-     * size the caller never chose — it happens on somebody's write, on a
-     * schedule the tiers decide.
+     * nine million of them, so the accumulation alone reached 700 MB — past
+     * the limit of every shared host measured, and a merge is the one
+     * operation whose size the caller never chose: it happens on somebody's
+     * write, on a schedule the tiers decide. (What a host actually gives is
+     * measured in MergePolicy, and it is not the 128 MB this project assumed
+     * for a long time.)
      *
      * Nothing about it needed the map. Every source dictionary is sorted, and
      * `postingsByTerm()` yields in that order, so the sources can be walked in

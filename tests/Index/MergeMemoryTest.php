@@ -18,8 +18,9 @@ use PHPUnit\Framework\TestCase;
  * it to. `optimize()` is a decision — whoever calls it has chosen to wait, and
  * can give the process whatever it needs. A tiered merge is not: it fires
  * inside somebody's `put()`, on a schedule the segment sizes decide, in an
- * HTTP request that on shared hosting has 128 MB and an application already
- * living in it.
+ * HTTP request working to whatever `memory_limit` the host set — 512 MB on the
+ * OVH cluster this is developed against, 128 MB on cheaper ones — with an
+ * application already living in it.
  *
  * The merger used to build the whole `term => ordinal => mask` map before
  * writing a byte of it. A posting is a slot in a nested PHP array and costs

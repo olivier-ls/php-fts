@@ -61,13 +61,28 @@ namespace Ols\PhpFts\Index;
  * not fitted on: 45 000 real products with seven filterable fields, predicted
  * 73.2 MB and measured 73.0.
  *
- * So the cap is a share of the memory actually left in the process, converted
- * into documents. A 128 MB shared host running an application in 40 MB of it
- * gets a smaller merge than a 512 MB one, without anybody configuring it, and
- * a merge that will not fit does not happen — the segments stay, search gets a
- * little slower, and `optimize()` from a cron fixes it. That is the right way
- * round: piling up segments is a slow index, and running out of memory is a
- * failed request.
+ * ── How much memory a shared host actually gives ────────────────────────────
+ *
+ * This is the one number the whole design leans on, and it was an assumption
+ * until it was checked. **It is not a constant, and it is not 128 MB.** The
+ * OVH cluster this library is developed against gives a request **512 MB**, on
+ * the CLI and over HTTP alike — measured, not read off a documentation page.
+ * Cheaper plans and older offers are where 128 MB comes from, and it is still
+ * the figure to design against, but assuming it everywhere would be designing
+ * for a host nobody in this project actually has.
+ *
+ * Which is the argument for not hard-coding either: the budget is read from
+ * `memory_limit` at the moment it matters. A host with 128 MB and an
+ * application living in 40 MB of it gets a smaller merge than one with 512 MB,
+ * without anybody configuring anything, and a merge that will not fit does not
+ * happen — the segments stay, search gets a little slower, and `optimize()`
+ * from a cron fixes it. That is the right way round: piling up segments is a
+ * slow index, and running out of memory is a failed request.
+ *
+ * On 512 MB the derived cap lands near 130 000 documents, so the ceiling is
+ * what binds and this class does nothing. That is the correct outcome and
+ * worth saying plainly: the mechanism earns its place on the hosts that need
+ * it, and stays out of the way on the ones that do not.
  */
 final class MergePolicy
 {
@@ -283,8 +298,8 @@ final class MergePolicy
     /**
      * `memory_limit` in bytes, or null when it is unlimited or unreadable.
      *
-     * The shorthand suffixes are PHP's own, and case-insensitive: `128M` is
-     * what a shared host writes.
+     * The shorthand suffixes are PHP's own, and case-insensitive: `512M` is
+     * what the php.ini this was measured against writes.
      */
     private static function memoryLimit(): ?int
     {

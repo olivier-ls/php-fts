@@ -32,9 +32,10 @@ use Ols\PhpFts\Storage\SegmentReader;
  *
  * `unpack('e*', …)` would decode the whole column in one C call, which is fast
  * but materialises one PHP float per document — around 1.5 MB of array for a
- * 160 KB column. Since shared hosting is the target and `memory_limit` is often
- * 128 MB, the scan works through fixed-size chunks instead: still one C call
- * per chunk, but the peak stays bounded whatever the segment holds.
+ * 160 KB column. Since shared hosting is the target and every request there
+ * works to a `memory_limit`, the scan works through fixed-size chunks instead:
+ * still one C call per chunk, but the peak stays bounded whatever the segment
+ * holds.
  */
 final class NumericColumn
 {
