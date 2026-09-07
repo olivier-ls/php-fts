@@ -180,8 +180,8 @@ local ordinal.
 | `number`  | `double` ×N, fixed width — direct offset `ordinal × 8` |
 | `boolean` | bitmap, 1 bit per document |
 | `keyword` | **dictionary-encoded**: sorted distinct values + per-doc ordinal (1/2/4 B by cardinality) |
-| `tags`    | value-ordinal lists + an offsets array |
-| presence  | a bitmap per column, for missing values |
+| `tags`    | the same value dictionary + a run of ordinals and a fixed-width offset per document |
+| presence  | a bitmap per column, for missing values — except `tags`, where an empty range is absence |
 
 Dictionary encoding is the key move. Counting a `brand` facet becomes:
 *allocate an int array of size cardinality, walk the matching ordinals,
@@ -189,6 +189,38 @@ increment.* No string comparison, no `json_decode`, no document read.
 
 In v1, faceting requires decoding the JSON of every matching document — which is
 why the demo runs six `limit: 2000` queries to fake it.
+
+### `tags`: a range instead of a slot
+
+A `keyword` column holds one ordinal per document at a fixed width, so document
+*d* is at byte `d × width` and nothing has to be looked up to find it. That is
+what makes it fast, and it is exactly what a list cannot have. So the values are
+laid end to end and each document gets an **offset** into that run:
+
+```
+offsets    [ 0, 2, 3, 3 ]              documentCount + 1 entries, fixed width
+ordinals   [ luxury, summer, winter ]  doc 0 owns [0,2), doc 1 owns [2,3)
+```
+
+Three properties, and they are why the layout is this one:
+
+- **Random access survives.** Offsets are fixed width, so a document's range is
+  still two reads at computable positions — no scan from the start of the column.
+- **Presence needs no bitmap.** No tags is a range of length zero, so `exists`
+  is `offsets[d+1] > offsets[d]`, and this is the one column with no presence
+  bitset.
+- **A facet costs one pass over the values.** Counting is proportional to the
+  number of values, not to values × documents. An inverted bitset per tag would
+  answer a *filter* faster and cost a popcount over the whole vocabulary to
+  answer a *facet* — the wrong trade in the direction facets are used.
+
+A document's ordinals are stored ascending and deduplicated. The sorting lets a
+scan stop early; the dedup is not cosmetic — counted twice, a facet would report
+more documents for a tag than there are documents.
+
+Offsets are sized from the column's total number of values, ordinals from its
+cardinality, both 1/2/4 bytes. Twenty thousand products with three tags each
+spend two bytes per offset, not four.
 
 ### Bitsets with native PHP string operators
 

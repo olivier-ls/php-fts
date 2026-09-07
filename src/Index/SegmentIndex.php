@@ -127,7 +127,7 @@ final class SegmentIndex
     private Scorer $scorer;
     private DocumentStore $documents;
 
-    /** @var array<string, NumericColumn|KeywordColumn> */
+    /** @var array<string, NumericColumn|KeywordColumn|TagColumn|null> */
     private array $columns = [];
 
     private function __construct(SegmentReader $segment, ?Analyzer $analyzer)
@@ -385,7 +385,7 @@ final class SegmentIndex
             throw new FilterException("No facetable column for field '$field'" . $this->becauseInferred($field));
         }
 
-        if ($facet->kind === 'terms' && !$column instanceof KeywordColumn) {
+        if ($facet->kind === 'terms' && !$column instanceof KeywordColumn && !$column instanceof TagColumn) {
             throw new FilterException(
                 "Facet '$name' asks for term counts, but '$field' is a numeric column."
                 . ' Use Facet::stats() for a number, or Facet::ranges() once it exists'
@@ -399,9 +399,12 @@ final class SegmentIndex
             );
         }
 
-        return $column instanceof KeywordColumn
-            ? $column->facet($matches, size: 0)
-            : $column->stats($matches);
+        // Size is applied by the caller, once, over the counts of every
+        // segment added together — the top twenty of the index are not the top
+        // twenty of each segment.
+        return $column instanceof NumericColumn
+            ? $column->stats($matches)
+            : $column->facet($matches, size: 0);
     }
 
     /**
@@ -415,6 +418,7 @@ final class SegmentIndex
 
         return match (true) {
             $column instanceof KeywordColumn => $column->facet($matches, size: 0),
+            $column instanceof TagColumn     => $column->facet($matches, size: 0),
             $column instanceof NumericColumn => $column->stats($matches),
             default                          => [],
         };
@@ -895,11 +899,11 @@ final class SegmentIndex
                 'exists', 'missing' => null,
                 'in', 'notIn', 'between' => is_array($filter->value)
                     ? array_map(
-                        fn(mixed $one): mixed => $one === null ? null : $this->schema->coerceValue($field, $one),
+                        fn(mixed $one): mixed => $one === null ? null : $this->schema->coerceComparand($field, $one),
                         $filter->value,
                     )
                     : $filter->value,
-                default => $this->schema->coerceValue($field, $filter->value),
+                default => $this->schema->coerceComparand($field, $filter->value),
             };
         } catch (FieldTypeException $e) {
             // Re-thrown as a filter problem, because that is what the caller
@@ -913,7 +917,40 @@ final class SegmentIndex
             return $this->compileKeyword($column, $filter->operator, $field, $value);
         }
 
+        if ($column instanceof TagColumn) {
+            return $this->compileTags($column, $filter->operator, $field, $value);
+        }
+
         return $this->compileNumeric($column, $filter->operator, $field, $value);
+    }
+
+    /**
+     * A filter on a multi-valued field.
+     *
+     * `eq` is containment, because a list of three tags does not equal one tag
+     * and there is nothing else the comparison could usefully mean. The
+     * negations follow the same SQL reading as everywhere else in this file: a
+     * document with no tags at all is not "tagged something other than
+     * summer", so `neq` excludes it and `not(eq(...))` — the plain complement
+     * — includes it.
+     *
+     * "Summer *and* luxury" needs no operator: `Filter::all()` of two `eq`
+     * clauses is two bitsets and one AND, which the tree already expresses.
+     *
+     * @throws FilterException
+     * @throws CorruptSegmentException
+     */
+    private function compileTags(TagColumn $column, string $operator, string $field, mixed $value): Bitset
+    {
+        return match ($operator) {
+            'eq'      => $column->contains((string) $value),
+            'neq'     => $column->contains((string) $value)->not()->and($column->exists()),
+            'in'      => $column->containsAny($this->strings($field, $value)),
+            'notIn'   => $column->containsAny($this->strings($field, $value))->not()->and($column->exists()),
+            'exists'  => $column->exists(),
+            'missing' => $column->missing(),
+            default   => throw new FilterException($this->wrongOperator($operator, $field, 'tags')),
+        };
     }
 
     /**
@@ -1176,7 +1213,7 @@ final class SegmentIndex
         return $this->keysByOrdinal[$ordinal] ?? (string) $ordinal;
     }
 
-    private function column(string $field): NumericColumn|KeywordColumn|null
+    private function column(string $field): NumericColumn|KeywordColumn|TagColumn|null
     {
         if (array_key_exists($field, $this->columns)) {
             return $this->columns[$field];
@@ -1195,6 +1232,7 @@ final class SegmentIndex
         return $this->columns[$field] = match ($definition['type']) {
             'number', 'boolean' => NumericColumn::open($this->segment, 'dv.' . $field),
             'keyword'           => KeywordColumn::open($this->segment, 'dv.' . $field),
+            'tags'              => TagColumn::open($this->segment, 'dv.' . $field),
             default             => null,
         };
     }

@@ -106,15 +106,21 @@ final class Schema
     }
 
     /**
-     * A list of exact values, analysed as text.
+     * A list of exact values: searchable, filterable and facetable.
      *
-     * Filtering on tags needs a multi-valued column, which is not built yet, so
-     * `filterable` is accepted and ignored for now rather than silently
-     * pretending to work.
+     * Filtering asks whether the list *holds* a value, because there is no
+     * useful sense in which a list of three tags equals one tag — see
+     * TagColumn. Facet counts therefore add up to more than the number of
+     * documents, which is what a tag facet is for.
      */
-    public function tags(string $field, float $boost = 1.0, bool $stored = true): self
-    {
-        return $this->with($field, 'tags', indexed: true, filterable: false, stored: $stored, boost: $boost, b: null);
+    public function tags(
+        string $field,
+        float $boost = 1.0,
+        bool $indexed = true,
+        bool $filterable = true,
+        bool $stored = true,
+    ): self {
+        return $this->with($field, 'tags', $indexed, $filterable, $stored, $boost, null);
     }
 
     /**
@@ -357,6 +363,43 @@ final class Schema
     }
 
     /**
+     * One value of a field, as a *filter* compares against it.
+     *
+     * The same as coerceValue() for every type but `tags`, where the two part
+     * company: storing a tags field takes a list, while filtering one takes a
+     * single tag and asks whether the list holds it. Coercing `'summer'` for
+     * storage gives `['summer']`, which is right there and useless here.
+     *
+     * A tag is coerced exactly as a keyword is, because that is what one item
+     * of the list is.
+     *
+     * @throws FieldTypeException
+     */
+    public function coerceComparand(string $field, mixed $value): mixed
+    {
+        $definition = $this->fields[$field] ?? null;
+
+        if ($definition === null || $value === null) {
+            return $value;
+        }
+
+        if ($definition['type'] === 'tags') {
+            if (is_array($value)) {
+                throw $this->refuse(
+                    null,
+                    $field,
+                    'tags',
+                    'a list. A filter compares against one tag at a time; use in() for several'
+                );
+            }
+
+            return $this->coerceKeyword(null, $field, $value);
+        }
+
+        return $this->coerceField(null, $field, $definition['type'], $value);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     public function toArray(): array
@@ -417,6 +460,7 @@ final class Schema
             $schema = match ($type) {
                 'number'  => $schema->number((string) $field),
                 'keyword' => $schema->keyword((string) $field),
+                'tags'    => $schema->tags((string) $field),
                 default   => $schema->text((string) $field),
             };
         }

@@ -5,8 +5,7 @@
 > tested on the `2.x` branch.
 >
 > Still unwritten, and marked as such below where it appears: `Sort` and the
-> `sort:` argument, multi-valued `tags` as a filterable column, per-field
-> analyzer overrides, and `UPGRADE.md`.
+> `sort:` argument, per-field analyzer overrides, and `UPGRADE.md`.
 >
 > The shipped documentation is still [`/README.md`](../../README.md) (1.x).
 
@@ -200,8 +199,7 @@ $engine = SearchEngine::open('./search_data', Schema::make()
     ->text('description')
     ->keyword('brand')            // exact match, filterable, facetable
     ->keyword('category')
-    ->tags('tags')                // array of keywords — stored and searchable
-                                  // today; filterable and facetable next
+    ->tags('tags')                // array of keywords, filterable and facetable
     ->number('price')             // filterable, sortable, range facets
     ->number('stock')
     ->boolean('active')
@@ -389,6 +387,39 @@ Filter::not(Filter::eq('brand', 'Nike'))  // is not a Nike — including
 so a product with no brand is not "a brand other than Nike". `not` is plain set
 complement, which is what the word means. Both are useful, so both exist rather
 than one being quietly chosen for you.
+
+### Multi-valued fields
+
+On a `tags` field, `eq` asks whether the list **holds** the value. A list of
+three tags does not equal one tag, so there is nothing else it could usefully
+mean — and it is what makes the natural spelling do the right thing:
+
+```php
+Filter::eq('tags', 'summer')                     // tagged summer
+Filter::in('tags', ['summer', 'winter'])         // tagged either
+Filter::all(                                     // tagged both
+    Filter::eq('tags', 'summer'),
+    Filter::eq('tags', 'luxury'),
+)
+Filter::missing('tags')                          // no tags at all
+```
+
+There is no `containsAll` operator, because `Filter::all()` already says it:
+two clauses, two bitsets, one AND.
+
+`neq` and `notIn` keep the SQL reading here too, so a product with no tags is
+not "tagged something other than summer" — `not(eq(...))` is the complement
+that includes it.
+
+A tag facet counts a document once per tag it carries, so its counts add up to
+more than the number of matches. That is what a tag facet is for: fifty
+products of which thirty are `summer` and twenty-five `luxury`, five being
+both.
+
+Both work with no schema at all: a field whose values are lists of short,
+repeated strings is inferred as `tags` and gets its column. A list of
+paragraphs is prose in an array and stays text — the same measure as for a bare
+string.
 
 ### Strictness
 

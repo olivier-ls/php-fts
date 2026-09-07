@@ -239,7 +239,14 @@ final class SegmentIndexWriter
      * there are ten documents: everything looks unique, and the column would be
      * tiny anyway.
      *
-     * @return array<string, string> field => 'number' | 'keyword' | 'text'
+     * A **list** is judged by the same measure, applied to its items: short and
+     * repeated across documents is a set of tags, and earns a multi-valued
+     * column that can be filtered and faceted. A list of paragraphs is prose in
+     * an array and stays text. The PHP type decides the *shape*, and repetition
+     * decides whether that shape is worth a column — the same rule as for a
+     * bare string, which is the point.
+     *
+     * @return array<string, string> field => 'number' | 'keyword' | 'tags' | 'text'
      */
     private function inferFields(): array
     {
@@ -249,6 +256,8 @@ final class SegmentIndexWriter
         $numeric = [];
         /** @var array<string, bool> */
         $tooLong = [];
+        /** @var array<string, bool> */
+        $listed = [];
         /** @var array<string, array<string, true>> */
         $distinct = [];
 
@@ -262,10 +271,28 @@ final class SegmentIndexWriter
                 }
 
                 if (is_array($value)) {
-                    // A list of tags contributes terms, so it needs a type and a
-                    // mask bit. Inference used to skip it, which meant it was
-                    // indexed but invisible to the schema.
-                    $tooLong[$field] = true;
+                    // A list keeps its shape: whatever its items turn out to
+                    // be, this field is multi-valued and cannot be a plain
+                    // keyword column.
+                    $listed[$field] = true;
+
+                    foreach ($value as $item) {
+                        if (is_int($item) || (is_float($item) && is_finite($item))) {
+                            $item = (string) $item;
+                        }
+
+                        if (!is_string($item)) {
+                            continue;
+                        }
+
+                        if (strlen($item) > self::KEYWORD_MAX_LENGTH) {
+                            $tooLong[$field] = true;
+                            continue;
+                        }
+
+                        $distinct[$field][$item] = true;
+                    }
+
                     continue;
                 }
 
@@ -294,12 +321,21 @@ final class SegmentIndexWriter
                 continue;   // already numeric somewhere; numbers win
             }
 
-            $fields[$field] = !isset($tooLong[$field]) && count($values) <= $ceiling
-                ? 'keyword'
-                : 'text';
+            if (isset($tooLong[$field]) || count($values) > $ceiling) {
+                $fields[$field] = 'text';
+                continue;
+            }
+
+            $fields[$field] = isset($listed[$field]) ? 'tags' : 'keyword';
         }
 
         foreach ($tooLong as $field => $_) {
+            $fields[$field] ??= 'text';
+        }
+
+        // A list that contributed no usable item — every value was an object,
+        // or every list was empty — is still a field, and still text.
+        foreach ($listed as $field => $_) {
             $fields[$field] ??= 'text';
         }
 
@@ -469,6 +505,28 @@ final class SegmentIndexWriter
 
                 $sections = $column->finish($documentCount);
 
+                $segment->addSection('dv.' . $field, $sections['ordinals']);
+                $segment->addSection('dv.' . $field . '.values', $sections['values']);
+                continue;
+            }
+
+            if ($type === 'tags') {
+                $column = new TagColumnWriter();
+
+                foreach ($this->documents as $ordinal => $document) {
+                    $value = $document[$field] ?? null;
+
+                    // A single string is a one-element list. The writer accepts
+                    // it, so a document whose one tag arrived unwrapped is not a
+                    // document with no tags.
+                    $column->add($ordinal, is_string($value) || is_array($value) ? $value : null);
+                }
+
+                $sections = $column->finish($documentCount);
+
+                // The same two section names as a keyword column, and the same
+                // value dictionary inside them. What differs is the shape of
+                // the first one, which its own magic identifies.
                 $segment->addSection('dv.' . $field, $sections['ordinals']);
                 $segment->addSection('dv.' . $field . '.values', $sections['values']);
             }

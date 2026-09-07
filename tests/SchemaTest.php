@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ols\PhpFts\Tests;
 
+use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Schema;
 use PHPUnit\Framework\Attributes\Test;
@@ -275,5 +276,74 @@ class SchemaTest extends TestCase
         $this->assertTrue($schema->fields()['brand']['filterable']);
         $this->assertTrue($schema->fields()['price']['filterable']);
         $this->assertSame([], $schema->boosts(), 'inference never invents a boost');
+    }
+
+    #[Test]
+    public function inference_can_produce_a_multi_valued_field(): void
+    {
+        $schema = Schema::inferred(['tags' => 'tags']);
+
+        $this->assertSame('tags', $schema->typeOf('tags'));
+        $this->assertSame(['tags'], $schema->searchableFields());
+        $this->assertTrue($schema->fields()['tags']['filterable']);
+    }
+
+    #[Test]
+    public function tags_are_filterable_and_searchable_by_default(): void
+    {
+        $definition = Schema::make()->tags('tags')->fields()['tags'];
+
+        $this->assertSame('tags', $definition['type']);
+        $this->assertTrue($definition['indexed']);
+        $this->assertTrue($definition['filterable']);
+        $this->assertTrue($definition['stored']);
+    }
+
+    #[Test]
+    public function a_tag_field_can_give_up_either_capability(): void
+    {
+        // A catalogue with thousands of tags nobody filters on should not pay
+        // for the column; one nobody types should not pay for the terms.
+        $unfilterable = Schema::make()->tags('tags', filterable: false)->fields()['tags'];
+        $unindexed    = Schema::make()->tags('tags', indexed: false)->fields()['tags'];
+
+        $this->assertFalse($unfilterable['filterable']);
+        $this->assertTrue($unfilterable['indexed']);
+
+        $this->assertFalse($unindexed['indexed']);
+        $this->assertTrue($unindexed['filterable']);
+    }
+
+    #[Test]
+    public function a_filter_compares_against_one_tag_not_the_list(): void
+    {
+        $schema = Schema::make()->tags('tags');
+
+        // Storing takes a list; filtering takes one item and asks whether the
+        // list holds it. Coercion has to answer both questions differently.
+        $this->assertSame(['summer'], $schema->coerceValue('tags', 'summer'));
+        $this->assertSame('summer', $schema->coerceComparand('tags', 'summer'));
+        $this->assertSame('2025', $schema->coerceComparand('tags', 2025));
+    }
+
+    #[Test]
+    public function a_list_as_a_comparand_says_to_use_in(): void
+    {
+        $this->expectException(FieldTypeException::class);
+        $this->expectExceptionMessage('use in() for several');
+
+        Schema::make()->tags('tags')->coerceComparand('tags', ['summer', 'winter']);
+    }
+
+    #[Test]
+    public function a_comparand_of_any_other_type_is_coerced_as_the_value_would_be(): void
+    {
+        $schema = Schema::make()->number('price')->keyword('brand')->boolean('active');
+
+        $this->assertSame(200, $schema->coerceComparand('price', '200'));
+        $this->assertSame('Nike', $schema->coerceComparand('brand', 'Nike'));
+        $this->assertTrue($schema->coerceComparand('active', '1'));
+        $this->assertNull($schema->coerceComparand('price', null));
+        $this->assertSame('anything', $schema->coerceComparand('undeclared', 'anything'));
     }
 }
