@@ -28,8 +28,8 @@ One segment = one file, `seg_<id>.fts`.
 │   "FTSG" | formatVersion u16 | flags u16        │
 │   segmentId u64  | docCount u32 | reserved      │
 ├─────────────────────────────────────────────────┤
-│ § terms          term dictionary                │
 │ § postings       posting lists + skip lists     │
+│ § terms          term dictionary                │
 │ § fieldmask      per-posting field bitmaps      │
 │ § docvalues      columnar values                │
 │ § keys           user key → local ordinal       │
@@ -50,6 +50,14 @@ seeking backwards. (Same reason ZIP puts its central directory last.)
 
 **Opening a segment is two reads:** `fseek(-32, SEEK_END)` for the trailer, then
 the directory. From there every section is addressable.
+
+**The order of the sections is nothing to a reader**, for the same reason: the
+directory says where everything is, and no section is found by following
+another. It matters only to the writer, which is why § postings comes before
+§ terms — a dictionary entry points into the posting lists, so the dictionary is
+not complete until the last list is written. Writing the postings first is what
+lets them be streamed to disk one term at a time instead of concatenated in
+memory; see §11.
 
 **The trailer is the self-validation.** `fileLength` compared to the real file
 size is an O(1) completeness check, which catches the only failure that actually
@@ -259,16 +267,25 @@ docstore record stores its own key.
 
 ## 7. § docstore
 
-Records in ordinal order:
-
 ```
-[ keyLen varint ][ key ][ jsonLen varint ][ json ]
+"DSTO" | version u8 | reserved 3 | count u32
+offsets   u32 × (count + 1)     ← where each document starts, and the end
+payloads  the documents, back to back
 ```
 
-preceded by an offsets array (`u32` relative to the section start) so any
-document is one seek away.
+One offset more than there are documents, so the last one's length is read the
+same way as every other's; a document whose stored projection is empty has
+`end == start`. The table is fixed-width and comes first, so any document is one
+seek away — variable-length where you scan, fixed-width where you jump.
+
+A payload is the JSON and nothing else. The key is **not** repeated here: it
+lives in § keys, in a dictionary that maps it to the ordinal, which is the
+direction a lookup actually goes. Storing it twice would cost a second copy of
+every id to answer a question nobody asks of this section.
 
 Only read for the documents actually returned — at most `limit` per query.
+
+Written a document at a time, never assembled: see §11.
 
 ### No compression — selective source instead
 
@@ -375,6 +392,35 @@ put ×8      → 8 tiny segments      → merge → 1 segment (8 docs)
 …
 steady state: 3 to 10 segments, each merge amortised O(log n) per document
 ```
+
+### What a merge is allowed to cost
+
+An automatic merge runs inside somebody's `put()`, in an HTTP request that on
+shared hosting has 128 MB and an application already living in it. Its size is
+the one thing the caller never chose. So it holds nothing it can stream:
+
+- **Postings.** Every source dictionary is sorted and readable in order, so the
+  sources are walked in lockstep — a k-way merge that takes the smallest term at
+  the heads, unions the postings of the sources holding it, writes it, and lets
+  it go. What is live is one term's posting list, bounded by the document count
+  rather than by the vocabulary.
+- **Documents.** A carried document is projected through `source()` and encoded
+  the moment it arrives; only its four-byte offset is kept, which the docstore's
+  offset table needs anyway. The payloads go to a `php://temp` and are copied
+  through in blocks when the section is written.
+
+What is still held is per document (keys, field lengths, column values) or per
+term (the block dictionary, which is assembled before it is written) — both
+bounded by things the caller can see. Measured on a 45 000-product catalogue:
+
+| | accumulating | streaming |
+|---|---|---|
+| `optimize()`, 45 000 documents | 806 MB | 88 MB |
+| full import, peak | 322 MB | 66 MB |
+| import time | 38.2 s | 39.8 s |
+
+The property is locked by `tests/Index/MergeMemoryTest.php`, which holds the
+documents and the vocabulary fixed and varies only how many postings there are.
 
 ---
 

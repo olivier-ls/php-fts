@@ -91,6 +91,9 @@ final class SegmentMerger
             }
         }
 
+        /** @var array<int, array<int, int>> segment position => source ordinal => new ordinal */
+        $remaps = [];
+
         foreach ($sources as $position => $segment) {
             $deleted = $deletions[$position] ?? null;
             $count   = $segment->count();
@@ -124,14 +127,18 @@ final class SegmentMerger
                 $remap[$ordinal] = $next++;
             }
 
-            if ($remap === []) {
-                // Entirely deleted: no postings to carry, and no dictionary to
-                // walk for them.
-                continue;
+            // An entirely deleted segment keeps no remap, and so is left out of
+            // the dictionary walk below: none of its postings could survive it.
+            if ($remap !== []) {
+                $remaps[$position] = $remap;
             }
-
-            $this->carryPostings($writer, $segment, $remap);
         }
+
+        // Handed over as a stream, run when the writer reaches its postings
+        // section. The remaps have to exist by then and they do — they were
+        // built above — but nothing is read out of the sources until write()
+        // asks, and nothing is kept once it has.
+        $writer->carryPostings(fn (): \Generator => $this->mergedPostings($sources, $remaps));
 
         if ($writer->count() === 0) {
             // Every source was entirely deleted. There is nothing to write, and
@@ -145,34 +152,98 @@ final class SegmentMerger
     }
 
     /**
-     * Walks one segment's dictionary and hands its postings over, translated.
+     * Every source's postings, as one ordered stream of translated terms.
+     *
+     * ── Why this is a k-way merge and not a map ────────────────────────────
+     *
+     * It used to be a map: each source's dictionary was walked, its postings
+     * remapped, and the result handed to the writer to accumulate. Correct,
+     * and unaffordable. A posting is a slot in a nested PHP array and costs
+     * about 75 bytes there; a real catalogue of 45 000 products holds some
+     * nine million of them, so the accumulation alone reached 700 MB. Shared
+     * hosting gives a request 128 MB, and a merge is the one operation whose
+     * size the caller never chose — it happens on somebody's write, on a
+     * schedule the tiers decide.
+     *
+     * Nothing about it needed the map. Every source dictionary is sorted, and
+     * `postingsByTerm()` yields in that order, so the sources can be walked in
+     * lockstep: take the smallest term at the heads, union the postings of
+     * every source holding it, yield it, advance those heads. The writer
+     * encodes it and lets it go. What is live at any moment is one term's
+     * posting list, bounded by the number of documents rather than by the
+     * vocabulary — and the vocabulary is the thing that grows.
+     *
+     * The heads are scanned linearly rather than kept in a heap. There are at
+     * most `segmentsPerTier` of them, eight by default, and a heap of eight
+     * costs more to maintain in PHP than eight `strcmp`s.
      *
      * A term whose every document was deleted disappears here rather than
      * being written with an empty list: `$live` ends up empty and the term is
-     * never added.
+     * never yielded.
      *
-     * @param array<int, int> $remap source ordinal => new ordinal
+     * @param SegmentIndex[]                    $sources segment position => segment
+     * @param array<int, array<int, int>>       $remaps  position => source ordinal => new ordinal
+     *
+     * @return \Generator<string, array<int, int>>
      * @throws CorruptSegmentException
      */
-    private function carryPostings(SegmentIndexWriter $writer, SegmentIndex $segment, array $remap): void
+    private function mergedPostings(array $sources, array $remaps): \Generator
     {
-        $postings = [];
+        /** @var \Generator<string, array<int, int>>[] */
+        $heads = [];
 
-        foreach ($segment->postingsByTerm() as $term => $byOrdinal) {
+        foreach ($remaps as $position => $_) {
+            $walk = $sources[$position]->postingsByTerm();
+
+            if ($walk->valid()) {
+                $heads[$position] = $walk;
+            }
+        }
+
+        while ($heads !== []) {
+            $smallest = null;
+
+            foreach ($heads as $walk) {
+                $term = (string) $walk->key();
+
+                if ($smallest === null || strcmp($term, $smallest) < 0) {
+                    $smallest = $term;
+                }
+            }
+
             $live = [];
 
-            foreach ($byOrdinal as $ordinal => $mask) {
-                if (isset($remap[$ordinal])) {
-                    $live[$remap[$ordinal]] = $mask;
+            foreach ($heads as $position => $walk) {
+                if ((string) $walk->key() !== $smallest) {
+                    continue;
+                }
+
+                $remap = $remaps[$position];
+
+                foreach ($walk->current() as $ordinal => $mask) {
+                    if (isset($remap[$ordinal])) {
+                        // A term one source holds in the title and another in
+                        // the description keeps one posting per document with
+                        // both bits set — but only ever for the same document,
+                        // which cannot come from two sources. The union is
+                        // there because the shape says it may, not because it
+                        // does.
+                        $new        = $remap[$ordinal];
+                        $live[$new] = ($live[$new] ?? 0) | $mask;
+                    }
+                }
+
+                $walk->next();
+
+                if (!$walk->valid()) {
+                    unset($heads[$position]);
                 }
             }
 
             if ($live !== []) {
-                $postings[$term] = $live;
+                yield (string) $smallest => $live;
             }
         }
-
-        $writer->carryPostings($postings);
     }
 
     /**

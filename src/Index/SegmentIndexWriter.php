@@ -78,8 +78,21 @@ final class SegmentIndexWriter
     /** @var string[] ordinal => the caller's id */
     private array $keys = [];
 
-    /** @var array<int, array<string, mixed>> ordinal => document */
+    /**
+     * @var array<int, array<string, mixed>> ordinal => document
+     *
+     * Only the analysing path fills this: it has to, because a field's type is
+     * inferred from the whole batch and a term's postings are only complete
+     * once every document has been read. A carried document goes straight into
+     * the store below and is not kept.
+     */
     private array $documents = [];
+
+    /** How many documents have arrived, by either path. */
+    private int $count = 0;
+
+    /** The documents as they will be stored, encoded as they arrive. */
+    private ?DocumentStoreWriter $store = null;
 
     /** @var array<string, true> ids already used, to catch duplicates */
     private array $seen = [];
@@ -87,8 +100,15 @@ final class SegmentIndexWriter
     /** Whether the documents were carried across rather than analysed. */
     private bool $carried = false;
 
-    /** @var array<string, array<int, int>> term => ordinal => field mask */
-    private array $carriedPostings = [];
+    /**
+     * Opens the carried postings, in ascending term order.
+     *
+     * A closure rather than a Generator, because it is handed over before the
+     * documents are, and must not start running until write() asks for it.
+     *
+     * @var (\Closure(): \Generator<string, array<int, int>>)|null
+     */
+    private ?\Closure $postingsStream = null;
 
     /** @var array<int, array<int, int>> ordinal => bit => length */
     private array $carriedLengths = [];
@@ -162,11 +182,12 @@ final class SegmentIndexWriter
         $this->seen[$id]   = true;
         $this->keys[]      = $id;
         $this->documents[] = $this->schema?->coerce($document, $id) ?? $document;
+        $this->count++;
     }
 
     public function count(): int
     {
-        return count($this->documents);
+        return $this->count;
     }
 
     // -------------------------------------------------------------------------
@@ -201,40 +222,64 @@ final class SegmentIndexWriter
             throw new StorageException("Duplicate document id in this batch: '$id'");
         }
 
+        if ($this->schema === null) {
+            // Impossible by construction — a merge only happens after a commit,
+            // and a commit freezes a schema — but the store below has to
+            // project the document *now*, and with no schema to project
+            // against it would store a `source()`-narrowed copy as if it were
+            // the whole thing. Better to say so, here, where the id is still
+            // in view.
+            throw new StorageException('Carried documents need the frozen schema; none was given');
+        }
+
         // No coercion: these values were coerced when they were first indexed,
         // against this same frozen schema. Running them through again would at
         // best be work and at worst would refuse, on a merge, a document the
         // index already holds.
-        $this->seen[$id]        = true;
-        $this->keys[]           = $id;
-        $this->documents[]      = $stored;
+        $this->seen[$id] = true;
+        $this->keys[]    = $id;
+
+        // Encoded and let go, rather than kept until write(). This is the
+        // difference between a merge that holds its whole input and one that
+        // holds a document at a time — see DocumentStoreWriter.
+        $this->store ??= new DocumentStoreWriter();
+        $this->store->add($this->schema->project($stored), $id);
+
         $this->carriedLengths[] = $lengths;
         $this->carriedColumns[] = $columns;
         $this->carried          = true;
+        $this->count++;
     }
 
     /**
-     * The postings of a whole segment being carried, added to what is already
-     * accumulated.
+     * Where the carried postings will come from, when write() asks.
      *
-     * Per segment rather than per document, because that is the order they are
-     * read in — see SegmentIndex::postingsByTerm(). The ordinals are the
-     * *new* ones, which only the caller knows.
+     * A **stream**, not a map, and that is the whole point of it. The obvious
+     * shape — hand over one segment's postings at a time and let the writer
+     * accumulate them — costs about 75 bytes per posting, because a nested PHP
+     * array is what it accumulates into. Measured on a real catalogue that was
+     * 106 MB for ten thousand documents and 700 MB for forty-five thousand, on
+     * an operation nobody asked for and whose size nobody chose.
      *
-     * @param array<string, array<int, int>> $postings term => ordinal => field mask
+     * A stream costs one term. The caller merges its sources' dictionaries —
+     * all sorted, all readable in order — and yields each term once, already
+     * remapped; the encoder below writes it and forgets it. What is left in
+     * memory is the largest posting list in the index, which is bounded by the
+     * document count rather than by the vocabulary.
+     *
+     * The closure is called once, at write() time. Handing over a Generator
+     * directly would start the merge before the ordinals it translates to are
+     * known.
+     *
+     * @param \Closure(): \Generator<string, array<int, int>> $stream yields
+     *        term => ordinal => field mask, terms in ascending byte order and
+     *        ordinals already translated to this segment's
      *
      * @internal for SegmentMerger
      */
-    public function carryPostings(array $postings): void
+    public function carryPostings(\Closure $stream): void
     {
-        foreach ($postings as $term => $byOrdinal) {
-            foreach ($byOrdinal as $ordinal => $mask) {
-                // A term found in several fields keeps one posting with several
-                // bits set, exactly as the analysing path builds it.
-                $this->carriedPostings[$term][$ordinal] =
-                    ($this->carriedPostings[$term][$ordinal] ?? 0) | $mask;
-            }
-        }
+        $this->postingsStream = $stream;
     }
 
     /**
@@ -244,7 +289,7 @@ final class SegmentIndexWriter
      */
     public function write(string $path): void
     {
-        $documentCount = count($this->documents);
+        $documentCount = $this->count;
 
         $segment = SegmentWriter::create($path);
 
@@ -257,14 +302,6 @@ final class SegmentIndexWriter
             // With no schema, everything is inferred and the result is turned
             // into one, so declared and inferred indexes take the same path
             // from here on.
-            if ($this->carried && $this->schema === null) {
-                // Impossible by construction — a merge only happens after a
-                // commit, and a commit freezes a schema — but inferring from
-                // carried documents would read a `source()`-narrowed copy and
-                // quietly give a field a different type. Better to say so.
-                throw new StorageException('Carried documents need the frozen schema; none was given');
-            }
-
             $schema = $this->schema ?? Schema::inferred($this->inferFields());
 
             $this->effectiveSchema = $schema;
@@ -272,7 +309,15 @@ final class SegmentIndexWriter
             $this->writeTermsAndPostings($segment, $documentCount, $schema);
             $this->writeColumns($segment, $schema, $documentCount);
 
-            $segment->addSection('docs', DocumentStore::encode($this->storedDocuments($schema), $this->keys));
+            // A carried document was projected and encoded as it arrived; an
+            // analysed one could not be, because the schema it is projected
+            // against is only settled a few lines above. It is still streamed
+            // rather than concatenated, which is what saves the second copy of
+            // the batch the projection used to make.
+            $store = $this->store ?? $this->encodeDocuments($schema);
+
+            $store->writeTo($segment, 'docs');
+
             $segment->addSection('keys', $this->encodeKeys());
             $segment->addSection('meta', (string) json_encode([
                 'documentCount'    => $documentCount,
@@ -291,20 +336,19 @@ final class SegmentIndexWriter
     }
 
     /**
-     * The documents as they should be stored, with whatever the schema excludes
-     * left out.
+     * The analysed batch, projected and encoded into a store.
      *
-     * @return array<int, array<string, mixed>>
+     * @throws StorageException
      */
-    private function storedDocuments(Schema $schema): array
+    private function encodeDocuments(Schema $schema): DocumentStoreWriter
     {
-        $stored = [];
+        $store = new DocumentStoreWriter();
 
         foreach ($this->documents as $ordinal => $document) {
-            $stored[$ordinal] = $schema->project($document);
+            $store->add($schema->project($document), $this->keys[$ordinal] ?? '');
         }
 
-        return $stored;
+        return $store;
     }
 
     // -------------------------------------------------------------------------
@@ -459,26 +503,29 @@ final class SegmentIndexWriter
         $searchable = $schema->searchableFields();
         $maskWidth  = max(1, (int) ceil(count($searchable) / 8));
 
-        // The two ways a segment can come by its postings. Everything after
-        // this line is shared, so a carried segment and an analysed one cannot
-        // disagree about the layout — there is only one encoder.
-        [$postings, $lengths, $sums] = $this->carried
+        // The two ways a segment can come by its postings. Both hand over the
+        // same thing — an ordered stream of (term, ordinal => mask) — so a
+        // carried segment and an analysed one cannot disagree about the
+        // layout: there is one encoder below, and it consumes a stream.
+        [$stream, $lengths, $sums] = $this->carried
             ? $this->carriedTerms($searchable)
             : $this->analysedTerms($searchable);
 
-        // Sorted bytewise, which the dictionary requires and which UTF-8 makes
-        // the same as sorting by code point.
-        $terms = array_keys($postings);
-        sort($terms, SORT_STRING);
+        $dictionary = new BlockDictionaryWriter();
+        $masks      = '';
+        $written    = 0;
 
-        $dictionary   = new BlockDictionaryWriter();
-        $encodedLists = '';
-        $masks        = '';
+        // Streamed, not concatenated. A posting list is written the moment its
+        // term is complete and is not held afterwards, which is what lets a
+        // merge run in the memory of its largest term rather than of its whole
+        // vocabulary. The masks are still buffered, because they are a section
+        // of their own and only one can be open at a time — one byte per
+        // posting, against the ~75 a nested array costs.
+        $segment->beginSection('postings');
 
-        foreach ($terms as $term) {
+        foreach ($stream as $term => $byOrdinal) {
             $term = (string) $term;
 
-            $byOrdinal = $postings[$term];
             ksort($byOrdinal);
 
             $ordinals = array_keys($byOrdinal);
@@ -488,11 +535,12 @@ final class SegmentIndexWriter
             // documents hold the term, where its list is, and where its masks
             // are.
             $dictionary->add($term, Varint::encode(count($ordinals))
-                . Varint::encode(strlen($encodedLists))
+                . Varint::encode($written)
                 . Varint::encode(strlen($encoded))
                 . Varint::encode(strlen($masks)));
 
-            $encodedLists .= $encoded;
+            $segment->write($encoded);
+            $written += strlen($encoded);
 
             foreach ($byOrdinal as $mask) {
                 for ($byte = 0; $byte < $maskWidth; $byte++) {
@@ -501,8 +549,15 @@ final class SegmentIndexWriter
             }
         }
 
+        $segment->endSection();
+
+        // After the postings rather than before, because the dictionary points
+        // into them and is only complete once the last list is written. Where
+        // a section sits in the file is nothing to a reader — the directory at
+        // the end says where everything is — so the order costs nothing and
+        // both paths take it, which is what keeps a merged segment byte for
+        // byte the segment a fresh commit would have written.
         $segment->addSection('terms', $dictionary->finish());
-        $segment->addSection('postings', $encodedLists);
 
         // With one searchable field every mask byte holds the same single bit,
         // so it says nothing — and BM25F over one neutral field gives exactly
@@ -535,8 +590,15 @@ final class SegmentIndexWriter
     /**
      * Analyses every document, field by field.
      *
+     * Unlike a merge, this path has to hold the whole map: a term's postings
+     * are only complete once every document has been analysed, so there is no
+     * order in which they could be written as they are found. What bounds it
+     * is the batch — the caller chose how many documents to commit at once,
+     * and can choose fewer. A merge's size is not chosen by anybody, which is
+     * why that path streams and this one does not.
+     *
      * @param string[] $searchable bit => field name
-     * @return array{0: array<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     * @return array{0: \Generator<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
      */
     private function analysedTerms(array $searchable): array
     {
@@ -567,7 +629,27 @@ final class SegmentIndexWriter
             }
         }
 
-        return [$postings, $lengths, $sums];
+        return [self::inTermOrder($postings), $lengths, $sums];
+    }
+
+    /**
+     * A map of postings, yielded in the order the dictionary requires.
+     *
+     * Bytewise, which UTF-8 makes the same as sorting by code point. The map is
+     * passed by value and the generator holds the only reference to it once the
+     * caller lets go, so nothing is duplicated.
+     *
+     * @param array<string, array<int, int>> $postings
+     * @return \Generator<string, array<int, int>>
+     */
+    private static function inTermOrder(array $postings): \Generator
+    {
+        $terms = array_keys($postings);
+        sort($terms, SORT_STRING);
+
+        foreach ($terms as $term) {
+            yield (string) $term => $postings[$term];
+        }
     }
 
     /**
@@ -580,10 +662,15 @@ final class SegmentIndexWriter
      * along the way must not still be in the average BM25 normalises against.
      *
      * @param string[] $searchable bit => field name
-     * @return array{0: array<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     * @return array{0: \Generator<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     * @throws StorageException
      */
     private function carriedTerms(array $searchable): array
     {
+        if ($this->postingsStream === null) {
+            throw new StorageException('Carried documents need their postings; carryPostings() was never called');
+        }
+
         $sums    = array_fill(0, max(1, count($searchable)), 0);
         $lengths = [];
 
@@ -596,7 +683,7 @@ final class SegmentIndexWriter
             }
         }
 
-        return [$this->carriedPostings, $lengths, $sums];
+        return [($this->postingsStream)(), $lengths, $sums];
     }
 
 
@@ -632,7 +719,7 @@ final class SegmentIndexWriter
             if ($type === 'number' || $type === 'boolean') {
                 $column = new NumericColumnWriter();
 
-                foreach (array_keys($this->documents) as $ordinal) {
+                for ($ordinal = 0; $ordinal < $documentCount; $ordinal++) {
                     $value = $this->valueForColumn($ordinal, $field);
 
                     $column->add($ordinal, match (true) {
@@ -649,7 +736,7 @@ final class SegmentIndexWriter
             if ($type === 'keyword') {
                 $column = new KeywordColumnWriter();
 
-                foreach (array_keys($this->documents) as $ordinal) {
+                for ($ordinal = 0; $ordinal < $documentCount; $ordinal++) {
                     $value = $this->valueForColumn($ordinal, $field);
                     $column->add($ordinal, is_string($value) ? $value : null);
                 }
@@ -664,7 +751,7 @@ final class SegmentIndexWriter
             if ($type === 'tags') {
                 $column = new TagColumnWriter();
 
-                foreach (array_keys($this->documents) as $ordinal) {
+                for ($ordinal = 0; $ordinal < $documentCount; $ordinal++) {
                     $value = $this->valueForColumn($ordinal, $field);
 
                     // A single string is a one-element list. The writer accepts
