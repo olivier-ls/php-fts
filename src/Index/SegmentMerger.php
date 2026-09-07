@@ -6,6 +6,7 @@ namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Schema;
 
 /**
  * Combines several segments into one, dropping the documents they no longer
@@ -49,14 +50,14 @@ final class SegmentMerger
      *
      * @param SegmentIndex[]             $sources   segment position => segment
      * @param Bitset[]                   $deletions same keys as $sources
-     * @param array<string, string>|null $fields    the index's frozen schema
+     * @param Schema|null                $schema    the index's frozen schema
      *
      * @return int how many documents the new segment holds
      * @throws StorageException
      */
-    public function merge(array $sources, array $deletions, string $path, ?array $fields = null): int
+    public function merge(array $sources, array $deletions, string $path, ?Schema $schema = null): int
     {
-        $writer = new SegmentIndexWriter($this->analyzer, $fields);
+        $writer = new SegmentIndexWriter($this->analyzer, $schema);
 
         foreach ($sources as $position => $segment) {
             $deleted = $deletions[$position] ?? null;

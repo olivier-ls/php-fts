@@ -6,6 +6,7 @@ namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\Storage\SegmentWriter;
 use Ols\PhpFts\Storage\Varint;
 
@@ -32,12 +33,18 @@ use Ols\PhpFts\Storage\Varint;
  *   dv.<field>.values   the value dictionary of a keyword column
  *   docs          the documents themselves
  *   keys          BlockDictionary  your id → local ordinal
- *   meta          field types and counts, as JSON
+ *   meta          the schema and the counts BM25 needs, as JSON
  *
- * ── Field types are inferred ────────────────────────────────────────────────
+ * ── A schema, declared or inferred ──────────────────────────────────────────
  *
- * There is no schema yet, so types are worked out from the values themselves,
- * across the whole batch:
+ * A Schema may be passed in, in which case it decides everything: which fields
+ * are searchable, which get a column, what each is boosted by, what is stored.
+ * A field it does not declare is still stored and returned, but is neither
+ * searched nor filtered — the caller said what mattered, and the writer takes
+ * them at their word.
+ *
+ * With no schema, types are worked out from the values themselves, across the
+ * whole batch:
  *
  *   int, float, bool   →  a numeric column, filterable and sortable
  *   short string       →  analysed into terms *and* given a keyword column,
@@ -47,8 +54,11 @@ use Ols\PhpFts\Storage\Varint;
  *                         be large and useless
  *   array of strings   →  analysed into terms
  *
- * The length threshold is a heuristic standing in for the explicit schema the
- * public API will offer.
+ * The length threshold is a heuristic, and it is the reason declaring a schema
+ * is worth it: inference reads the batch it is given, so the only way to be
+ * certain a field is filterable is to say so. Whichever path was taken, the
+ * result is a Schema, written into the segment's meta and frozen by the index
+ * at its first commit.
  */
 final class SegmentIndexWriter
 {
@@ -73,8 +83,8 @@ final class SegmentIndexWriter
     /** @var array<string, true> ids already used, to catch duplicates */
     private array $seen = [];
 
-    /** @var array<string, string>|null the types actually written */
-    private ?array $effectiveFields = null;
+    /** The schema actually written, declared or inferred. */
+    private ?Schema $effectiveSchema = null;
 
     /** Summed document lengths, for the average BM25 normalises against. */
     private int $termLengthSum = 0;
@@ -88,27 +98,26 @@ final class SegmentIndexWriter
     private int $maskWidth = 1;
 
     /**
-     * @param array<string, string>|null $fields field => type, to use instead of
-     *        inferring. The index freezes its field types at its first commit and
-     *        passes them here afterwards, because inference depends on the batch:
+     * @param Schema|null $schema declared field definitions, used instead of
+     *        inferring. The index freezes its schema at its first commit and
+     *        passes it here afterwards, because inference depends on the batch:
      *        ten documents with ten distinct titles look like a keyword field,
-     *        two hundred do not. Left to re-infer, a merge could change a field's
+     *        two hundred do not. Left to re-infer, a merge could change a
      *        type, and a filter that worked on the unmerged segments would then
      *        fail on the merged one.
      */
-    public function __construct(?Analyzer $analyzer = null, private readonly ?array $fields = null)
+    public function __construct(?Analyzer $analyzer = null, private readonly ?Schema $schema = null)
     {
         $this->analyzer = $analyzer ?? new Analyzer();
     }
 
     /**
-     * The field types this writer used, known once write() has run.
-     *
-     * @return array<string, string>
+     * The schema this writer used, declared or inferred, known once write() has
+     * run.
      */
-    public function fields(): array
+    public function schema(): Schema
     {
-        return $this->effectiveFields ?? [];
+        return $this->effectiveSchema ?? Schema::make();
     }
 
     /**
@@ -149,24 +158,27 @@ final class SegmentIndexWriter
         $segment = SegmentWriter::create($path);
 
         try {
-            // A frozen schema wins, but a field it has never seen still needs a
-            // type — adding a field to later documents must not make it
-            // unfilterable.
-            $fields = $this->fields === null
-                ? $this->inferFields()
-                : $this->fields + $this->inferFields();
+            // A declared schema wins outright. Fields it does not mention are
+            // kept and returned but neither searched nor filtered — a catalogue
+            // export gains columns all the time, and inferring the stragglers
+            // would bring back exactly the drift the schema exists to remove.
+            //
+            // With no schema, everything is inferred and the result is turned
+            // into one, so declared and inferred indexes take the same path
+            // from here on.
+            $schema = $this->schema ?? Schema::inferred($this->inferFields());
 
-            $this->effectiveFields = $fields;
+            $this->effectiveSchema = $schema;
 
-            $this->writeTermsAndPostings($segment, $documentCount, $fields);
-            $this->writeColumns($segment, $fields, $documentCount);
+            $this->writeTermsAndPostings($segment, $documentCount, $schema);
+            $this->writeColumns($segment, $schema, $documentCount);
 
-            $segment->addSection('docs', DocumentStore::encode($this->documents));
+            $segment->addSection('docs', DocumentStore::encode($this->storedDocuments($schema)));
             $segment->addSection('keys', $this->encodeKeys());
             $segment->addSection('meta', (string) json_encode([
                 'documentCount'    => $documentCount,
                 'termLengthSum'    => $this->termLengthSum,
-                'fields'           => $fields,
+                'schema'           => $schema->toArray(),
                 'searchableFields' => $this->searchableFields,
                 'fieldLengthSums'  => $this->fieldLengthSums,
                 'maskWidth'        => $this->maskWidth,
@@ -177,6 +189,23 @@ final class SegmentIndexWriter
             $segment->discard();
             throw $e;
         }
+    }
+
+    /**
+     * The documents as they should be stored, with whatever the schema excludes
+     * left out.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    private function storedDocuments(Schema $schema): array
+    {
+        $stored = [];
+
+        foreach ($this->documents as $ordinal => $document) {
+            $stored[$ordinal] = $schema->project($document);
+        }
+
+        return $stored;
     }
 
     // -------------------------------------------------------------------------
@@ -288,12 +317,11 @@ final class SegmentIndexWriter
      * masks are touched for the handful of documents that reach scoring.
      * Interleaving would have hurt both the compression and the skipping.
      *
-     * @param array<string, string> $fields the effective schema
      * @throws StorageException
      */
-    private function writeTermsAndPostings(SegmentWriter $segment, int $documentCount, array $fields): void
+    private function writeTermsAndPostings(SegmentWriter $segment, int $documentCount, Schema $schema): void
     {
-        $searchable = $this->searchableFields($fields);
+        $searchable = $schema->searchableFields();
         $maskWidth  = max(1, (int) ceil(count($searchable) / 8));
 
         /** @var array<string, array<int, int>> term => ordinal => field bitmap */
@@ -389,39 +417,21 @@ final class SegmentIndexWriter
         $this->termLengthSum    = array_sum($sums);
     }
 
-    /**
-     * The fields that contribute terms, in a fixed order.
-     *
-     * Sorted by name so that a field's bit is the same in every segment of an
-     * index — the schema is frozen, so the list is too, and a mask written by
-     * one segment means the same thing when a merged segment reads it.
-     *
-     * @param array<string, string> $fields
-     * @return string[] bit => field name
-     */
-    private function searchableFields(array $fields): array
-    {
-        $searchable = [];
-
-        foreach ($fields as $field => $type) {
-            if ($type === 'text' || $type === 'keyword') {
-                $searchable[] = $field;
-            }
-        }
-
-        sort($searchable, SORT_STRING);
-
-        return $searchable;
-    }
 
     /**
-     * @param array<string, string> $fields
+     * @param Schema $schema decides which fields earn a column
      * @throws StorageException
      */
-    private function writeColumns(SegmentWriter $segment, array $fields, int $documentCount): void
+    private function writeColumns(SegmentWriter $segment, Schema $schema, int $documentCount): void
     {
-        foreach ($fields as $field => $type) {
-            if ($type === 'number') {
+        foreach ($schema->fields() as $field => $definition) {
+            if (!$definition['filterable']) {
+                continue;
+            }
+
+            $type = $definition['type'];
+
+            if ($type === 'number' || $type === 'boolean') {
                 $column = new NumericColumnWriter();
 
                 foreach ($this->documents as $ordinal => $document) {

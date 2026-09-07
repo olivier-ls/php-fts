@@ -11,6 +11,7 @@ use Ols\PhpFts\Hit;
 use Ols\PhpFts\Query\CollectionStatistics;
 use Ols\PhpFts\Query\Scorer;
 use Ols\PhpFts\Query\TopK;
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
 use Ols\PhpFts\Storage\SegmentReader;
 use Ols\PhpFts\Storage\Varint;
@@ -56,13 +57,14 @@ use Ols\PhpFts\Storage\Varint;
  * the term, so `boosts: ['title' => 3.0]` weights a title match above a
  * description one — and each field is normalised against its own average
  * length, because a title of five terms is not short the way a description of
- * five terms would be.
+ * five terms would be. How hard that normalisation bites can be set per field
+ * in the schema, which is what BM25F allows and what a title needs: its length
+ * says much less about relevance than a description's does.
  *
  * ── What is deliberately provisional ────────────────────────────────────────
  *
  * The filter format is a flat list of ANDed clauses, standing in for the
- * nested, fluent builder the public API will offer. There is one `b` for every
- * field rather than one per field, which BM25F allows.
+ * nested, fluent builder the public API will offer.
  */
 final class SegmentIndex
 {
@@ -85,8 +87,7 @@ final class SegmentIndex
 
     private int $documentCount;
 
-    /** @var array<string, string> field => 'number' | 'keyword' | 'text' */
-    private array $fields;
+    private Schema $schema;
 
     private ?BlockDictionaryReader $terms = null;
     private ?BlockDictionaryReader $keys = null;
@@ -125,13 +126,13 @@ final class SegmentIndex
 
         $meta = json_decode($segment->read('meta'), true);
 
-        if (!is_array($meta) || !isset($meta['documentCount'], $meta['fields'])) {
+        if (!is_array($meta) || !isset($meta['documentCount'], $meta['schema'])) {
             throw new CorruptSegmentException('Segment metadata is missing or unreadable');
         }
 
         $this->documentCount    = (int) $meta['documentCount'];
         $this->termLengthSum    = (int) ($meta['termLengthSum'] ?? 0);
-        $this->fields           = $meta['fields'];
+        $this->schema           = Schema::fromArray($meta['schema']);
         $this->searchableFields = array_values($meta['searchableFields'] ?? []);
         $this->fieldLengthSums  = $meta['fieldLengthSums'] ?? [];
         $this->maskWidth        = max(1, (int) ($meta['maskWidth'] ?? 1));
@@ -152,12 +153,25 @@ final class SegmentIndex
         return $this->documentCount;
     }
 
+    public function schema(): Schema
+    {
+        return $this->schema;
+    }
+
     /**
+     * Field names to their types, for reporting.
+     *
      * @return array<string, string>
      */
     public function fields(): array
     {
-        return $this->fields;
+        $types = [];
+
+        foreach ($this->schema->fields() as $field => $definition) {
+            $types[$field] = $definition['type'];
+        }
+
+        return $types;
     }
 
     /**
@@ -396,6 +410,7 @@ final class SegmentIndex
 
         $weightByBit = $this->boostsByBit($boosts);
         $averages    = $this->fieldAverages($statistics);
+        $bByBit      = $this->bByBit();
 
         foreach ($terms as $term) {
             $entry = $this->entryFor($term);
@@ -433,6 +448,7 @@ final class SegmentIndex
                         $weightByBit,
                         $this->fieldLengthsOf($ordinal),
                         $averages,
+                        $bByBit,
                     );
 
                     $weights[$ordinal] = ($weights[$ordinal] ?? 0.0)
@@ -502,10 +518,40 @@ final class SegmentIndex
      */
     private function boostsByBit(array $boosts): array
     {
+        // The schema's boosts are defaults; a query overrides them per field.
+        // So declaring `->text('title', boost: 3.0)` once saves repeating
+        // `['title' => 3.0]` at every call site, and a query that wants
+        // something else for one search still gets it.
+        $boosts = $boosts + $this->schema->boosts();
+
         $byBit = [];
 
         foreach ($this->searchableFields as $bit => $field) {
             $byBit[$bit] = (float) ($boosts[$field] ?? 1.0);
+        }
+
+        return $byBit;
+    }
+
+    /**
+     * Per-field length normalisation, by mask bit.
+     *
+     * Only fields the schema gave an explicit `b` appear; the rest fall back to
+     * the scorer's default inside fieldedFrequency().
+     *
+     * @return array<int, float>
+     */
+    private function bByBit(): array
+    {
+        $definitions = $this->schema->fields();
+        $byBit       = [];
+
+        foreach ($this->searchableFields as $bit => $field) {
+            $b = $definitions[$field]['b'] ?? null;
+
+            if ($b !== null) {
+                $byBit[$bit] = $b;
+            }
         }
 
         return $byBit;
@@ -811,12 +857,20 @@ final class SegmentIndex
             return $this->columns[$field];
         }
 
-        $type = $this->fields[$field] ?? null;
+        $definition = $this->schema->fields()[$field] ?? null;
 
-        return $this->columns[$field] = match ($type) {
-            'number'  => NumericColumn::open($this->segment, 'dv.' . $field),
-            'keyword' => KeywordColumn::open($this->segment, 'dv.' . $field),
-            default   => null,
+        // A field the schema declares but did not make filterable has no
+        // column, and neither does one the schema never mentioned. Both answer
+        // null, and the caller turns that into an explicit error rather than a
+        // silent mismatch.
+        if ($definition === null || !$definition['filterable']) {
+            return $this->columns[$field] = null;
+        }
+
+        return $this->columns[$field] = match ($definition['type']) {
+            'number', 'boolean' => NumericColumn::open($this->segment, 'dv.' . $field),
+            'keyword'           => KeywordColumn::open($this->segment, 'dv.' . $field),
+            default             => null,
         };
     }
 }

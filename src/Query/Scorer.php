@@ -136,13 +136,22 @@ final class Scorer
      * Term frequency is 0 or 1 per field, because the analyzer deduplicates, so
      * the mask bit is the frequency.
      *
-     * @param int          $mask     which fields hold the term, one bit each
-     * @param float[]      $boosts   bit => weight
-     * @param int[]        $lengths  bit => terms this document has in that field
-     * @param float[]      $averages bit => mean across the index
+     * @param int     $mask     which fields hold the term, one bit each
+     * @param float[] $boosts   bit => weight
+     * @param int[]   $lengths  bit => terms this document has in that field
+     * @param float[] $averages bit => mean across the index
+     * @param float[] $bByField bit => how much that field's length matters.
+     *        A field whose values are all about the same length — a brand, a
+     *        SKU — gains nothing from normalisation and can set 0, which stops
+     *        it penalising the handful of brands that happen to be two words.
      */
-    public function fieldedFrequency(int $mask, array $boosts, array $lengths, array $averages): float
-    {
+    public function fieldedFrequency(
+        int $mask,
+        array $boosts,
+        array $lengths,
+        array $averages,
+        array $bByField = [],
+    ): float {
         $combined = 0.0;
 
         foreach ($boosts as $bit => $boost) {
@@ -151,9 +160,10 @@ final class Scorer
             }
 
             $average = $averages[$bit] ?? 0.0;
+            $b       = $bByField[$bit] ?? $this->b;
 
             $normalisation = $average > 0.0
-                ? 1.0 - $this->b + $this->b * (($lengths[$bit] ?? 0) / $average)
+                ? 1.0 - $b + $b * (($lengths[$bit] ?? 0) / $average)
                 : 1.0;
 
             $combined += $boost / $normalisation;

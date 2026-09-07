@@ -71,14 +71,14 @@ final class Manifest
      * @param array<int, array{name: string, documents: int, deleted: string}> $segments
      *        deleted holds the raw deletion bitmap, already decoded
      * @param array<int, array{name: string, at: int}> $retired segments a merge replaced
-     * @param array<string, string> $fields field => type, frozen at the first commit
+     * @param array<string, mixed> $schema the serialised Schema, frozen at the first commit
      */
     private function __construct(
         public readonly int $generation,
         public readonly array $segments,
         public readonly array $retired = [],
         public readonly int $createdAt = 0,
-        public readonly array $fields = [],
+        public readonly array $schema = [],
     ) {
     }
 
@@ -90,16 +90,16 @@ final class Manifest
     /**
      * @param array<int, array{name: string, documents: int, deleted: string}> $segments
      * @param array<int, array{name: string, at: int}>                         $retired
-     * @param array<string, string>|null                                        $fields null keeps the frozen schema
+     * @param array<string, mixed>|null                                         $schema null keeps the frozen schema
      */
-    public function next(array $segments, array $retired = [], ?array $fields = null): self
+    public function next(array $segments, array $retired = [], ?array $schema = null): self
     {
         return new self(
             $this->generation + 1,
             array_values($segments),
             array_values($retired),
             time(),
-            $fields ?? $this->fields,
+            $schema ?? $this->schema,
         );
     }
 
@@ -205,13 +205,9 @@ final class Manifest
             }
         }
 
-        $fields = [];
+        $schema = is_array($data['schema'] ?? null) ? $data['schema'] : [];
 
-        foreach ($data['fields'] ?? [] as $field => $type) {
-            $fields[(string) $field] = (string) $type;
-        }
-
-        return new self($generation, $segments, $retired, (int) ($data['createdAt'] ?? 0), $fields);
+        return new self($generation, $segments, $retired, (int) ($data['createdAt'] ?? 0), $schema);
     }
 
     /**
@@ -283,7 +279,7 @@ final class Manifest
             'createdAt'  => $this->createdAt,
             'segments'   => $segments,
             'retired'    => $this->retired,
-            'fields'     => $this->fields,
+            'schema'     => $this->schema,
         ];
     }
 }

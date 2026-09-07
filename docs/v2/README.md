@@ -180,6 +180,26 @@ $engine = SearchEngine::open('./search_data', Schema::make()
 );
 ```
 
+A field the schema does not mention is still stored and still comes back in
+`$hit->document` — it is simply neither searched nor filtered. A catalogue
+export gains columns all the time, and that should not stop a product being
+indexed.
+
+Each capability can be overridden where the type's default is not what you
+want:
+
+```php
+->keyword('status', indexed: false)   // filter on it; nobody types it
+->text('body', stored: false)         // searchable, not returned
+->text('title', b: 0.4)               // its length matters less than a description's
+```
+
+A schema is frozen the first time the index commits, and every later batch and
+every merge uses that one — otherwise inference would read a different batch
+and a filter that worked yesterday would fail today. Reopening with a
+different schema is refused rather than silently ignored; to change one,
+reindex into a new directory.
+
 ### Keeping the index small
 
 Your data already lives somewhere — a database, a CMS, files on disk. php-fts

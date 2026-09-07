@@ -706,7 +706,7 @@ class IndexDirectoryTest extends TestCase
     {
         // Written one at a time, an index does not end up with one segment per
         // document: the tiers collapse as the loop runs.
-        $index = IndexDirectory::open($this->dir, new MergePolicy(segmentsPerTier: 4, tierFactor: 4));
+        $index = IndexDirectory::open($this->dir, policy: new MergePolicy(segmentsPerTier: 4, tierFactor: 4));
 
         foreach ($this->products(40) as $id => $product) {
             $index->put($id, $product);

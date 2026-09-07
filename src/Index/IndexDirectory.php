@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Exception\CorruptSegmentException;
+use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\LockManager;
 use Ols\PhpFts\Query\CollectionStatistics;
 use Ols\PhpFts\Query\TopK;
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
 use Ols\PhpFts\Storage\Manifest;
 
@@ -84,16 +86,26 @@ final class IndexDirectory
         private readonly LockManager $lock,
         private readonly MergePolicy $policy,
         private readonly SegmentMerger $merger,
+        private readonly ?Schema $declared = null,
     ) {
     }
 
     /**
      * Opens the newest readable commit.
      *
+     * A schema may be declared here. It is used the first time the index
+     * commits and frozen into the manifest from then on. Passing none leaves
+     * the types inferred from the documents, which is what a caller who just
+     * wants to search gets.
+     *
      * @throws StorageException
+     * @throws FtsException when the declared schema is not the frozen one
      */
-    public static function open(string $directory, ?MergePolicy $policy = null): self
-    {
+    public static function open(
+        string $directory,
+        ?Schema $schema = null,
+        ?MergePolicy $policy = null,
+    ): self {
         if (!is_dir($directory) && !@mkdir($directory, 0755, true) && !is_dir($directory)) {
             throw new StorageException("Unable to create index directory: $directory");
         }
@@ -103,16 +115,84 @@ final class IndexDirectory
             new LockManager($directory),
             $policy ?? new MergePolicy(),
             new SegmentMerger(),
+            $schema,
         );
 
         $index->load();
+        $index->assertSchemaMatches();
 
         return $index;
+    }
+
+    /**
+     * Refuses a schema that contradicts the one the index already holds.
+     *
+     * An index's schema is frozen at its first commit, so a later call passing
+     * something different cannot be honoured — the segments already on disk
+     * were written to the old one. Reopening with the same schema is fine and
+     * expected, since the declaration usually sits next to the open() call.
+     *
+     * Loud rather than silent: quietly ignoring the new declaration is how
+     * someone spends an afternoon wondering why their boost does nothing.
+     *
+     * @throws FtsException
+     */
+    private function assertSchemaMatches(): void
+    {
+        if ($this->declared === null || $this->manifest->schema === []) {
+            return;
+        }
+
+        // Compared through fromArray() on both sides, not against the raw
+        // manifest: JSON does not keep a float's zero fraction, so a boost of
+        // 1.0 comes back as the integer 1 and a strict comparison against the
+        // declared array would fail on every reopen.
+        if ($this->declared->toArray() !== $this->schema()->toArray()) {
+            throw new FtsException(
+                "The index in {$this->directory} was created with a different schema. "
+                . 'A schema is frozen at the first commit; reindex into a new directory to change it.'
+            );
+        }
     }
 
     public function directory(): string
     {
         return $this->directory;
+    }
+
+    /**
+     * The schema this index is using, declared or inferred.
+     */
+    public function schema(): Schema
+    {
+        return Schema::fromArray($this->manifest->schema);
+    }
+
+    /**
+     * @return array<string, string> field => type
+     */
+    private function fieldTypes(): array
+    {
+        $types = [];
+
+        foreach ($this->schema()->fields() as $field => $definition) {
+            $types[$field] = $definition['type'];
+        }
+
+        return $types;
+    }
+
+    /**
+     * The schema to hand a writer: the frozen one, else what the caller
+     * declared at open(), else null so the writer infers.
+     *
+     * Frozen at the first commit and carried forward, because inference depends
+     * on the batch: left to re-infer, a merge could change a field's type and a
+     * filter that worked before it would fail after.
+     */
+    private function frozenSchema(): ?Schema
+    {
+        return $this->manifest->schema === [] ? $this->declared : $this->schema();
     }
 
     public function generation(): int
@@ -153,7 +233,8 @@ final class IndexDirectory
             'segments'   => count($this->manifest->segments),
             'generation' => $this->manifest->generation,
             'bytes'      => $bytes,
-            'fields'     => $this->manifest->fields,
+            'fields'     => $this->fieldTypes(),
+            'schema'     => $this->manifest->schema,
 
             // A read may say a merge would help; it may not perform one, since
             // that needs the write lock and would let a search wait behind an
@@ -198,10 +279,7 @@ final class IndexDirectory
             // The frozen schema goes to every new segment, not only to merges:
             // otherwise a later batch could infer a different type for a field
             // and a filter would work on some segments and fail on others.
-            $writer = new SegmentIndexWriter(
-                null,
-                $this->manifest->fields === [] ? null : $this->manifest->fields,
-            );
+            $writer = new SegmentIndexWriter(null, $this->frozenSchema());
 
             $replacing = [];
 
@@ -244,8 +322,8 @@ final class IndexDirectory
 
             // The schema is frozen at the first commit and carried forward, so
             // that a later merge cannot re-infer a field into a different type.
-            $this->commit($segments, fields: $this->manifest->fields === []
-                ? $writer->fields()
+            $this->commit($segments, schema: $this->manifest->schema === []
+                ? $writer->schema()->toArray()
                 : null);
 
             // Commit first, maintain second. The write is durable before any
@@ -516,17 +594,17 @@ final class IndexDirectory
     /**
      * @param array<int, array{name: string, documents: int, deleted: string}> $segments
      * @param array<int, array{name: string, at: int}>|null                    $retired
-     * @param array<string, string>|null                                       $fields
+     * @param array<string, mixed>|null                                        $schema
      * @throws StorageException
      */
-    private function commit(array $segments, ?array $retired = null, ?array $fields = null): void
+    private function commit(array $segments, ?array $retired = null, ?array $schema = null): void
     {
         // Garbage collection rides along on the commit rather than needing one
         // of its own: expired retirements are dropped from the list being
         // written, and their files removed.
         $retired = $this->pruneRetired($retired ?? $this->manifest->retired);
 
-        $this->manifest->next($segments, $retired, $fields)->write($this->directory);
+        $this->manifest->next($segments, $retired, $schema)->write($this->directory);
 
         $this->load();
         $this->forgetOldCommits();
@@ -582,7 +660,7 @@ final class IndexDirectory
             $sources,
             $this->deletions,
             $this->segmentPath($name),
-            $this->manifest->fields === [] ? null : $this->manifest->fields,
+            $this->frozenSchema(),
         );
 
         $segments = [];
