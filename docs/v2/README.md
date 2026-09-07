@@ -420,19 +420,35 @@ Counted over **all** matches, not just the current page.
 $result = $engine->search('shoe', facets: [
     'brand'    => Facet::terms(size: 20),
     'category' => Facet::terms(),
-    'price'    => Facet::ranges([0, 50, 100, 200, null]),
-    'stats'    => Facet::stats('price'),
+    'pricing'  => Facet::stats('price'),
 ]);
 
-$result->facets['brand'];   // ['Nike' => 42, 'Adidas' => 31, ...]
-$result->facets['stats'];   // ['min' => 12.5, 'max' => 890.0, 'avg' => 96.4]
+$result->facets['brand'];     // ['Nike' => 42, 'Adidas' => 31, ...]
+$result->facets['pricing'];   // ['count' => 73, 'min' => 12.5, 'max' => 890.0, ...]
 ```
+
+The array key names the result and `field` says what to read, so the same
+column can be counted twice under two names and a facet's name in your
+template need not be a column name. A bare field name works too and picks the
+kind for you — term counts for an exact value, statistics for a number:
+
+```php
+facets: ['brand', 'price']
+```
+
+Values are ordered most frequent first, with ties broken by value so that a
+facet's order is the same across two identical requests and does not reshuffle
+when segments merge. A `size` is applied once, at the end: the top twenty of
+the index are not the top twenty of each segment added together.
 
 ### Disjunctive facets, in one query
 
-The classic e-commerce problem: once a user picks a brand, the brand facet
-should still show the *other* brands. Tag a filter, then exclude that tag from
-its own facet:
+The classic e-commerce problem. A shopper picks Nike, so the results are Nike
+products, so the brand facet is counted over Nike products and shows `Nike (42)`
+alone — and the shopper can no longer see that there are 31 Adidas to switch
+to. The facet that made the choice possible has destroyed itself.
+
+Tag the clause, then exclude that tag from its own facet:
 
 ```php
 $result = $engine->search('shoe',
@@ -448,7 +464,19 @@ $result = $engine->search('shoe',
 );
 ```
 
-One query, correct counts on every facet.
+The brand facet then counts active Sneakers of every brand; the category facet
+counts active Nike products of every category. Both halves matter: the facet
+sees past its *own* clause, and every other clause still narrows it.
+
+Only the counting is widened — the results themselves are untouched, so a
+shopper who picked Nike is still shown Nike products. A statistics facet can
+exclude its own tag too, which is how a price slider shows the real bounds of
+the catalogue rather than collapsing onto the range already chosen.
+
+One query, correct counts on every facet. Each distinct excluded tag costs one
+more pass of the filter over the query's candidates: no posting list is walked
+twice and no document is read, so two facets excluding the same tag cost one
+pass, not two.
 
 ---
 

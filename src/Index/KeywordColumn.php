@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Exception\CorruptSegmentException;
+use Ols\PhpFts\Facet;
 use Ols\PhpFts\Storage\SegmentReader;
 use Ols\PhpFts\Storage\Varint;
 
@@ -231,7 +232,11 @@ final class KeywordColumn
             $result[$names[$ordinal] ?? "?$ordinal"] = $count;
         }
 
-        return $result;
+        // Ranked by name once the ordinals have become values, so that ties
+        // break the same way here as they do when several segments are added
+        // together. Sorting by ordinal would break them by dictionary position
+        // instead, which is a different order and would flip on a merge.
+        return Facet::rank($result);
     }
 
     // -------------------------------------------------------------------------

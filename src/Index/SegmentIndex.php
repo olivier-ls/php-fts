@@ -8,6 +8,7 @@ use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
+use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\Query\CollectionStatistics;
@@ -202,7 +203,7 @@ final class SegmentIndex
     /**
      * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
      *        flat list of clauses, which are ANDed
-     * @param string[]            $facets  field names
+     * @param array<mixed>        $facets  field names, or name => Facet
      *
      * @throws CorruptSegmentException
      * @throws FilterException
@@ -217,14 +218,23 @@ final class SegmentIndex
     ): SearchResult {
         $started = hrtime(true);
 
-        [$matches, $scores] = $this->select($query, $filters, boosts: $boosts);
+        $filter                = Filter::normalise($filters) ?? Filter::all();
+        [$candidates, $scores] = $this->candidates($query, boosts: $boosts);
 
-        $total = $matches->count();
+        $matches = $this->narrow($candidates, $filter);
+        $total   = $matches->count();
 
         $counted = [];
 
-        foreach ($facets as $field) {
-            $counted[$field] = $this->facetOn($field, $matches);
+        foreach (Facet::normalise($facets) as $name => $facet) {
+            // Counted over the candidates narrowed by every clause *except*
+            // the one this facet excludes, so a facet the shopper has already
+            // used still shows them what else they could pick.
+            $narrowed = $facet->exclude === null
+                ? $matches
+                : $this->narrow($candidates, $filter->withoutTag($facet->exclude) ?? Filter::all());
+
+            $counted[$name] = $facet->limit($this->facet($facet, $name, $narrowed));
         }
 
         $hits = [];
@@ -269,23 +279,96 @@ final class SegmentIndex
         ?CollectionStatistics $statistics = null,
         array $boosts = [],
     ): array {
+        [$candidates, $scores] = $this->candidates($query, $deleted, $statistics, $boosts);
+        $filter                = Filter::normalise($filters);
+
+        return [$filter === null ? $candidates : $this->narrow($candidates, $filter), $scores];
+    }
+
+    /**
+     * What the query alone matches, less what has been deleted.
+     *
+     * Split out from `select()` because a search with disjunctive facets needs
+     * several *differently filtered* views of the same query — one per facet
+     * that excludes its own clause. Matching the query is the expensive half:
+     * it walks posting lists. Filtering is set arithmetic over bits. So the
+     * query is matched once and the filters applied to the result as many times
+     * as the facets require.
+     *
+     * @param CollectionStatistics|null $statistics index-wide numbers for BM25.
+     *        Null makes the segment score against itself, which is right when it
+     *        is the whole index and wrong as soon as it is not — see the class.
+     *
+     * @return array{0: Bitset, 1: array<int, float>} the candidates, and their scores
+     * @internal
+     * @throws CorruptSegmentException
+     */
+    public function candidates(
+        string $query,
+        ?Bitset $deleted = null,
+        ?CollectionStatistics $statistics = null,
+        array $boosts = [],
+    ): array {
         [$matches, $scores] = $this->matchQuery(
             $query,
             $statistics ?? new CollectionStatistics($this->documentCount, $this->averageLength()),
             $boosts,
         );
 
-        $filter = Filter::normalise($filters);
+        return [$deleted === null ? $matches : $matches->andNot($deleted), $scores];
+    }
 
-        if ($filter !== null) {
-            $matches = $matches->and($this->compile($filter));
+    /**
+     * The candidates a filter keeps.
+     *
+     * @internal
+     * @throws CorruptSegmentException
+     * @throws FilterException
+     */
+    public function narrow(Bitset $candidates, Filter $filter): Bitset
+    {
+        return $candidates->and($this->compile($filter));
+    }
+
+    /**
+     * One facet, counted over a set of matches.
+     *
+     * Term counts are gathered without a size limit whatever the facet asks
+     * for, because the top twenty of the index are not the top twenty of each
+     * segment added together. Truncation happens once, after every segment has
+     * contributed.
+     *
+     * @return array<string|int, mixed>
+     * @internal
+     * @throws CorruptSegmentException
+     * @throws FilterException
+     */
+    public function facet(Facet $facet, string $name, Bitset $matches): array
+    {
+        $field  = $facet->fieldFor($name);
+        $column = $this->column($field);
+
+        if ($column === null) {
+            throw new FilterException("No facetable column for field '$field'" . $this->becauseInferred($field));
         }
 
-        if ($deleted !== null) {
-            $matches = $matches->andNot($deleted);
+        if ($facet->kind === 'terms' && !$column instanceof KeywordColumn) {
+            throw new FilterException(
+                "Facet '$name' asks for term counts, but '$field' is a numeric column."
+                . ' Use Facet::stats() for a number, or Facet::ranges() once it exists'
+            );
         }
 
-        return [$matches, $scores];
+        if ($facet->kind === 'stats' && !$column instanceof NumericColumn) {
+            throw new FilterException(
+                "Facet '$name' asks for statistics, but '$field' is not a numeric column."
+                . ' Use Facet::terms() for an exact value'
+            );
+        }
+
+        return $column instanceof KeywordColumn
+            ? $column->facet($matches, size: 0)
+            : $column->stats($matches);
     }
 
     /**

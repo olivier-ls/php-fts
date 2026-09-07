@@ -178,7 +178,9 @@ class KeywordColumnTest extends TestCase
         $column  = $this->column(['Adidas', 'Puma', 'Adidas', 'Nike', 'Adidas']);
         $matches = Bitset::of([0, 1, 3], 5);
 
-        $this->assertSame(['Adidas' => 1, 'Puma' => 1, 'Nike' => 1], $column->facet($matches));
+        // All three tie, so they come out by value — the tie-break that keeps
+        // a facet's order the same across a merge.
+        $this->assertSame(['Adidas' => 1, 'Nike' => 1, 'Puma' => 1], $column->facet($matches));
     }
 
     #[Test]

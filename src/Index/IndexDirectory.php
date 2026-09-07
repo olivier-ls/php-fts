@@ -8,6 +8,7 @@ use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\LockManager;
@@ -423,7 +424,7 @@ final class IndexDirectory
     /**
      * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
      *        flat list of clauses, which are ANDed
-     * @param string[]            $facets
+     * @param array<mixed>        $facets  field names, or name => Facet
      *
      * @throws CorruptSegmentException
      * @throws FilterException
@@ -449,6 +450,19 @@ final class IndexDirectory
         // a merge then changing the ranking.
         $statistics = $this->statisticsFor($query);
 
+        $wanted = Facet::normalise($facets);
+
+        // The filter as each excluded tag sees it, worked out once for the
+        // whole search. Two facets excluding the same tag are one extra pass,
+        // not two, and a tag nothing excludes costs nothing at all.
+        $variants = [];
+
+        foreach ($wanted as $facet) {
+            if ($facet->exclude !== null && !array_key_exists($facet->exclude, $variants)) {
+                $variants[$facet->exclude] = $filters->withoutTag($facet->exclude) ?? Filter::all();
+            }
+        }
+
         $total  = 0;
         $merged = [];
 
@@ -458,26 +472,46 @@ final class IndexDirectory
         $top = new TopK(max(0, $offset) + max(0, $limit));
 
         foreach ($this->segments as $position => $segment) {
-            [$matches, $scores] = $segment->select(
+            // The query is matched once per segment. Every filter variant is
+            // then bit arithmetic over the same candidates — no posting list is
+            // walked twice, which is what keeps disjunctive facets affordable.
+            [$candidates, $scores] = $segment->candidates(
                 $query,
-                $filters,
                 $this->deletions[$position],
                 $statistics,
                 $boosts,
             );
 
-            $total += $matches->count();
+            $matches = $segment->narrow($candidates, $filters);
+            $total  += $matches->count();
 
-            foreach ($facets as $field) {
-                $merged[$field] = $this->mergeFacet(
-                    $merged[$field] ?? null,
-                    $segment->facetOn($field, $matches)
+            $narrowed = [];
+
+            foreach ($variants as $tag => $variant) {
+                $narrowed[$tag] = $segment->narrow($candidates, $variant);
+            }
+
+            foreach ($wanted as $name => $facet) {
+                // Not `$narrowed[$facet->exclude] ?? $matches`: a null offset
+                // is deprecated in 8.5, and a facet excluding nothing is the
+                // common case rather than the exception.
+                $over = $facet->exclude === null ? $matches : ($narrowed[$facet->exclude] ?? $matches);
+
+                $merged[$name] = $this->mergeFacet(
+                    $merged[$name] ?? null,
+                    $segment->facet($facet, $name, $over)
                 );
             }
 
             foreach ($matches->iterate() as $ordinal) {
                 $top->offer($scores[$ordinal] ?? 0.0, $position, $ordinal);
             }
+        }
+
+        // Truncated only now. The top twenty of the index are not the top
+        // twenty of each segment added together.
+        foreach ($wanted as $name => $facet) {
+            $merged[$name] = $facet->limit($merged[$name] ?? []);
         }
 
         $hits = [];
@@ -806,9 +840,7 @@ final class IndexDirectory
             $running[$value] = ($running[$value] ?? 0) + $occurrences;
         }
 
-        arsort($running);
-
-        return $running;
+        return Facet::rank($running);
     }
 
     private function smaller(?float $a, ?float $b): ?float

@@ -357,6 +357,14 @@ deletion; the failure is benign and retried on the next commit.
 
 Agreed and scheduled, but not now:
 
+- **Range facets** — `Facet::ranges([0, 50, 100, 200, null])`, counting a
+  numeric column into buckets. The pieces exist: `NumericColumn::range()` gives
+  the bitmap for one bucket and a population count gives its size. It is a
+  bucketing feature rather than part of disjunction, so it is left until the
+  API it belongs to is being used in anger and the bucket semantics — open
+  ends, empty buckets, whether bounds are inclusive at the top — can be settled
+  against something real.
+
 - **Multi-valued columns, and the filters that need them** — `contains`,
   `containsAny`, `containsAll` over a `tags` field. A tags field is analysed
   today, so it is searchable; filtering on one needs a column holding several
