@@ -8,6 +8,9 @@ use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Hit;
+use Ols\PhpFts\Query\CollectionStatistics;
+use Ols\PhpFts\Query\Scorer;
+use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\SearchResult;
 use Ols\PhpFts\Storage\SegmentReader;
 use Ols\PhpFts\Storage\Varint;
@@ -40,14 +43,21 @@ use Ols\PhpFts\Storage\Varint;
  *      from it. Neither reads a document.
  *   6. Only the page being returned is read from the document store.
  *
+ * ── Scoring, and why the statistics come from outside ──────────────────────
+ *
+ * Ranking is BM25 (see Scorer). IDF asks how rare a term is *in the index*, so
+ * a segment cannot answer it from its own dictionary: the same term would be
+ * rare in one segment and common in another, and the same document would score
+ * differently depending on where it happened to land. So `select()` takes a
+ * CollectionStatistics gathered across every segment, and only falls back to
+ * its own numbers when it really is the whole index.
+ *
  * ── What is deliberately provisional ────────────────────────────────────────
  *
- * Ranking here is the number of query terms a document contains. It is enough
- * to put the right documents at the top of a small result set and nowhere near
- * enough in general — BM25F, the field-mask stream it needs and a proper
- * top-K selection are the next piece of work. The same goes for the filter
- * format: a flat list of ANDed clauses, standing in for the nested, fluent
- * builder the public API will offer.
+ * Scoring has no notion of fields yet, so `boosts: ['title' => 3.0]` cannot
+ * work: that needs a field mask stored per posting, which is the next piece.
+ * The filter format is a flat list of ANDed clauses, standing in for the
+ * nested, fluent builder the public API will offer.
  */
 final class SegmentIndex
 {
@@ -78,6 +88,15 @@ final class SegmentIndex
 
     /** Reverse of the key dictionary, built on first use. @var string[]|null */
     private ?array $keysByOrdinal = null;
+
+    /** @var array<string, array{documents: int, offset: int, length: int}|null> */
+    private array $termCache = [];
+
+    private ?string $lengths = null;
+
+    private int $termLengthSum = 0;
+
+    private Scorer $scorer;
     private DocumentStore $documents;
 
     /** @var array<string, NumericColumn|KeywordColumn> */
@@ -95,8 +114,10 @@ final class SegmentIndex
         }
 
         $this->documentCount = (int) $meta['documentCount'];
+        $this->termLengthSum = (int) ($meta['termLengthSum'] ?? 0);
         $this->fields        = $meta['fields'];
         $this->documents     = DocumentStore::open($segment, 'docs');
+        $this->scorer        = new Scorer();
     }
 
     /**
@@ -190,14 +211,25 @@ final class SegmentIndex
      * @param array<int, array{field: string, op: string, value: mixed}> $filters
      * @param Bitset|null $deleted documents the manifest marks as deleted
      *
-     * @return array{0: Bitset, 1: array<int, int>} the matches, and term counts
+     * @param CollectionStatistics|null $statistics index-wide numbers for BM25.
+     *        Null makes the segment score against itself, which is right when it
+     *        is the whole index and wrong as soon as it is not — see the class.
+     *
+     * @return array{0: Bitset, 1: array<int, float>} the matches, and their scores
      * @internal
      * @throws CorruptSegmentException
      * @throws FilterException
      */
-    public function select(string $query, array $filters = [], ?Bitset $deleted = null): array
-    {
-        [$matches, $scores] = $this->matchQuery($query);
+    public function select(
+        string $query,
+        array $filters = [],
+        ?Bitset $deleted = null,
+        ?CollectionStatistics $statistics = null,
+    ): array {
+        [$matches, $scores] = $this->matchQuery(
+            $query,
+            $statistics ?? new CollectionStatistics($this->documentCount, $this->averageLength()),
+        );
 
         foreach ($filters as $filter) {
             $matches = $matches->and($this->evaluate($filter));
@@ -254,6 +286,54 @@ final class SegmentIndex
         return $this->ordinalOf($id);
     }
 
+    /**
+     * How many of this segment's documents hold each of these terms.
+     *
+     * Asked of every segment before any of them scores, so that IDF describes
+     * the index rather than one segment. The lookups are cached, so the pass the
+     * search was going to make anyway is not repeated.
+     *
+     * @param string[] $terms
+     * @return array<string, int>
+     * @internal
+     * @throws CorruptSegmentException
+     */
+    public function documentFrequencies(array $terms): array
+    {
+        $frequencies = [];
+
+        foreach ($terms as $term) {
+            $entry = $this->entryFor($term);
+
+            if ($entry !== null) {
+                $frequencies[$term] = $entry['documents'];
+            }
+        }
+
+        return $frequencies;
+    }
+
+    /**
+     * Summed document lengths, so an average can be taken across segments.
+     *
+     * @internal
+     */
+    public function termLengthSum(): int
+    {
+        return $this->termLengthSum;
+    }
+
+    /**
+     * The terms a query analyses to, using this segment's analyzer.
+     *
+     * @return string[]
+     * @internal
+     */
+    public function analyze(string $query): array
+    {
+        return $this->analyzer->analyze($query);
+    }
+
     // -------------------------------------------------------------------------
 
     /**
@@ -263,10 +343,10 @@ final class SegmentIndex
      * An empty query matches everything, which is what makes filters and facets
      * usable on their own — a category page with no search box.
      *
-     * @return array{0: Bitset, 1: array<int, int>}
+     * @return array{0: Bitset, 1: array<int, float>} the matches, and their BM25 scores
      * @throws CorruptSegmentException
      */
-    private function matchQuery(string $query): array
+    private function matchQuery(string $query, CollectionStatistics $statistics): array
     {
         $terms = $this->analyzer->analyze($query);
 
@@ -274,39 +354,41 @@ final class SegmentIndex
             return [Bitset::full($this->documentCount), []];
         }
 
-        /** @var Bitset[] $sets one per term actually present in the index */
-        $sets   = [];
-        $scores = [];
+        /** @var array<int, int> ordinal => how many query terms it holds */
+        $held = [];
+
+        /** @var array<int, float> ordinal => summed IDF of those terms */
+        $weights = [];
 
         foreach ($terms as $term) {
-            $payload = $this->terms()->get($term);
+            $entry = $this->entryFor($term);
 
-            if ($payload === null) {
+            if ($entry === null) {
                 continue;
             }
 
-            $position = 0;
-            Varint::decode($payload, $position);                  // document frequency, unused for now
-            $listOffset = Varint::decode($payload, $position);
-            $listLength = Varint::decode($payload, $position);
-
-            $cursor = PostingsCursor::open(
-                $this->segment->read('postings', $listOffset, $listLength)
+            // Computed once per term, before any document is looked at. 1.x
+            // called log() and a dictionary lookup inside the per-document loop.
+            $idf = $this->scorer->idf(
+                $statistics->documentFrequency($term) ?: $entry['documents'],
+                $statistics->documentCount ?: $this->documentCount,
             );
 
-            $set = Bitset::empty($this->documentCount);
+            $cursor = PostingsCursor::open(
+                $this->segment->read('postings', $entry['offset'], $entry['length'])
+            );
 
             while ($cursor->current() !== PostingsFormat::END) {
                 $ordinal = $cursor->current();
-                $set->set($ordinal);
-                $scores[$ordinal] = ($scores[$ordinal] ?? 0) + 1;
+
+                $held[$ordinal]    = ($held[$ordinal] ?? 0) + 1;
+                $weights[$ordinal] = ($weights[$ordinal] ?? 0.0) + $idf;
+
                 $cursor->next();
             }
-
-            $sets[] = $set;
         }
 
-        if ($sets === []) {
+        if ($held === []) {
             return [Bitset::empty($this->documentCount), []];
         }
 
@@ -326,15 +408,79 @@ final class SegmentIndex
         // trigrams and stays above the bar, while an unrelated word does not.
         $required = max(1, (int) ceil(count($terms) * self::MIN_SHOULD_MATCH));
 
-        $matches = Bitset::empty($this->documentCount);
+        $matches       = Bitset::empty($this->documentCount);
+        $scores        = [];
+        $averageLength = $statistics->averageLength > 0.0
+            ? $statistics->averageLength
+            : $this->averageLength();
 
-        foreach ($scores as $ordinal => $held) {
-            if ($held >= $required) {
-                $matches->set($ordinal);
+        foreach ($held as $ordinal => $count) {
+            if ($count < $required) {
+                continue;
             }
+
+            $matches->set($ordinal);
+            $scores[$ordinal] = $this->scorer->score(
+                $weights[$ordinal],
+                $this->lengthOf($ordinal),
+                $averageLength,
+            );
         }
 
         return [$matches, $scores];
+    }
+
+    /**
+     * A term's document frequency and where its posting list is, cached.
+     *
+     * Cached because a search asks twice: once to gather document frequencies
+     * across every segment, so that IDF describes the index rather than one
+     * segment, and once to walk the postings. Without the cache that would be
+     * two dictionary lookups per term per segment.
+     *
+     * @return array{documents: int, offset: int, length: int}|null
+     * @throws CorruptSegmentException
+     */
+    private function entryFor(string $term): ?array
+    {
+        if (array_key_exists($term, $this->termCache)) {
+            return $this->termCache[$term];
+        }
+
+        $payload = $this->terms()->get($term);
+
+        if ($payload === null) {
+            return $this->termCache[$term] = null;
+        }
+
+        $position = 0;
+
+        return $this->termCache[$term] = [
+            'documents' => Varint::decode($payload, $position),
+            'offset'    => Varint::decode($payload, $position),
+            'length'    => Varint::decode($payload, $position),
+        ];
+    }
+
+    /**
+     * How many terms one document produced.
+     *
+     * @throws CorruptSegmentException
+     */
+    private function lengthOf(int $ordinal): int
+    {
+        $this->lengths ??= $this->segment->has('lengths')
+            ? $this->segment->read('lengths')
+            : '';
+
+        $packed = substr($this->lengths, $ordinal * 2, 2);
+
+        return strlen($packed) === 2 ? unpack('v', $packed)[1] : 0;
+    }
+
+    private function averageLength(): float
+    {
+        return $this->documentCount > 0 ? $this->termLengthSum / $this->documentCount : 0.0;
     }
 
     /**
@@ -400,20 +546,29 @@ final class SegmentIndex
     /**
      * The requested page, best first.
      *
-     * @param array<int, int> $scores
+     * Selection is bounded: a query matching eight thousand documents used to
+     * build eight thousand scores and sort them to return twenty. TopK keeps
+     * only offset+limit candidates, so the memory is fixed whatever the query
+     * matches.
+     *
+     * @param array<int, float> $scores
      * @return array<int, float> ordinal => score
      */
     private function page(Bitset $matches, array $scores, int $limit, int $offset): array
     {
-        $ranked = [];
+        $top = new TopK(max(0, $offset) + max(0, $limit));
 
         foreach ($matches->iterate() as $ordinal) {
-            $ranked[$ordinal] = (float) ($scores[$ordinal] ?? 0);
+            $top->offer($scores[$ordinal] ?? 0.0, 0, $ordinal);
         }
 
-        arsort($ranked);
+        $page = [];
 
-        return array_slice($ranked, max(0, $offset), max(0, $limit), true);
+        foreach (array_slice($top->drain(), max(0, $offset)) as [$score, , $ordinal]) {
+            $page[$ordinal] = $score;
+        }
+
+        return $page;
     }
 
     private function terms(): BlockDictionaryReader

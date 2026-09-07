@@ -8,6 +8,8 @@ use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\LockManager;
+use Ols\PhpFts\Query\CollectionStatistics;
+use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\SearchResult;
 use Ols\PhpFts\Storage\Manifest;
 
@@ -37,20 +39,32 @@ use Ols\PhpFts\Storage\Manifest;
  *
  * ── Why searching several segments is not just searching one, N times ───────
  *
- * The total is a sum, and facet counts add up per value, but ranking cannot be
- * concatenated: the best twenty documents overall are somewhere inside the best
- * twenty of each segment. So every segment is asked for its own best
- * `offset + limit`, and those are merged and cut. Asking each for everything
- * would be correct too, and would materialise the whole result set to return a
- * page of twenty.
+ * Three things have to be done across the whole index rather than per segment,
+ * and each of them was a bug before it was fixed:
  *
- * ── Not here yet ────────────────────────────────────────────────────────────
+ *   - **Statistics.** IDF asks how rare a term is in the index. Answered per
+ *     segment, the same document scores differently depending on where it
+ *     landed, and merging changes the ranking. So document frequencies are
+ *     summed over every segment before any of them scores.
  *
- * Nothing merges segments, so an index written one document at a time
- * accumulates one segment per document and searches slow down in proportion.
- * The merge policy — tiered, automatic, bounded by a time budget, commit-first
- * so a write is never at risk from it — is the next piece. Until then,
- * `putMany()` on a whole batch is the way to keep an index to one segment.
+ *   - **Ranking.** The best twenty overall are spread across segments, so one
+ *     bounded heap collects candidates from all of them. Building a ranked list
+ *     per segment and concatenating would materialise far more than it returns.
+ *
+ *   - **Facets.** Term counts add up per value, but statistics have to be
+ *     recombined: the minimum of the whole is the smallest of the minima, and
+ *     the mean has to be worked out again from the totals.
+ *
+ * Totals, by contrast, really are just a sum.
+ *
+ * ── Maintenance ─────────────────────────────────────────────────────────────
+ *
+ * Every mutation publishes its commit and then checks whether segments should
+ * be merged, within a time budget. Merging needs the write lock, so it can only
+ * happen on a write — a search that could trigger one could wait behind an
+ * import. Reads report the need instead, through `stats()['needsOptimize']`, so
+ * an application can schedule `optimize()` rather than have the engine decide
+ * while a visitor waits.
  */
 final class IndexDirectory
 {
@@ -181,7 +195,14 @@ final class IndexDirectory
             // this object was opened, and its work must not be dropped.
             $this->load();
 
-            $writer   = new SegmentIndexWriter();
+            // The frozen schema goes to every new segment, not only to merges:
+            // otherwise a later batch could infer a different type for a field
+            // and a filter would work on some segments and fail on others.
+            $writer = new SegmentIndexWriter(
+                null,
+                $this->manifest->fields === [] ? null : $this->manifest->fields,
+            );
+
             $replacing = [];
 
             foreach ($documents as $id => $document) {
@@ -334,13 +355,27 @@ final class IndexDirectory
     ): SearchResult {
         $started = hrtime(true);
 
-        $total     = 0;
-        $merged    = [];
-        $candidates = [];
-        $wanted    = max(0, $offset) + max(0, $limit);
+        // Gathered before anything is scored: IDF describes how rare a term is
+        // in the index, so it cannot be answered segment by segment without the
+        // same document scoring differently depending on where it landed — and
+        // a merge then changing the ranking.
+        $statistics = $this->statisticsFor($query);
+
+        $total  = 0;
+        $merged = [];
+
+        // One bounded heap for the whole search rather than a ranked list per
+        // segment: the best twenty overall are somewhere among the segments, and
+        // there is no need to materialise more than twenty to find them.
+        $top = new TopK(max(0, $offset) + max(0, $limit));
 
         foreach ($this->segments as $position => $segment) {
-            [$matches, $scores] = $segment->select($query, $filters, $this->deletions[$position]);
+            [$matches, $scores] = $segment->select(
+                $query,
+                $filters,
+                $this->deletions[$position],
+                $statistics,
+            );
 
             $total += $matches->count();
 
@@ -351,26 +386,14 @@ final class IndexDirectory
                 );
             }
 
-            // Only this segment's own best can reach the merged page, so there
-            // is no point carrying more of them across.
-            $ranked = [];
-
             foreach ($matches->iterate() as $ordinal) {
-                $ranked[$ordinal] = (float) ($scores[$ordinal] ?? 0);
-            }
-
-            arsort($ranked);
-
-            foreach (array_slice($ranked, 0, $wanted, true) as $ordinal => $score) {
-                $candidates[] = [$score, $position, $ordinal];
+                $top->offer($scores[$ordinal] ?? 0.0, $position, $ordinal);
             }
         }
 
-        usort($candidates, static fn(array $a, array $b): int => $b[0] <=> $a[0]);
-
         $hits = [];
 
-        foreach (array_slice($candidates, max(0, $offset), max(0, $limit)) as [$score, $position, $ordinal]) {
+        foreach (array_slice($top->drain(), max(0, $offset)) as [$score, $position, $ordinal]) {
             $document = $this->segments[$position]->documentAt($ordinal);
 
             if ($document !== null) {
@@ -379,6 +402,36 @@ final class IndexDirectory
         }
 
         return new SearchResult($hits, $total, $merged, (hrtime(true) - $started) / 1e6);
+    }
+
+    /**
+     * The index-wide numbers BM25 needs, summed over every segment.
+     *
+     * @throws CorruptSegmentException
+     */
+    private function statisticsFor(string $query): CollectionStatistics
+    {
+        $statistics = CollectionStatistics::empty();
+
+        if ($this->segments === []) {
+            return $statistics;
+        }
+
+        $terms = reset($this->segments)->analyze($query);
+
+        foreach ($this->segments as $position => $segment) {
+            // Live documents, not written ones: a term present only in deleted
+            // documents should not look common.
+            $live = $segment->count() - $this->deletions[$position]->count();
+
+            $statistics = $statistics->plus(
+                max(0, $live),
+                $segment->termLengthSum(),
+                $terms === [] ? [] : $segment->documentFrequencies($terms),
+            );
+        }
+
+        return $statistics;
     }
 
     // -------------------------------------------------------------------------

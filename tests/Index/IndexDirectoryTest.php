@@ -447,6 +447,107 @@ class IndexDirectoryTest extends TestCase
     }
 
     // =========================================================================
+    // Ranking
+    // =========================================================================
+
+    #[Test]
+    public function a_short_document_outranks_a_long_one_holding_the_same_words(): void
+    {
+        // What counting matched terms got wrong: both documents hold every term
+        // of the query, so both used to score identically and whichever came
+        // first won. A long description collides with more of a query by
+        // accident, and BM25's length normalisation is what says so.
+        $index = $this->index();
+
+        $index->putMany([
+            'court' => ['title' => 'Chaussure cuir marron'],
+            'long'  => ['title' => 'chaussure de ville elegante en cuir marron veritable tannage vegetal '
+                . str_repeat('confort qualite durabilite finition soignee coloris naturel ', 12)],
+            'autre' => ['title' => 'Botte cuir noir'],
+        ]);
+
+        $result = $index->search('cuir marron');
+        $scores = [];
+
+        foreach ($result as $hit) {
+            $scores[$hit->id] = $hit->score;
+        }
+
+        $this->assertArrayHasKey('court', $scores);
+        $this->assertArrayHasKey('long', $scores);
+        $this->assertGreaterThan($scores['long'], $scores['court'], 'the short one wins');
+    }
+
+    #[Test]
+    public function matching_a_rare_word_counts_for_more_than_a_common_one(): void
+    {
+        $index = $this->index();
+
+        $documents = [];
+
+        for ($i = 0; $i < 50; $i++) {
+            $documents["commun-$i"] = ['title' => "chaussure cuir modele $i"];
+        }
+
+        $documents['rare'] = ['title' => 'chaussure zibeline'];
+
+        $index->putMany($documents);
+
+        $result = $index->search('chaussure zibeline');
+
+        $this->assertSame('rare', $result->hits[0]->id);
+    }
+
+    #[Test]
+    public function scores_are_positive_numbers(): void
+    {
+        $result = $this->catalogue()->search('brown');
+
+        foreach ($result as $hit) {
+            $this->assertIsFloat($hit->score);
+            $this->assertGreaterThan(0.0, $hit->score);
+        }
+    }
+
+    #[Test]
+    public function statistics_are_taken_across_segments_not_per_segment(): void
+    {
+        // IDF asks how rare a term is in the index. If each segment answered
+        // from its own dictionary, the same document would score differently
+        // depending on where it landed — and a merge would change the ranking.
+        //
+        // Here the rare document sits alone in its own segment while the common
+        // ones fill another, which is exactly the arrangement that would expose
+        // per-segment statistics.
+        $index = $this->index();
+
+        $common = [];
+
+        for ($i = 0; $i < 40; $i++) {
+            $common["commun-$i"] = ['title' => "chaussure cuir modele $i"];
+        }
+
+        $index->putMany($common);
+        $index->putMany(['rare' => ['title' => 'chaussure zibeline']]);
+
+        $this->assertGreaterThan(1, $index->stats()['segments'], 'really two segments');
+
+        $before = $index->search('chaussure zibeline')->hits[0];
+
+        $index->optimize();
+        $this->assertSame(1, $index->stats()['segments']);
+
+        $after = $index->search('chaussure zibeline')->hits[0];
+
+        $this->assertSame($before->id, $after->id);
+        $this->assertSame(
+            round($before->score, 6),
+            round($after->score, 6),
+            'the score did not depend on how the documents were spread'
+        );
+    }
+
+    // =========================================================================
     // Merging
     // =========================================================================
 

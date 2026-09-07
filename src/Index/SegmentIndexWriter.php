@@ -76,6 +76,9 @@ final class SegmentIndexWriter
     /** @var array<string, string>|null the types actually written */
     private ?array $effectiveFields = null;
 
+    /** Summed document lengths, for the average BM25 normalises against. */
+    private int $termLengthSum = 0;
+
     /**
      * @param array<string, string>|null $fields field => type, to use instead of
      *        inferring. The index freezes its field types at its first commit and
@@ -154,6 +157,7 @@ final class SegmentIndexWriter
             $segment->addSection('keys', $this->encodeKeys());
             $segment->addSection('meta', (string) json_encode([
                 'documentCount' => $documentCount,
+                'termLengthSum' => $this->termLengthSum,
                 'fields'        => $fields,
             ]));
 
@@ -254,8 +258,20 @@ final class SegmentIndexWriter
         /** @var array<string, int[]> term => ordinals, ascending */
         $postings = [];
 
+        /** @var int[] ordinal => how many terms the document produced */
+        $lengths = [];
+
         foreach ($this->documents as $ordinal => $document) {
-            foreach ($this->analyzer->analyze($this->textOf($document)) as $term) {
+            $terms = $this->analyzer->analyze($this->textOf($document));
+
+            // BM25 penalises a document for being longer than average, which is
+            // what stops a long description from outranking a precise title
+            // simply by colliding with more of the query by accident. The count
+            // has to be recorded now: it cannot be recovered from the postings
+            // without walking every one of them.
+            $lengths[$ordinal] = count($terms);
+
+            foreach ($terms as $term) {
                 $postings[$term][] = $ordinal;
             }
         }
@@ -284,6 +300,22 @@ final class SegmentIndexWriter
 
         $segment->addSection('terms', $dictionary->finish());
         $segment->addSection('postings', $encodedLists);
+
+        // Fixed width, addressed by document number — the same rule as the
+        // doc-values columns. Clamped at 65 535, which a document would have to
+        // be about ten thousand words long to reach.
+        $packed  = '';
+        $total   = 0;
+
+        for ($ordinal = 0; $ordinal < $documentCount; $ordinal++) {
+            $length  = min(0xFFFF, $lengths[$ordinal] ?? 0);
+            $packed .= pack('v', $length);
+            $total  += $length;
+        }
+
+        $segment->addSection('lengths', $packed);
+
+        $this->termLengthSum = $total;
     }
 
     /**
