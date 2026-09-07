@@ -499,8 +499,10 @@ class SchemaIndexTest extends TestCase
         $index = IndexDirectory::open($this->dir, $this->schema());
         $index->putMany($this->products());
 
+        // Reported as a filter problem — that is what the caller was doing —
+        // with the message the shared type rules produce.
         $this->expectException(FilterException::class);
-        $this->expectExceptionMessage("Filter on 'price' expects a number, got string 'cher'");
+        $this->expectExceptionMessage("Field 'price' is declared number but received the string 'cher'");
 
         $index->search('', filters: [['field' => 'price', 'op' => '<=', 'value' => 'cher']]);
     }

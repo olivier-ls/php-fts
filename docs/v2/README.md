@@ -349,7 +349,6 @@ Filter::all(
     Filter::gt('stock', 0),
     Filter::between('price', 50, 300),
     Filter::in('category', ['Shoes', 'Sport']),
-    Filter::contains('tags', 'luxury'),
     Filter::any(
         Filter::eq('brand', 'Nike'),
         Filter::eq('brand', 'Adidas'),
@@ -362,16 +361,54 @@ Filter::all(
 |------------|--------------------------------------------|
 | Equality   | `eq` `neq` `in` `notIn`                    |
 | Comparison | `gt` `gte` `lt` `lte` `between`            |
-| Arrays     | `contains` `containsAny` `containsAll`     |
 | Presence   | `exists` `missing`                         |
 | Logic      | `all` `any` `not`                          |
 
-Comparisons are **strict**: `Filter::eq('brand', true)` will never match the
-string `'Adidas'`. Type mismatches raise `InvalidFilterException` instead of
-silently matching.
+`between` takes an open end: `between('price', 100, null)` is "100 and up".
+An empty `all()` narrows nothing, so a filter assembled by a loop that adds no
+clauses needs no special case at the call site.
 
-Building filters from user input (an HTTP API, say)? `Filter::fromArray()` takes
-the same structure as JSON and validates it.
+### `neq` and `not` are not the same thing
+
+```php
+Filter::neq('brand', 'Nike')              // has a brand, and it is not Nike
+Filter::not(Filter::eq('brand', 'Nike'))  // is not a Nike — including
+                                          // products with no brand at all
+```
+
+`neq` and `notIn` follow SQL: a comparison against a missing value is not true,
+so a product with no brand is not "a brand other than Nike". `not` is plain set
+complement, which is what the word means. Both are useful, so both exist rather
+than one being quietly chosen for you.
+
+### Strictness
+
+The value you filter *with* goes through the same type rules as the value you
+index, so `eq('brand', true)` is refused rather than quietly compared against
+`'1'` — and `lte('price', '200')` from `$_GET` is accepted. A type mismatch
+raises `FilterException`, never a silent non-match.
+
+### From an HTTP request
+
+`Filter::fromArray()` takes the same structure as JSON and validates it as a
+structure, before any of it reaches the code that reads files:
+
+```json
+{"op": "all", "filters": [
+    {"op": "eq",      "field": "active", "value": true},
+    {"op": "between", "field": "price",  "value": [50, 300]},
+    {"op": "not", "filters": [{"op": "exists", "field": "discontinued_at"}]}
+]}
+```
+
+Operators may be spelled the way a front end writes them — `=`, `!=`, `>=`,
+`<=`, `not in`, `and`, `or`. Everything unexpected is **refused**, never
+ignored: a misspelled operator that silently dropped its clause would widen a
+search rather than narrow it, which is the failure nobody notices. Nesting is
+capped, because a request body is an attack surface rather than a style
+question.
+
+`search()` also accepts a plain list of clauses, which is ANDed.
 
 ---
 

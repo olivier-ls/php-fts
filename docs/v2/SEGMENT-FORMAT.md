@@ -357,6 +357,13 @@ deletion; the failure is benign and retried on the next commit.
 
 Agreed and scheduled, but not now:
 
+- **Multi-valued columns, and the filters that need them** — `contains`,
+  `containsAny`, `containsAll` over a `tags` field. A tags field is analysed
+  today, so it is searchable; filtering on one needs a column holding several
+  ordinals per document, which the fixed-width layout does not do. Left out of
+  `Filter` entirely rather than added as factories that throw: an operator you
+  can write and cannot run is worse than one that is not there.
+
 - **Segment inspector** — a command that opens a `.fts` and prints its
   structure: sections and sizes, block counts, cost per key, a sample of keys
   with their payloads, checksum status. Makes the format legible instead of

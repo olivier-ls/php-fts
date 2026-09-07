@@ -6,7 +6,9 @@ namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Exception\CorruptSegmentException;
+use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
+use Ols\PhpFts\Filter;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\Query\CollectionStatistics;
 use Ols\PhpFts\Query\Scorer;
@@ -21,7 +23,10 @@ use Ols\PhpFts\Storage\Varint;
  *
  *     $index  = SegmentIndex::open('/path/seg_a1f.fts');
  *     $result = $index->search('lether sho',
- *         filters: [['field' => 'price', 'op' => '<=', 'value' => 300]],
+ *         filters: Filter::all(
+ *             Filter::lte('price', 300),
+ *             Filter::any(Filter::eq('brand', 'Nike'), Filter::eq('brand', 'Adidas')),
+ *         ),
  *         facets:  ['brand'],
  *     );
  *
@@ -61,10 +66,12 @@ use Ols\PhpFts\Storage\Varint;
  * in the schema, which is what BM25F allows and what a title needs: its length
  * says much less about relevance than a description's does.
  *
- * ── What is deliberately provisional ────────────────────────────────────────
+ * ── Filters are compiled here, not built here ───────────────────────────────
  *
- * The filter format is a flat list of ANDed clauses, standing in for the
- * nested, fluent builder the public API will offer.
+ * A Filter is a value object that knows nothing about segments. It has to be
+ * compiled per segment, because each one numbers its own documents and holds
+ * its own columns, so the same tree becomes a different bitmap in each. See
+ * `compile()`.
  */
 final class SegmentIndex
 {
@@ -193,8 +200,9 @@ final class SegmentIndex
     }
 
     /**
-     * @param array<int, array{field: string, op: string, value: mixed}> $filters ANDed together
-     * @param string[]                                                  $facets  field names
+     * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
+     *        flat list of clauses, which are ANDed
+     * @param string[]            $facets  field names
      *
      * @throws CorruptSegmentException
      * @throws FilterException
@@ -203,7 +211,7 @@ final class SegmentIndex
         string $query = '',
         int $limit = 20,
         int $offset = 0,
-        array $filters = [],
+        Filter|array $filters = [],
         array $facets = [],
         array $boosts = [],
     ): SearchResult {
@@ -256,7 +264,7 @@ final class SegmentIndex
      */
     public function select(
         string $query,
-        array $filters = [],
+        Filter|array $filters = [],
         ?Bitset $deleted = null,
         ?CollectionStatistics $statistics = null,
         array $boosts = [],
@@ -267,8 +275,10 @@ final class SegmentIndex
             $boosts,
         );
 
-        foreach ($filters as $filter) {
-            $matches = $matches->and($this->evaluate($filter));
+        $filter = Filter::normalise($filters);
+
+        if ($filter !== null) {
+            $matches = $matches->and($this->compile($filter));
         }
 
         if ($deleted !== null) {
@@ -714,75 +724,224 @@ final class SegmentIndex
     }
 
     /**
-     * @param array{field: string, op: string, value: mixed} $filter
+     * Turns a filter tree into the set of documents it selects.
+     *
+     * The tree itself knows nothing about this segment — it is a value object
+     * the caller built, or one that arrived as JSON. Compilation has to happen
+     * here because a segment numbers its own documents and holds its own
+     * columns, so the same tree becomes a different bitmap in each one.
+     *
+     * Everything is set arithmetic on strings of bits: `all` intersects, `any`
+     * unions, `not` complements. Nothing reads a document.
+     *
      * @throws FilterException
+     * @throws FieldTypeException
      * @throws CorruptSegmentException
      */
-    private function evaluate(array $filter): Bitset
+    private function compile(Filter $filter): Bitset
     {
-        foreach (['field', 'op', 'value'] as $key) {
-            if (!array_key_exists($key, $filter)) {
-                throw new FilterException("Filter is missing the '$key' key");
-            }
+        if ($filter->isGroup()) {
+            return match ($filter->operator) {
+                // An `all` with nothing in it is the identity, so a filter
+                // built by a loop that added no clauses narrows nothing.
+                'all' => array_reduce(
+                    $filter->children,
+                    fn(Bitset $set, Filter $child): Bitset => $set->and($this->compile($child)),
+                    Bitset::full($this->documentCount),
+                ),
+                // An `any` with nothing in it matches nothing, which is what
+                // "one of these zero things" has to mean.
+                'any' => array_reduce(
+                    $filter->children,
+                    fn(Bitset $set, Filter $child): Bitset => $set->or($this->compile($child)),
+                    Bitset::empty($this->documentCount),
+                ),
+                default => $this->compile($filter->children[0])->not(),
+            };
         }
 
-        $field  = (string) $filter['field'];
+        $field  = (string) $filter->field;
         $column = $this->column($field);
 
         if ($column === null) {
             throw new FilterException("No filterable column for field '$field'" . $this->becauseInferred($field));
         }
 
-        $value = $filter['value'];
-        $op    = $filter['op'];
-
-        if ($column instanceof KeywordColumn) {
-            return match ($op) {
-                '=', 'eq'     => $column->equals((string) $value),
-                '!=', 'neq'   => $column->equals((string) $value)->not()->and($column->exists()),
-                'in'          => $column->in((array) $value),
-                'not in'      => $column->in((array) $value)->not()->and($column->exists()),
-                'exists'      => $column->exists(),
-                'missing'     => $column->missing(),
-                default       => throw new FilterException($this->wrongOperator($op, $field, 'keyword')),
+        // The same rules that decide what may be *stored* in the field decide
+        // what may be compared against it, so filtering by '129.90' and
+        // indexing '129.90' are one act. It is also where strictness comes
+        // from: eq('brand', true) is refused rather than quietly matching '1'.
+        //
+        // Applied per value, because `in` and `between` carry a list of them
+        // and the field's type describes each element, not the list.
+        try {
+            $value = match ($filter->operator) {
+                'exists', 'missing' => null,
+                'in', 'notIn', 'between' => is_array($filter->value)
+                    ? array_map(
+                        fn(mixed $one): mixed => $one === null ? null : $this->schema->coerceValue($field, $one),
+                        $filter->value,
+                    )
+                    : $filter->value,
+                default => $this->schema->coerceValue($field, $filter->value),
             };
+        } catch (FieldTypeException $e) {
+            // Re-thrown as a filter problem, because that is what the caller
+            // was doing. The type rules are shared with indexing, but someone
+            // catching bad query input should not have to know that. The
+            // original is chained, and its message is already the good one.
+            throw new FilterException($e->getMessage(), 0, $e);
         }
 
-        $number = static function (mixed $value) use ($field): float {
-            if (is_bool($value)) {
-                return $value ? 1.0 : 0.0;
+        if ($column instanceof KeywordColumn) {
+            return $this->compileKeyword($column, $filter->operator, $field, $value);
+        }
+
+        return $this->compileNumeric($column, $filter->operator, $field, $value);
+    }
+
+    /**
+     * @throws FilterException
+     * @throws CorruptSegmentException
+     */
+    private function compileKeyword(KeywordColumn $column, string $operator, string $field, mixed $value): Bitset
+    {
+        return match ($operator) {
+            'eq'      => $column->equals((string) $value),
+            // Excludes documents with no value, as SQL does: a comparison
+            // against nothing is not true. `not(eq(...))` is the plain
+            // complement, and does include them.
+            'neq'     => $column->equals((string) $value)->not()->and($column->exists()),
+            'in'      => $column->in($this->strings($field, $value)),
+            'notIn'   => $column->in($this->strings($field, $value))->not()->and($column->exists()),
+            'exists'  => $column->exists(),
+            'missing' => $column->missing(),
+            default   => throw new FilterException($this->wrongOperator($operator, $field, 'keyword')),
+        };
+    }
+
+    /**
+     * @throws FilterException
+     * @throws CorruptSegmentException
+     */
+    private function compileNumeric(NumericColumn $column, string $operator, string $field, mixed $value): Bitset
+    {
+        if ($operator === 'in' || $operator === 'notIn') {
+            $matched = Bitset::empty($this->documentCount);
+
+            foreach ($this->numbers($field, $value) as $number) {
+                $matched = $matched->or($column->equals($number));
             }
 
-            if (is_int($value) || is_float($value)) {
-                return (float) $value;
-            }
+            return $operator === 'in' ? $matched : $matched->not()->and($column->exists());
+        }
 
-            // A price slider in a web form sends '60', never 60. The column is
-            // already known to be numeric, so there is nothing to guess at —
-            // the same reasoning that lets a declared number field accept
-            // '129.90' from a database driver.
-            if (is_string($value) && is_numeric($value)) {
-                return (float) $value;
+        if ($operator === 'between') {
+            [$min, $max] = $this->bounds($field, $value);
+
+            return $column->range($min, $max);
+        }
+
+        return match ($operator) {
+            'eq'      => $column->equals($this->number($field, $value)),
+            'neq'     => $column->equals($this->number($field, $value))->not()->and($column->exists()),
+            'gt'      => $column->range($this->number($field, $value), null, minInclusive: false),
+            'gte'     => $column->range($this->number($field, $value), null),
+            'lt'      => $column->range(null, $this->number($field, $value), maxInclusive: false),
+            'lte'     => $column->range(null, $this->number($field, $value)),
+            'exists'  => $column->exists(),
+            'missing' => $column->missing(),
+            default   => throw new FilterException($this->wrongOperator($operator, $field, 'numeric')),
+        };
+    }
+
+    /**
+     * One filter value as the float a numeric column compares against.
+     *
+     * A declared field has already been through the schema, so this only has
+     * to catch the inferred case — where the column is numeric but nothing
+     * vouched for the value.
+     *
+     * @throws FilterException
+     */
+    private function number(string $field, mixed $value): float
+    {
+        if (is_bool($value)) {
+            return $value ? 1.0 : 0.0;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            return (float) $value;
+        }
+
+        // A price slider in a web form sends '60', never 60.
+        if (is_string($value) && is_numeric($value)) {
+            return (float) $value;
+        }
+
+        throw new FilterException(
+            "Filter on '$field' expects a number, got " . get_debug_type($value)
+            . (is_string($value) ? ' ' . var_export($value, true) : '')
+        );
+    }
+
+    /**
+     * @return float[]
+     * @throws FilterException
+     */
+    private function numbers(string $field, mixed $value): array
+    {
+        if (!is_array($value)) {
+            throw new FilterException("Filter on '$field' expects a list of values");
+        }
+
+        return array_map(fn(mixed $one): float => $this->number($field, $one), array_values($value));
+    }
+
+    /**
+     * @return string[]
+     * @throws FilterException
+     */
+    private function strings(string $field, mixed $value): array
+    {
+        if (!is_array($value)) {
+            throw new FilterException("Filter on '$field' expects a list of values");
+        }
+
+        $strings = [];
+
+        foreach ($value as $one) {
+            if (is_string($one) || is_int($one) || is_float($one)) {
+                $strings[] = (string) $one;
+                continue;
             }
 
             throw new FilterException(
-                "Filter on '$field' expects a number, got " . get_debug_type($value)
-                . (is_string($value) ? ' ' . var_export($value, true) : '')
+                "Filter on '$field' expects a list of exact values, got " . get_debug_type($one) . ' in it'
             );
-        };
+        }
 
-        return match ($op) {
-            '=', 'eq'   => $column->equals($number($value)),
-            '!=', 'neq' => $column->equals($number($value))->not()->and($column->exists()),
-            '>', 'gt'   => $column->range($number($value), null, minInclusive: false),
-            '>=', 'gte' => $column->range($number($value), null),
-            '<', 'lt'   => $column->range(null, $number($value), maxInclusive: false),
-            '<=', 'lte' => $column->range(null, $number($value)),
-            'between'   => $column->range($number(((array) $value)[0]), $number(((array) $value)[1])),
-            'exists'    => $column->exists(),
-            'missing'   => $column->missing(),
-            default     => throw new FilterException($this->wrongOperator($op, $field, 'numeric')),
-        };
+        return $strings;
+    }
+
+    /**
+     * @return array{float|null, float|null}
+     * @throws FilterException
+     */
+    private function bounds(string $field, mixed $value): array
+    {
+        if (!is_array($value) || count($value) !== 2) {
+            throw new FilterException("Filter between on '$field' expects a minimum and a maximum");
+        }
+
+        [$min, $max] = array_values($value);
+
+        // An open end is useful: between(50, null) is "50 and up" without
+        // needing a separate clause.
+        return [
+            $min === null ? null : $this->number($field, $min),
+            $max === null ? null : $this->number($field, $max),
+        ];
     }
 
     /**

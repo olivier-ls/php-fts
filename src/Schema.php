@@ -331,6 +331,32 @@ final class Schema
     }
 
     /**
+     * One value, coerced to a field's declared type.
+     *
+     * Used for the values a *query* filters with, so that filtering by
+     * `'129.90'` and indexing `'129.90'` are the same act. A price slider in a
+     * web form sends a string; a JSON body sends whatever it sends.
+     *
+     * Unlike `coerce()` this applies to an inferred schema too. The reason the
+     * two differ: refusing to *store* a document against a guessed type would
+     * throw away the caller's data on the strength of a heuristic, whereas a
+     * query value is being compared against a column that already exists and
+     * already has one kind. There is nothing left to guess at.
+     *
+     * @throws FieldTypeException
+     */
+    public function coerceValue(string $field, mixed $value): mixed
+    {
+        $definition = $this->fields[$field] ?? null;
+
+        if ($definition === null || $value === null) {
+            return $value;
+        }
+
+        return $this->coerceField(null, $field, $definition['type'], $value);
+    }
+
+    /**
      * @return array<string, mixed>
      */
     public function toArray(): array
@@ -422,7 +448,7 @@ final class Schema
     /**
      * @throws FieldTypeException
      */
-    private function coerceField(string $id, string $field, string $type, mixed $value): mixed
+    private function coerceField(?string $id, string $field, string $type, mixed $value): mixed
     {
         if ($value === null) {
             return null;
@@ -441,7 +467,7 @@ final class Schema
     /**
      * @throws FieldTypeException
      */
-    private function coerceNumber(string $id, string $field, mixed $value): int|float
+    private function coerceNumber(?string $id, string $field, mixed $value): int|float
     {
         if (is_int($value)) {
             return $value;
@@ -478,7 +504,7 @@ final class Schema
     /**
      * @throws FieldTypeException
      */
-    private function coerceBoolean(string $id, string $field, mixed $value): bool
+    private function coerceBoolean(?string $id, string $field, mixed $value): bool
     {
         if (is_bool($value)) {
             return $value;
@@ -510,7 +536,7 @@ final class Schema
     /**
      * @throws FieldTypeException
      */
-    private function coerceKeyword(string $id, string $field, mixed $value): string
+    private function coerceKeyword(?string $id, string $field, mixed $value): string
     {
         if (is_string($value)) {
             return $value;
@@ -536,7 +562,7 @@ final class Schema
      * @return string[]
      * @throws FieldTypeException
      */
-    private function coerceTags(string $id, string $field, mixed $value): array
+    private function coerceTags(?string $id, string $field, mixed $value): array
     {
         if (is_string($value)) {
             return [$value];
@@ -569,7 +595,7 @@ final class Schema
      * @return string|string[]
      * @throws FieldTypeException
      */
-    private function coerceText(string $id, string $field, mixed $value): string|array
+    private function coerceText(?string $id, string $field, mixed $value): string|array
     {
         if (is_string($value)) {
             return $value;
@@ -596,7 +622,7 @@ final class Schema
      *
      * @throws FieldTypeException
      */
-    private function coerceStored(string $id, string $field, mixed $value, int $depth = 0): mixed
+    private function coerceStored(?string $id, string $field, mixed $value, int $depth = 0): mixed
     {
         if (is_array($value)) {
             if ($depth > 32) {
@@ -625,11 +651,15 @@ final class Schema
         return $value;
     }
 
-    private function refuse(string $id, string $field, string $type, string $received): FieldTypeException
+    /**
+     * @param string|null $id the document being indexed, or null when the value
+     *        came from a query rather than from a document
+     */
+    private function refuse(?string $id, string $field, string $type, string $received): FieldTypeException
     {
-        return new FieldTypeException(
-            "Field '$field' of document '$id' is declared $type but received $received"
-        );
+        $subject = $id === null ? "Field '$field'" : "Field '$field' of document '$id'";
+
+        return new FieldTypeException("$subject is declared $type but received $received");
     }
 
     private function describe(mixed $value): string

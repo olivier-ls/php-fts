@@ -5,8 +5,10 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Exception\CorruptSegmentException;
+use Ols\PhpFts\Exception\FilterException;
 use Ols\PhpFts\Exception\FtsException;
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Filter;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\LockManager;
 use Ols\PhpFts\Query\CollectionStatistics;
@@ -23,7 +25,7 @@ use Ols\PhpFts\Storage\Manifest;
  *
  *     $index->putMany(['sku-1' => [...], 'sku-2' => [...]]);   // one commit
  *     $index->delete('sku-1');                                  // another
- *     $index->search('leather', facets: ['brand']);
+ *     $index->search('leather', filters: Filter::gt('stock', 0), facets: ['brand']);
  *
  * ── What changes once there is more than one segment ────────────────────────
  *
@@ -419,20 +421,27 @@ final class IndexDirectory
     }
 
     /**
-     * @param array<int, array{field: string, op: string, value: mixed}> $filters
-     * @param string[]                                                  $facets
+     * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
+     *        flat list of clauses, which are ANDed
+     * @param string[]            $facets
      *
      * @throws CorruptSegmentException
+     * @throws FilterException
      */
     public function search(
         string $query = '',
         int $limit = 20,
         int $offset = 0,
-        array $filters = [],
+        Filter|array $filters = [],
         array $facets = [],
         array $boosts = [],
     ): SearchResult {
         $started = hrtime(true);
+
+        // Parsed once here rather than once per segment: a malformed filter is
+        // the caller's mistake, and it should be reported before any file is
+        // touched rather than by whichever segment happened to be read first.
+        $filters = Filter::normalise($filters) ?? Filter::all();
 
         // Gathered before anything is scored: IDF describes how rare a term is
         // in the index, so it cannot be answered segment by segment without the
