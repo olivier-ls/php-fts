@@ -73,9 +73,31 @@ final class SegmentIndexWriter
     /** @var array<string, true> ids already used, to catch duplicates */
     private array $seen = [];
 
-    public function __construct(?Analyzer $analyzer = null)
+    /** @var array<string, string>|null the types actually written */
+    private ?array $effectiveFields = null;
+
+    /**
+     * @param array<string, string>|null $fields field => type, to use instead of
+     *        inferring. The index freezes its field types at its first commit and
+     *        passes them here afterwards, because inference depends on the batch:
+     *        ten documents with ten distinct titles look like a keyword field,
+     *        two hundred do not. Left to re-infer, a merge could change a field's
+     *        type, and a filter that worked on the unmerged segments would then
+     *        fail on the merged one.
+     */
+    public function __construct(?Analyzer $analyzer = null, private readonly ?array $fields = null)
     {
         $this->analyzer = $analyzer ?? new Analyzer();
+    }
+
+    /**
+     * The field types this writer used, known once write() has run.
+     *
+     * @return array<string, string>
+     */
+    public function fields(): array
+    {
+        return $this->effectiveFields ?? [];
     }
 
     /**
@@ -116,7 +138,14 @@ final class SegmentIndexWriter
         $segment = SegmentWriter::create($path);
 
         try {
-            $fields = $this->inferFields();
+            // A frozen schema wins, but a field it has never seen still needs a
+            // type — adding a field to later documents must not make it
+            // unfilterable.
+            $fields = $this->fields === null
+                ? $this->inferFields()
+                : $this->fields + $this->inferFields();
+
+            $this->effectiveFields = $fields;
 
             $this->writeTermsAndPostings($segment, $documentCount);
             $this->writeColumns($segment, $fields, $documentCount);

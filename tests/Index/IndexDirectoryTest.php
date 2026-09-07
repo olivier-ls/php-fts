@@ -6,6 +6,7 @@ namespace Ols\PhpFts\Tests\Index;
 
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Index\IndexDirectory;
+use Ols\PhpFts\Index\MergePolicy;
 use Ols\PhpFts\Storage\Manifest;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -348,19 +349,33 @@ class IndexDirectoryTest extends TestCase
     }
 
     #[Test]
-    public function a_query_falls_back_to_any_term_when_no_document_holds_them_all(): void
+    public function a_document_must_hold_enough_of_the_query_not_merely_part_of_it(): void
     {
-        // Provisional and worth pinning: term matching is "every term, or
-        // failing that any term". So "suede boot", once the boot is gone, still
-        // finds the suede shoe. A real query planner will degrade gradually
-        // between the two instead of jumping.
+        // "suede boot" shares five of its nine trigrams with "Brown suede shoe",
+        // which is under the threshold. So once the boot is deleted the query
+        // finds nothing, rather than dragging in a shoe because one word
+        // overlapped.
+        //
+        // An earlier version took every term, or failing that any term. That
+        // decision was made per segment, so the answer depended on how the
+        // documents happened to be distributed — and merging changed it.
         $index = $this->catalogue();
         $index->delete('sku-2');
 
-        $result = $index->search('suede boot');
+        $this->assertSame(0, $index->search('suede boot')->total);
+        $this->assertSame(1, $index->search('suede shoe')->total, 'the shoe is still findable');
+    }
 
-        $this->assertSame(1, $result->total);
-        $this->assertSame('sku-3', $result->hits[0]->id, 'matched on "suede" alone');
+    #[Test]
+    public function the_threshold_still_tolerates_typos(): void
+    {
+        // The balance the threshold has to strike: "lether sho" misspells both
+        // words and still shares six of its nine trigrams with "leather shoe".
+        $index = $this->catalogue();
+
+        $result = $index->search('lether sho');
+
+        $this->assertSame('sku-1', $result->hits[0]->id);
     }
 
     #[Test]
@@ -429,5 +444,240 @@ class IndexDirectoryTest extends TestCase
 
         $this->assertContains('commit.1', $files);
         $this->assertCount(2, $files, 'one manifest and one segment');
+    }
+
+    // =========================================================================
+    // Merging
+    // =========================================================================
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    private function products(int $count): array
+    {
+        $brands   = ['Adidas', 'Puma', 'Nike'];
+        $products = [];
+
+        for ($i = 0; $i < $count; $i++) {
+            $products["sku-$i"] = [
+                'title' => "chaussure modele $i en cuir",
+                'brand' => $brands[$i % 3],
+                'price' => 50.0 + ($i % 200),
+            ];
+        }
+
+        return $products;
+    }
+
+    #[Test]
+    public function segments_collapse_as_writes_accumulate(): void
+    {
+        // Written one at a time, an index does not end up with one segment per
+        // document: the tiers collapse as the loop runs.
+        $index = IndexDirectory::open($this->dir, new MergePolicy(segmentsPerTier: 4, tierFactor: 4));
+
+        foreach ($this->products(40) as $id => $product) {
+            $index->put($id, $product);
+        }
+
+        $this->assertSame(40, $index->count());
+        $this->assertLessThan(10, $index->stats()['segments'], '40 writes must not leave 40 segments');
+    }
+
+    #[Test]
+    public function optimize_reduces_the_index_to_one_segment(): void
+    {
+        $index = $this->index();
+
+        foreach (array_chunk($this->products(20), 4, true) as $batch) {
+            $index->putMany($batch);
+        }
+
+        $this->assertGreaterThan(1, $index->stats()['segments']);
+
+        $index->optimize();
+
+        $this->assertSame(1, $index->stats()['segments']);
+        $this->assertSame(20, $index->count());
+        $this->assertFalse($index->stats()['needsOptimize']);
+    }
+
+    #[Test]
+    public function a_merge_does_not_change_what_a_search_returns(): void
+    {
+        // The guarantee that matters. A merge rewrites every structure in the
+        // index and renumbers every document; none of that may be observable.
+        $index = $this->index();
+
+        foreach (array_chunk($this->products(30), 5, true) as $batch) {
+            $index->putMany($batch);
+        }
+
+        $index->delete('sku-3');
+        $index->delete('sku-17');
+
+        $queries = ['cuir', 'chaussure modele 12', 'modele', 'cuire', ''];
+        $before  = [];
+
+        foreach ($queries as $query) {
+            $result = $index->search($query, limit: 50, facets: ['brand', 'price']);
+
+            $before[$query] = [
+                'total'  => $result->total,
+                'ids'    => array_map(static fn($hit): string => $hit->id, $result->hits),
+                'facets' => $result->facets,
+            ];
+        }
+
+        $index->optimize();
+        $this->assertSame(1, $index->stats()['segments'], 'the merge really happened');
+
+        foreach ($queries as $query) {
+            $result = $index->search($query, limit: 50, facets: ['brand', 'price']);
+
+            $this->assertSame($before[$query]['total'], $result->total, "total for [$query]");
+            $this->assertEqualsCanonicalizing(
+                $before[$query]['ids'],
+                array_map(static fn($hit): string => $hit->id, $result->hits),
+                "documents for [$query]"
+            );
+            $this->assertEquals($before[$query]['facets'], $result->facets, "facets for [$query]");
+        }
+    }
+
+    #[Test]
+    public function ids_survive_a_merge(): void
+    {
+        // What 1.x got wrong: it made a document's byte offset its identity, so
+        // compaction silently invalidated every id an application had stored.
+        // Here a merge renumbers everything internally and no id changes.
+        $index = $this->index();
+
+        foreach (array_chunk($this->products(20), 4, true) as $batch) {
+            $index->putMany($batch);
+        }
+
+        $index->optimize();
+
+        for ($i = 0; $i < 20; $i++) {
+            $this->assertNotNull($index->get("sku-$i"), "sku-$i survived the merge");
+            $this->assertSame("chaussure modele $i en cuir", $index->get("sku-$i")['title']);
+        }
+    }
+
+    #[Test]
+    public function a_merge_drops_deleted_documents_for_good(): void
+    {
+        $index = $this->index();
+        $index->putMany($this->products(10));
+
+        for ($i = 0; $i < 6; $i++) {
+            $index->delete("sku-$i");
+        }
+
+        $this->assertSame(4, $index->count());
+
+        $index->optimize();
+
+        $stats = $index->stats();
+
+        $this->assertSame(4, $stats['documents']);
+        $this->assertSame(0, $stats['deleted'], 'the tombstones are gone, not just ignored');
+        $this->assertSame(1, $stats['segments']);
+        $this->assertNull($index->get('sku-0'));
+    }
+
+    #[Test]
+    public function the_field_schema_is_frozen_and_survives_merging(): void
+    {
+        // Inference depends on the batch, so a merge left to re-infer could turn
+        // a keyword field into a text one — and a filter that worked before the
+        // merge would fail after it.
+        $index = $this->index();
+
+        $index->putMany($this->products(10));
+        $frozen = $index->stats()['fields'];
+
+        $this->assertSame('keyword', $frozen['brand']);
+
+        for ($i = 10; $i < 300; $i++) {
+            $index->putMany(["sku-$i" => [
+                'title' => "chaussure modele $i en cuir",
+                'brand' => 'Adidas',
+                'price' => 99.0,
+            ]]);
+        }
+
+        $index->optimize();
+
+        $this->assertSame($frozen, $index->stats()['fields'], 'the schema did not drift');
+
+        $this->assertGreaterThan(
+            0,
+            $index->search('', filters: [['field' => 'brand', 'op' => '=', 'value' => 'Adidas']])->total,
+            'and the filter that depends on it still works'
+        );
+    }
+
+    #[Test]
+    public function optimizing_an_optimal_index_does_nothing(): void
+    {
+        $index = $this->index();
+        $index->putMany($this->products(5));
+
+        $before = $index->generation();
+
+        $index->optimize();
+
+        $this->assertSame($before, $index->generation(), 'no commit for no work');
+    }
+
+    #[Test]
+    public function retired_segment_files_are_collected_once_their_grace_has_passed(): void
+    {
+        $index = $this->index();
+
+        foreach (array_chunk($this->products(20), 4, true) as $batch) {
+            $index->putMany($batch);
+        }
+
+        $index->optimize();
+
+        $this->assertSame(1, $index->stats()['segments']);
+        $this->assertGreaterThan(1, count(glob($this->dir . '/seg_*.fts') ?: []), 'retired files still there');
+
+        // Age the retirements past the grace period.
+        $generation = Manifest::generations($this->dir)[0];
+        $path       = $this->dir . '/commit.' . $generation;
+        $manifest   = json_decode((string) file_get_contents($path), true);
+
+        foreach ($manifest['retired'] as $position => $_) {
+            $manifest['retired'][$position]['at'] -= Manifest::GRACE_SECONDS * 2;
+        }
+
+        file_put_contents($path, (string) json_encode($manifest));
+
+        // Opening collects them — an index written once and only read afterwards
+        // would otherwise keep every intermediate segment for good.
+        $reopened = IndexDirectory::open($this->dir);
+
+        $this->assertCount(1, glob($this->dir . '/seg_*.fts') ?: []);
+        $this->assertSame(20, $reopened->count(), 'and the index is still whole');
+        $this->assertSame(20, $reopened->search('cuir')->total);
+    }
+
+    #[Test]
+    public function old_commit_files_are_forgotten_but_a_few_are_kept(): void
+    {
+        $index = $this->index();
+
+        for ($i = 0; $i < 12; $i++) {
+            $index->put("sku-$i", ['title' => "produit $i"]);
+        }
+
+        $generations = Manifest::generations($this->dir);
+
+        $this->assertLessThanOrEqual(3, count($generations), 'old commits are removed');
+        $this->assertGreaterThanOrEqual(2, count($generations), 'but rollback has somewhere to land');
     }
 }

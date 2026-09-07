@@ -51,6 +51,20 @@ use Ols\PhpFts\Storage\Varint;
  */
 final class SegmentIndex
 {
+    /**
+     * Fraction of a query's terms a document must hold to match.
+     *
+     * Sets the balance between recall and precision, and it is the single knob
+     * that decides whether "lether sho" still finds "leather shoe": those two
+     * share six trigrams out of the query's nine, so anything up to 0.66 keeps
+     * them together. Lower it and unrelated words creep in; raise it and typos
+     * stop working.
+     *
+     * A placeholder for the tunable it should become, and for the scoring that
+     * will make the cut-off matter less.
+     */
+    private const MIN_SHOULD_MATCH = 0.6;
+
     private SegmentReader $segment;
     private Analyzer $analyzer;
 
@@ -296,26 +310,31 @@ final class SegmentIndex
             return [Bitset::empty($this->documentCount), []];
         }
 
-        // Every term present is the precise answer; when nothing holds them all,
-        // fall back to anything holding one. A real query planner would degrade
-        // gradually between the two rather than jumping.
-        $all = $sets[0];
+        // A document has to hold enough of the query's terms, rather than all of
+        // them or merely one.
+        //
+        // The first version of this jumped: it took the documents holding every
+        // term, and if there were none it fell back to those holding any. That
+        // decision was made per segment, so the same query answered differently
+        // depending on how the documents happened to be spread across segments —
+        // and merging them changed the result. A test comparing a search before
+        // and after a merge caught it.
+        //
+        // The threshold is computed from the query alone, never from what this
+        // segment happens to contain, which is what makes the answer independent
+        // of write history. It also degrades smoothly: a typo costs a few
+        // trigrams and stays above the bar, while an unrelated word does not.
+        $required = max(1, (int) ceil(count($terms) * self::MIN_SHOULD_MATCH));
 
-        foreach (array_slice($sets, 1) as $set) {
-            $all = $all->and($set);
+        $matches = Bitset::empty($this->documentCount);
+
+        foreach ($scores as $ordinal => $held) {
+            if ($held >= $required) {
+                $matches->set($ordinal);
+            }
         }
 
-        if (!$all->isEmpty()) {
-            return [$all, $scores];
-        }
-
-        $any = $sets[0];
-
-        foreach (array_slice($sets, 1) as $set) {
-            $any = $any->or($set);
-        }
-
-        return [$any, $scores];
+        return [$matches, $scores];
     }
 
     /**

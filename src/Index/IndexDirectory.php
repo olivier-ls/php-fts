@@ -62,9 +62,14 @@ final class IndexDirectory
     /** @var Bitset[] deletions per segment, same keys */
     private array $deletions = [];
 
+    /** Commit files kept behind the newest, so a rollback has somewhere to land. */
+    private const COMMITS_KEPT = 3;
+
     private function __construct(
         private readonly string $directory,
         private readonly LockManager $lock,
+        private readonly MergePolicy $policy,
+        private readonly SegmentMerger $merger,
     ) {
     }
 
@@ -73,13 +78,19 @@ final class IndexDirectory
      *
      * @throws StorageException
      */
-    public static function open(string $directory): self
+    public static function open(string $directory, ?MergePolicy $policy = null): self
     {
         if (!is_dir($directory) && !@mkdir($directory, 0755, true) && !is_dir($directory)) {
             throw new StorageException("Unable to create index directory: $directory");
         }
 
-        $index = new self(rtrim($directory, '/\\'), new LockManager($directory));
+        $index = new self(
+            rtrim($directory, '/\\'),
+            new LockManager($directory),
+            $policy ?? new MergePolicy(),
+            new SegmentMerger(),
+        );
+
         $index->load();
 
         return $index;
@@ -128,6 +139,13 @@ final class IndexDirectory
             'segments'   => count($this->manifest->segments),
             'generation' => $this->manifest->generation,
             'bytes'      => $bytes,
+            'fields'     => $this->manifest->fields,
+
+            // A read may say a merge would help; it may not perform one, since
+            // that needs the write lock and would let a search wait behind an
+            // import. This is what lets an application schedule optimize()
+            // instead of the engine deciding while a visitor waits.
+            'needsOptimize' => $this->policy->selectAll($this->descriptors()) !== [],
         ];
     }
 
@@ -203,7 +221,16 @@ final class IndexDirectory
                 'deleted'   => '',
             ];
 
-            $this->commit($segments);
+            // The schema is frozen at the first commit and carried forward, so
+            // that a later merge cannot re-infer a field into a different type.
+            $this->commit($segments, fields: $this->manifest->fields === []
+                ? $writer->fields()
+                : null);
+
+            // Commit first, maintain second. The write is durable before any
+            // merge starts, so a merge killed halfway leaves an orphan segment
+            // in no manifest — debris, not damage.
+            $this->maintain();
         });
     }
 
@@ -235,8 +262,34 @@ final class IndexDirectory
             $segments[$position]['deleted'] = $deleted->bytes();
 
             $this->commit($segments);
+            $this->maintain();
 
             return true;
+        });
+    }
+
+    /**
+     * Merges everything into one segment, with no caps.
+     *
+     * Never required: automatic merges keep an index healthy on their own. This
+     * is for the cases where someone would rather pay the cost now — after a
+     * bulk import, or from a cron on a large index where a 250 ms budget inside
+     * a web request would take a while to converge.
+     *
+     * Does nothing when there is nothing to gain.
+     *
+     * @throws StorageException
+     */
+    public function optimize(): void
+    {
+        $this->lock->withLock(function (): void {
+            $this->load();
+
+            $positions = $this->policy->selectAll($this->descriptors());
+
+            if ($positions !== []) {
+                $this->performMerge($positions);
+            }
         });
     }
 
@@ -344,7 +397,9 @@ final class IndexDirectory
         $this->segments  = [];
         $this->deletions = [];
 
-        foreach (Manifest::generations($this->directory) as $generation) {
+        $generations = Manifest::generations($this->directory);
+
+        foreach ($generations as $generation) {
             try {
                 $manifest = Manifest::read($this->directory, $generation);
                 $segments = [];
@@ -364,6 +419,18 @@ final class IndexDirectory
                 $this->deletions[$position] = Bitset::fromBytes($entry['deleted'], $entry['documents']);
             }
 
+            // Retired segment files are removed by the commit that follows their
+            // grace period — but an index written once and then only read would
+            // never see another commit, and would keep every intermediate
+            // segment on disk for good. So opening collects them too.
+            //
+            // Only when the newest generation loaded, though: a reader that had
+            // to fall back may still be looking at segments a later commit
+            // retired, and must not have them pulled out from under it.
+            if ($generation === ($generations[0] ?? null)) {
+                $this->collectRetiredFiles($manifest->retired);
+            }
+
             return;
         }
 
@@ -371,15 +438,176 @@ final class IndexDirectory
     }
 
     /**
+     * Deletes retired segment files whose grace period has passed.
+     *
+     * Not a change to the index: these files are named by no live manifest, so
+     * removing them alters nothing a reader can observe. The manifest's list of
+     * them is tidied by the next commit, which finds the files already gone.
+     *
+     * @param array<int, array{name: string, at: int}> $retired
+     */
+    private function collectRetiredFiles(array $retired): void
+    {
+        $deadline = time() - Manifest::GRACE_SECONDS;
+
+        foreach ($retired as $entry) {
+            if ($entry['at'] <= $deadline) {
+                @unlink($this->segmentPath($entry['name']));
+            }
+        }
+    }
+
+    /**
      * @param array<int, array{name: string, documents: int, deleted: string}> $segments
+     * @param array<int, array{name: string, at: int}>|null                    $retired
+     * @param array<string, string>|null                                       $fields
      * @throws StorageException
      */
-    private function commit(array $segments): void
+    private function commit(array $segments, ?array $retired = null, ?array $fields = null): void
     {
-        $next = $this->manifest->next($segments, $this->manifest->retired);
-        $next->write($this->directory);
+        // Garbage collection rides along on the commit rather than needing one
+        // of its own: expired retirements are dropped from the list being
+        // written, and their files removed.
+        $retired = $this->pruneRetired($retired ?? $this->manifest->retired);
+
+        $this->manifest->next($segments, $retired, $fields)->write($this->directory);
 
         $this->load();
+        $this->forgetOldCommits();
+    }
+
+    /**
+     * Runs merges until the policy is satisfied or the budget runs out.
+     *
+     * Called after a commit, never before: see the note in putMany().
+     *
+     * @throws StorageException
+     */
+    private function maintain(): void
+    {
+        $started = hrtime(true);
+
+        // A guard, not a policy: every merge strictly reduces the number of
+        // segments or the number of deletions, so this cannot spin. The cap is
+        // there so that a future policy bug costs a slow request rather than a
+        // hung one.
+        for ($pass = 0; $pass < 32; $pass++) {
+            if ((hrtime(true) - $started) / 1e6 > $this->policy->timeBudgetMs) {
+                return;
+            }
+
+            $positions = $this->policy->select($this->descriptors());
+
+            if ($positions === []) {
+                return;
+            }
+
+            $this->performMerge($positions);
+        }
+    }
+
+    /**
+     * Replaces some segments with one holding their live documents.
+     *
+     * @param int[] $positions
+     * @throws StorageException
+     */
+    private function performMerge(array $positions): void
+    {
+        $chosen  = array_fill_keys($positions, true);
+        $sources = [];
+
+        foreach ($positions as $position) {
+            $sources[$position] = $this->segments[$position];
+        }
+
+        $name  = $this->newSegmentName();
+        $count = $this->merger->merge(
+            $sources,
+            $this->deletions,
+            $this->segmentPath($name),
+            $this->manifest->fields === [] ? null : $this->manifest->fields,
+        );
+
+        $segments = [];
+        $retired  = $this->manifest->retired;
+        $now      = time();
+
+        foreach ($this->manifest->segments as $position => $entry) {
+            if (isset($chosen[$position])) {
+                // Not deleted yet: a search that started before this commit may
+                // still be reading it. It goes out after the grace period.
+                $retired[] = ['name' => $entry['name'], 'at' => $now];
+                continue;
+            }
+
+            $segments[] = $entry;
+        }
+
+        if ($count > 0) {
+            $segments[] = ['name' => $name, 'documents' => $count, 'deleted' => ''];
+        }
+
+        $this->commit($segments, $retired);
+    }
+
+    /**
+     * @param array<int, array{name: string, at: int}> $retired
+     * @return array<int, array{name: string, at: int}>
+     */
+    private function pruneRetired(array $retired): array
+    {
+        $deadline  = time() - Manifest::GRACE_SECONDS;
+        $remaining = [];
+
+        foreach ($retired as $entry) {
+            if ($entry['at'] > $deadline) {
+                $remaining[] = $entry;
+                continue;
+            }
+
+            // On Windows an open file refuses to be deleted. The failure is
+            // benign: the entry stays and the next commit tries again.
+            if (!@unlink($this->segmentPath($entry['name'])) && file_exists($this->segmentPath($entry['name']))) {
+                $remaining[] = $entry;
+            }
+        }
+
+        return $remaining;
+    }
+
+    /**
+     * Removes commit files well behind the newest.
+     *
+     * A few are kept so that rollback has somewhere to land: if the newest
+     * commit turns out to be unreadable, the one before it must still exist.
+     */
+    private function forgetOldCommits(): void
+    {
+        $generations = Manifest::generations($this->directory);
+
+        foreach (array_slice($generations, self::COMMITS_KEPT) as $generation) {
+            @unlink($this->directory . '/commit.' . $generation);
+        }
+    }
+
+    /**
+     * The sizes the policy reasons about.
+     *
+     * @return array<int, array{documents: int, deleted: int}>
+     */
+    private function descriptors(): array
+    {
+        $descriptors = [];
+
+        foreach ($this->manifest->segments as $position => $entry) {
+            $descriptors[$position] = [
+                'documents' => $entry['documents'],
+                'deleted'   => $this->deletions[$position]->count(),
+            ];
+        }
+
+        return $descriptors;
     }
 
     /**
