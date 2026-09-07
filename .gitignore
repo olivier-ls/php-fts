@@ -7,6 +7,10 @@ search_data*/
 benchmark/search_data*/
 demo/search_data*/
 
+# Benchmark corpora extracted from a real catalogue. The script that builds
+# them is committed; the data never is — it belongs to the shop it came from.
+benchmark/*.jsonl
+
 # IDE
 .idea/
 .vscode/
