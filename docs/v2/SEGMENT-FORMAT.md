@@ -372,7 +372,9 @@ Tiered, and deliberately boring:
 | `segmentsPerTier` | 8 | merge when a size tier holds this many |
 | `tierFactor` | 8 | each tier is 8× the previous in document count |
 | `timeBudget` | 250 ms | an automatic merge never starts new work past this |
-| `maxAutoMergeDocs` | 50 000 | above this, defer to `optimize()` |
+| `maxAutoMergeDocuments` | 50 000 | the ceiling, whatever the memory says |
+| `memoryFraction` | 0.5 | share of the free memory a merge may plan to use |
+| `memoryBudgetBytes` | derived | set it to make the decision reproducible |
 
 Rules:
 
@@ -421,6 +423,50 @@ bounded by things the caller can see. Measured on a 45 000-product catalogue:
 
 The property is locked by `tests/Index/MergeMemoryTest.php`, which holds the
 documents and the vocabulary fixed and varies only how many postings there are.
+
+### How large a merge is allowed to be
+
+Cheap is not the same as bounded, so the cap was measured rather than picked.
+What a merge costs turned out to be almost exactly **linear in documents** —
+and, once the postings and the docstore were streamed, in nothing else that a
+policy could see:
+
+| varied | range | cost |
+|---|---|---|
+| documents | 5 k → 80 k | 942 → 1 065 B/doc |
+| searchable fields | 1 → 6 | 871 → 895 B/doc — nothing |
+| key length | 4 B → 40 B | 923 → 972 B/doc — nothing |
+| **filterable fields** | 0 → 16 | **896 → 2 731 B/doc**, ~115 B each |
+
+A column is one array slot per document carried across, which is why it is the
+only shape that moves the number, and why a cap cannot be a constant: the same
+50 000 documents cost 45 MB with no columns and 137 MB with sixteen.
+
+**Bytes on disk are not the predictor**, which is the counter-intuitive part. A
+19 MB index of 5 000 documents with a large stored payload merges in 4 MB; a
+1.3 MB index of 20 000 short ones takes 18 MB. The correlation runs backwards,
+because the docstore is most of a segment file and is streamed.
+
+So `MergePolicy` converts a share of the memory the process actually has left
+into a number of documents, using `1 000 + 128 × filterableFields` bytes each.
+Predicted 73.2 MB for the 45 000-product catalogue against 73.0 measured, on
+coefficients fitted on synthetic data. A merge that will not fit does not
+happen: the segments stay, search gets a little slower, and `optimize()` from a
+cron fixes it — a slow index beats a failed request.
+
+Measured end to end, importing the 45 000-product catalogue at 2 000 a commit:
+
+| `memory_limit` | fixed cap of 50 000 | derived from memory |
+|---|---|---|
+| 128M | 9 segments, 66 MB | 9 segments, 66 MB |
+| 96M | 9 segments | 6 segments |
+| 64M | **out of memory** | 11 segments, 54 MB |
+| 48M | **out of memory** | 23 segments, 48 MB |
+| 40M | out of memory | out of memory* |
+
+\* not the merge: at 40 MB it is `putMany()`'s own batch of 2 000 documents that
+does not fit, which is the caller's to choose and does fit at 500 a commit
+(13 segments, 22 MB peak).
 
 ---
 

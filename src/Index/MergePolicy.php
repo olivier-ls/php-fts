@@ -31,9 +31,64 @@ namespace Ols\PhpFts\Index;
  * document cap and a time budget. Whatever it does not finish, the next write
  * picks up. `optimize()` lifts both, because whoever calls it has decided to
  * wait.
+ *
+ * ── Where the document cap comes from ───────────────────────────────────────
+ *
+ * A merge's memory was the thing that decided this, so the cap was measured
+ * rather than picked. Once the merge stopped accumulating its input — see
+ * SegmentMerger — what it costs turned out to be **almost exactly linear in
+ * documents**, and barely anything else:
+ *
+ *     documents          5 k → 80 k       942 → 1 065 B/doc
+ *     searchable fields  1 → 6            871 → 895 B/doc      (nothing)
+ *     key length         4 B → 40 B       923 → 972 B/doc      (nothing)
+ *     filterable fields  0 → 16           896 → 2 731 B/doc    (~115 B each)
+ *
+ * The last line is the one that matters and the reason the cap cannot simply
+ * be a number: a column costs one array slot per document, so an index with
+ * sixteen filterable fields costs three times what one with none costs, for
+ * the same documents. Both figures are free to read — the count is in the
+ * manifest, the fields are in the frozen schema.
+ *
+ * What is emphatically *not* a predictor is the size of the segments. A 19 MB
+ * index of 5 000 documents with a large stored payload merged in 4 MB; a 1.3 MB
+ * index of 20 000 short ones took 18 MB. The correlation runs backwards,
+ * because the docstore — which is most of a segment file — is streamed and
+ * costs nothing to carry. Bytes on disk were the obvious unit and would have
+ * been wrong by a factor of twenty.
+ *
+ * Checked against the catalogue in `benchmark/`, which the coefficients were
+ * not fitted on: 45 000 real products with seven filterable fields, predicted
+ * 73.2 MB and measured 73.0.
+ *
+ * So the cap is a share of the memory actually left in the process, converted
+ * into documents. A 128 MB shared host running an application in 40 MB of it
+ * gets a smaller merge than a 512 MB one, without anybody configuring it, and
+ * a merge that will not fit does not happen — the segments stay, search gets a
+ * little slower, and `optimize()` from a cron fixes it. That is the right way
+ * round: piling up segments is a slow index, and running out of memory is a
+ * failed request.
  */
 final class MergePolicy
 {
+    /**
+     * What one document costs a merge, before its columns.
+     *
+     * Its key, its field lengths, its share of the block dictionary and of the
+     * field masks. Rounded up from the 871–1 065 B/doc measured across every
+     * shape above that has no columns.
+     */
+    private const BYTES_PER_DOCUMENT = 1_000;
+
+    /**
+     * What one filterable field adds, per document.
+     *
+     * A column value is carried across a merge as a slot in a nested array, so
+     * this is one PHP array entry: measured at ~115 B, taken at 128 to round
+     * the estimate the safe way.
+     */
+    private const BYTES_PER_COLUMN = 128;
+
     public function __construct(
         /** Segments in one tier before it is collapsed. */
         public readonly int $segmentsPerTier = 8,
@@ -41,7 +96,14 @@ final class MergePolicy
         /** Each tier holds segments this many times larger than the last. */
         public readonly int $tierFactor = 8,
 
-        /** An automatic merge will not take on more documents than this. */
+        /**
+         * The ceiling on an automatic merge, whatever the memory says.
+         *
+         * A time guard rather than a memory one: the time budget is checked
+         * between merges and not during one, so without this a single merge of
+         * a very large index could hold a request for minutes on a machine
+         * with memory to spare.
+         */
         public readonly int $maxAutoMergeDocuments = 50_000,
 
         /** How long an automatic merge may spend, in milliseconds. */
@@ -53,7 +115,51 @@ final class MergePolicy
          * then discard.
          */
         public readonly float $deletedRatioThreshold = 0.5,
+
+        /**
+         * Bytes an automatic merge may plan to use, if you would rather say.
+         *
+         * Left null it is worked out from what the process has left, which is
+         * what a library should do — nobody deploying to a shared host knows
+         * this number, and the host is where it matters. Set it to make the
+         * decision reproducible, which is what the tests do: reading
+         * `memory_get_usage()` is the one thing in this class that depends on
+         * anything but its arguments.
+         */
+        public readonly ?int $memoryBudgetBytes = null,
+
+        /**
+         * How much of the free memory an automatic merge may plan to use.
+         *
+         * Half, because the merge is not the only thing that will allocate
+         * before the request ends — and because the estimate above is an
+         * estimate. Set to 0.0 to drop the memory cap and go back to counting
+         * documents alone.
+         */
+        public readonly float $memoryFraction = 0.5,
     ) {
+    }
+
+    /**
+     * How many documents an automatic merge may take on, here and now.
+     *
+     * @param int $filterableFields how many fields of the index's schema have a
+     *        column, which is what makes one document dearer than another
+     */
+    public function documentCap(int $filterableFields = 0): int
+    {
+        $budget = $this->memoryBudgetBytes ?? $this->freeShare();
+
+        if ($budget === null) {
+            // No memory_limit to reason from — the CLI's usual state. The
+            // ceiling is the only bound left, and it is the one that was there
+            // before any of this.
+            return $this->maxAutoMergeDocuments;
+        }
+
+        $perDocument = self::BYTES_PER_DOCUMENT + self::BYTES_PER_COLUMN * max(0, $filterableFields);
+
+        return min($this->maxAutoMergeDocuments, intdiv(max(0, $budget), $perDocument));
     }
 
     /**
@@ -62,13 +168,17 @@ final class MergePolicy
      * Returns fewer than two positions when there is nothing worth doing.
      *
      * @param array<int, array{documents: int, deleted: int}> $segments
+     * @param int $filterableFields the index's column count, which decides how
+     *        many documents fit in the memory budget
      * @return int[]
      */
-    public function select(array $segments): array
+    public function select(array $segments, int $filterableFields = 0): array
     {
         if ($segments === []) {
             return [];
         }
+
+        $cap = $this->documentCap($filterableFields);
 
         // Group by tier, smallest first: collapsing the cheapest tier keeps the
         // amortised cost per document low.
@@ -92,7 +202,7 @@ final class MergePolicy
             foreach ($positions as $position) {
                 $live = max(0, $segments[$position]['documents'] - $segments[$position]['deleted']);
 
-                if ($chosen !== [] && $total + $live > $this->maxAutoMergeDocuments) {
+                if ($chosen !== [] && $total + $live > $cap) {
                     break;
                 }
 
@@ -114,9 +224,7 @@ final class MergePolicy
 
             $ratio = $segment['deleted'] / $segment['documents'];
 
-            if ($ratio > $this->deletedRatioThreshold
-                && $segment['documents'] <= $this->maxAutoMergeDocuments
-            ) {
+            if ($ratio > $this->deletedRatioThreshold && $segment['documents'] <= $cap) {
                 return [$position];
             }
         }
@@ -146,6 +254,62 @@ final class MergePolicy
         }
 
         return [];
+    }
+
+    /**
+     * The share of the process's remaining memory a merge may plan to use,
+     * or null when there is no limit to take a share of.
+     */
+    private function freeShare(): ?int
+    {
+        if ($this->memoryFraction <= 0.0) {
+            return null;
+        }
+
+        $limit = self::memoryLimit();
+
+        if ($limit === null) {
+            return null;
+        }
+
+        // The real allocation rather than the accounted one, because that is
+        // what memory_limit is enforced against — and because a merge's cost
+        // is measured the same way.
+        $free = $limit - memory_get_usage(true);
+
+        return (int) (max(0, $free) * $this->memoryFraction);
+    }
+
+    /**
+     * `memory_limit` in bytes, or null when it is unlimited or unreadable.
+     *
+     * The shorthand suffixes are PHP's own, and case-insensitive: `128M` is
+     * what a shared host writes.
+     */
+    private static function memoryLimit(): ?int
+    {
+        // Cast rather than compared to false: ini_get() can say false for a
+        // directive that does not exist, which this one always does, and the
+        // cast turns that impossible case into the empty string the regex
+        // refuses anyway.
+        $setting = trim((string) ini_get('memory_limit'));
+
+        if (!preg_match('/^(-?\d+)\s*([kmg]?)$/i', $setting, $matched)) {
+            return null;
+        }
+
+        $value = (int) $matched[1];
+
+        if ($value < 0) {
+            return null;   // -1: no limit, so no share of it either
+        }
+
+        return match (strtolower($matched[2])) {
+            'k'     => $value * 1024,
+            'm'     => $value * 1024 * 1024,
+            'g'     => $value * 1024 * 1024 * 1024,
+            default => $value,
+        };
     }
 
     /**

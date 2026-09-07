@@ -195,4 +195,152 @@ class MergePolicyTest extends TestCase
 
         $this->assertSame([0], $policy->selectAll($this->segments([[1000, 1]])));
     }
+
+    // =========================================================================
+    // The memory budget
+    //
+    // Every case here says what its budget is, because the point of the
+    // parameter is that the decision can be made reproducible. Left to itself
+    // the policy reads memory_get_usage(), which is the right default on a
+    // shared host and the wrong one in a test.
+    // =========================================================================
+
+    #[Test]
+    public function the_budget_becomes_a_number_of_documents(): void
+    {
+        // 10 MB at the measured 1 000 bytes a document, with nothing to carry
+        // in a column.
+        $policy = new MergePolicy(memoryBudgetBytes: 10 * 1024 * 1024);
+
+        $this->assertSame(10485, $policy->documentCap(0));
+    }
+
+    #[Test]
+    public function a_column_makes_every_document_dearer(): void
+    {
+        // The finding this whole mechanism exists for: what a merge costs is
+        // linear in documents, and the slope is set by the columns. Sixteen of
+        // them roughly triple it, so the same memory buys a third of the
+        // documents.
+        $policy = new MergePolicy(memoryBudgetBytes: 10 * 1024 * 1024);
+
+        $this->assertSame(10485, $policy->documentCap(0));
+        $this->assertSame(3440, $policy->documentCap(16));
+
+        $this->assertLessThan(
+            $policy->documentCap(0),
+            $policy->documentCap(1),
+            'one column already costs something'
+        );
+    }
+
+    #[Test]
+    public function the_ceiling_still_applies_when_memory_is_plentiful(): void
+    {
+        $policy = new MergePolicy(
+            maxAutoMergeDocuments: 50_000,
+            memoryBudgetBytes: 8 * 1024 * 1024 * 1024,
+        );
+
+        // Not five hundred thousand: the ceiling is a time guard, and time does
+        // not get cheaper because memory did.
+        $this->assertSame(50_000, $policy->documentCap(0));
+    }
+
+    #[Test]
+    public function a_starved_process_merges_nothing_rather_than_failing(): void
+    {
+        // Four segments of a thousand, and room for two hundred documents. The
+        // segments stay, search gets a little slower, and optimize() from a
+        // cron fixes it — which is the right way round, because piling up
+        // segments is a slow index and running out of memory is a failed
+        // request.
+        $policy = new MergePolicy(segmentsPerTier: 4, memoryBudgetBytes: 200 * 1000);
+
+        $segments = $this->segments(array_fill(0, 4, [1000, 0]));
+
+        $this->assertSame([], $policy->select($segments, 0), 'no automatic merge');
+        $this->assertNotSame([], $policy->selectAll($segments), 'but optimize() would');
+    }
+
+    #[Test]
+    public function the_budget_decides_how_many_segments_go_in(): void
+    {
+        // Room for two and a half thousand documents, so two segments of a
+        // thousand and not the third. Exactly the behaviour the old fixed cap
+        // had — the number is now derived rather than declared.
+        $policy = new MergePolicy(segmentsPerTier: 4, memoryBudgetBytes: 2500 * 1000);
+
+        $this->assertCount(2, $policy->select($this->segments(array_fill(0, 4, [1000, 0])), 0));
+    }
+
+    #[Test]
+    public function a_mostly_deleted_segment_too_large_for_the_budget_is_left_alone(): void
+    {
+        // The other place the cap is used. A segment worth rewriting on its own
+        // is still a merge, and still has to fit — four fifths of it being
+        // tombstones does not make it cheaper to carry the fifth that is left,
+        // because the postings are walked either way.
+        $segment = $this->segments([[5000, 4000]]);
+
+        $starved = new MergePolicy(segmentsPerTier: 8, memoryBudgetBytes: 500 * 1000);
+        $roomy   = new MergePolicy(segmentsPerTier: 8, memoryBudgetBytes: 50 * 1000 * 1000);
+
+        $this->assertSame([], $starved->select($segment, 0), 'no room to rewrite it');
+        $this->assertSame([0], $roomy->select($segment, 0), 'room, so it is rewritten');
+    }
+
+    #[Test]
+    public function the_memory_cap_can_be_turned_off(): void
+    {
+        // For somebody who has measured their own workload and would rather
+        // count documents, as every version before this one did.
+        $policy = new MergePolicy(maxAutoMergeDocuments: 30_000, memoryFraction: 0.0);
+
+        $this->assertSame(30_000, $policy->documentCap(0));
+        $this->assertSame(30_000, $policy->documentCap(50), 'columns stop mattering too');
+    }
+
+    #[Test]
+    public function an_unlimited_memory_limit_leaves_only_the_ceiling(): void
+    {
+        $limit = ini_get('memory_limit');
+
+        // Raised, never lowered: dropping the limit under what the process has
+        // already allocated kills it on the next allocation, and a test that
+        // can take the suite down with it is not worth the coverage.
+        ini_set('memory_limit', '-1');
+
+        try {
+            $policy = new MergePolicy(maxAutoMergeDocuments: 12_345);
+
+            $this->assertSame(12_345, $policy->documentCap(0));
+        } finally {
+            ini_set('memory_limit', (string) $limit);
+        }
+    }
+
+    #[Test]
+    public function the_shorthand_a_shared_host_writes_is_understood(): void
+    {
+        $read = new \ReflectionMethod(MergePolicy::class, 'memoryLimit');
+        $read->setAccessible(true);
+
+        $limit = ini_get('memory_limit');
+
+        try {
+            // All well above what the suite has allocated: see the note above
+            // about lowering the limit under it.
+            foreach (['1G' => 1073741824, '512M' => 536870912, '262144K' => 268435456] as $setting => $bytes) {
+                ini_set('memory_limit', $setting);
+
+                $this->assertSame($bytes, $read->invoke(null), "memory_limit=$setting");
+            }
+
+            ini_set('memory_limit', '-1');
+            $this->assertNull($read->invoke(null), 'unlimited is not a number to take a share of');
+        } finally {
+            ini_set('memory_limit', (string) $limit);
+        }
+    }
 }

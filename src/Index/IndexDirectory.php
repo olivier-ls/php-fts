@@ -757,7 +757,7 @@ final class IndexDirectory
                 return;
             }
 
-            $positions = $this->policy->select($this->descriptors());
+            $positions = $this->policy->select($this->descriptors(), $this->filterableFieldCount());
 
             if ($positions === []) {
                 return;
@@ -869,6 +869,27 @@ final class IndexDirectory
         }
 
         return $descriptors;
+    }
+
+    /**
+     * How many fields have a column.
+     *
+     * The policy's other input: a column is carried across a merge as one
+     * array slot per document, so it is what makes one index's documents
+     * dearer to merge than another's. Free to work out — the schema is already
+     * loaded — and stable, because it is frozen at the first commit.
+     */
+    private function filterableFieldCount(): int
+    {
+        $count = 0;
+
+        foreach ($this->schema()->fields() as $definition) {
+            if ($definition['filterable']) {
+                $count++;
+            }
+        }
+
+        return $count;
     }
 
     /**
