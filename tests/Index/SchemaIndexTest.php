@@ -471,6 +471,99 @@ class SchemaIndexTest extends TestCase
     }
 
     // =========================================================================
+    // The PHP type is the declaration, when there is none
+    // =========================================================================
+
+    #[Test]
+    public function a_numeric_filter_accepts_the_string_a_web_form_sends(): void
+    {
+        // $_GET['max_price'] is '200', never 200. The column is already known
+        // to be numeric, so there is nothing left to guess at — the same
+        // reasoning that lets a declared number field accept '129.90'.
+        $index = IndexDirectory::open($this->dir, $this->schema());
+        $index->putMany($this->products());
+
+        $this->assertSame(
+            2,
+            $index->search('', filters: [['field' => 'price', 'op' => '<=', 'value' => '200']])->total
+        );
+        $this->assertSame(
+            1,
+            $index->search('', filters: [['field' => 'price', 'op' => 'between', 'value' => ['100', '150']]])->total
+        );
+    }
+
+    #[Test]
+    public function a_filter_value_that_is_not_a_number_names_the_field(): void
+    {
+        $index = IndexDirectory::open($this->dir, $this->schema());
+        $index->putMany($this->products());
+
+        $this->expectException(FilterException::class);
+        $this->expectExceptionMessage("Filter on 'price' expects a number, got string 'cher'");
+
+        $index->search('', filters: [['field' => 'price', 'op' => '<=', 'value' => 'cher']]);
+    }
+
+    #[Test]
+    public function a_range_over_an_inferred_keyword_says_how_to_settle_it(): void
+    {
+        // Without a schema the PHP type is the declaration, so prices passed as
+        // strings become a keyword field and `<=` has no meaning over a value
+        // dictionary. The message has to say that, not just refuse.
+        $index = IndexDirectory::open($this->dir);
+        $index->putMany([
+            'a' => ['title' => 'Brown leather shoe', 'price' => '129.90'],
+            'b' => ['title' => 'Blue suede boot', 'price' => '89.00'],
+        ]);
+
+        $this->assertSame('keyword', $index->stats()['fields']['price']);
+
+        try {
+            $index->search('', filters: [['field' => 'price', 'op' => '<=', 'value' => 200]]);
+            $this->fail('a range over a keyword column should have been refused');
+        } catch (FilterException $e) {
+            $this->assertStringContainsString("does not apply to the keyword field 'price'", $e->getMessage());
+            $this->assertStringContainsString('pass numbers as int or float', $e->getMessage());
+            $this->assertStringContainsString('Schema::number()', $e->getMessage());
+        }
+    }
+
+    #[Test]
+    public function the_same_values_passed_as_numbers_are_filterable(): void
+    {
+        // The other half of the contract, and the reason the hint above is
+        // worth printing: the fix is on the caller's side and it is one cast.
+        $index = IndexDirectory::open($this->dir);
+        $index->putMany([
+            'a' => ['title' => 'Brown leather shoe', 'price' => 129.90],
+            'b' => ['title' => 'Blue suede boot', 'price' => 89.00],
+        ]);
+
+        $this->assertSame('number', $index->stats()['fields']['price']);
+        $this->assertSame(
+            1,
+            $index->search('', filters: [['field' => 'price', 'op' => '<=', 'value' => 100]])->total
+        );
+    }
+
+    #[Test]
+    public function a_declared_schema_gets_no_hint_about_what_it_declared(): void
+    {
+        // Telling callers what they themselves wrote is noise.
+        $index = IndexDirectory::open($this->dir, $this->schema());
+        $index->putMany($this->products());
+
+        try {
+            $index->search('', filters: [['field' => 'brand', 'op' => '<=', 'value' => 'Nike']]);
+            $this->fail('a range over a keyword column should have been refused');
+        } catch (FilterException $e) {
+            $this->assertStringContainsString("does not apply to the keyword field 'brand'", $e->getMessage());
+            $this->assertStringNotContainsString('inferred', $e->getMessage());
+        }
+    }
+
+    // =========================================================================
     // Inference is still the default
     // =========================================================================
 

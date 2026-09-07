@@ -161,8 +161,29 @@ untouched. A crash mid-import cannot corrupt anything.
 
 ### Schema (optional)
 
-Field types are inferred from your documents. Declare a schema when you want
-control over what is indexed, stored, or filterable:
+Field types are inferred from your documents, and **the PHP type is what
+decides**. That is the whole contract:
+
+```php
+$engine->put('sku-1', [
+    'price'     => 129.90,     // a number: range filters, sorting, min/max facets
+    'stock'     => 12,         // a number
+    'reference' => '4471',     // a string: an exact value to filter and facet on
+    'phone'     => '0612345678',
+]);
+```
+
+`4471` is a number and `'4471'` is a reference, so a reference keeps its shape
+and a phone number keeps its leading zero. Nothing sniffs at the inside of your
+strings to decide it knows better.
+
+The one thing to watch: `PDO` hands back every column as a string until you
+turn on native types, so cast what is really a number before you index it —
+otherwise `price` becomes an exact value and a range filter over it has no
+meaning. If you do hit that, the exception says so and says what to do.
+
+Declare a schema when you want to settle it explicitly, or want control over
+what is indexed, stored, or filterable:
 
 ```php
 use Ols\PhpFts\{Schema, SearchEngine};
@@ -205,10 +226,18 @@ FieldTypeException: Field 'price' of document 'sku-4471' is declared number
 but received the string 'sur devis'
 ```
 
-The rule is: **convert what is unambiguous, refuse what would need a guess.**
+The rule is: **the declaration disambiguates.** Where inference has only the
+PHP type to go on and trusts it, a declared field has your word for what it is,
+so a value that merely needs converting gets converted — and one that would
+need guessing at gets refused.
 A `DECIMAL` column arrives from PDO as `'129.90'` and a `TINYINT(1)` as `'1'`,
-so those are converted; `'yes'` for a boolean is someone's convention rather
-than a fact, so it is refused. A field given a list where one value was
+so those are converted — declaring `number('price')` is exactly the cast you
+would otherwise have written yourself. `'yes'` for a boolean is someone's
+convention rather than a fact, so it is refused.
+
+The same reasoning applies to the values you filter *with*: a numeric column
+accepts `'200'` from `$_GET`, because by then there is nothing left to guess
+at. A field given a list where one value was
 declared is refused with the fix in the message — `declare the field with
 tags()`.
 

@@ -726,10 +726,11 @@ final class SegmentIndex
             }
         }
 
-        $column = $this->column($filter['field']);
+        $field  = (string) $filter['field'];
+        $column = $this->column($field);
 
         if ($column === null) {
-            throw new FilterException("No filterable column for field '{$filter['field']}'");
+            throw new FilterException("No filterable column for field '$field'" . $this->becauseInferred($field));
         }
 
         $value = $filter['value'];
@@ -743,20 +744,31 @@ final class SegmentIndex
                 'not in'      => $column->in((array) $value)->not()->and($column->exists()),
                 'exists'      => $column->exists(),
                 'missing'     => $column->missing(),
-                default       => throw new FilterException("Operator '$op' does not apply to a keyword field"),
+                default       => throw new FilterException($this->wrongOperator($op, $field, 'keyword')),
             };
         }
 
-        $number = static function (mixed $value): float {
+        $number = static function (mixed $value) use ($field): float {
             if (is_bool($value)) {
                 return $value ? 1.0 : 0.0;
             }
 
-            if (!is_int($value) && !is_float($value)) {
-                throw new FilterException('Numeric filters expect an int or a float');
+            if (is_int($value) || is_float($value)) {
+                return (float) $value;
             }
 
-            return (float) $value;
+            // A price slider in a web form sends '60', never 60. The column is
+            // already known to be numeric, so there is nothing to guess at —
+            // the same reasoning that lets a declared number field accept
+            // '129.90' from a database driver.
+            if (is_string($value) && is_numeric($value)) {
+                return (float) $value;
+            }
+
+            throw new FilterException(
+                "Filter on '$field' expects a number, got " . get_debug_type($value)
+                . (is_string($value) ? ' ' . var_export($value, true) : '')
+            );
         };
 
         return match ($op) {
@@ -769,8 +781,46 @@ final class SegmentIndex
             'between'   => $column->range($number(((array) $value)[0]), $number(((array) $value)[1])),
             'exists'    => $column->exists(),
             'missing'   => $column->missing(),
-            default     => throw new FilterException("Operator '$op' does not apply to a numeric field"),
+            default     => throw new FilterException($this->wrongOperator($op, $field, 'numeric')),
         };
+    }
+
+    /**
+     * Why an operator was refused, and what to do about it.
+     *
+     * A range operator on a keyword column is almost always the same story: the
+     * values arrived as strings, so inference called the field a keyword, and
+     * `<=` has no meaning over a value dictionary. Saying only that the
+     * operator does not apply leaves the caller to work that out themselves.
+     */
+    private function wrongOperator(string $op, string $field, string $kind): string
+    {
+        return "Operator '$op' does not apply to the $kind field '$field'"
+            . $this->becauseInferred($field);
+    }
+
+    /**
+     * The hint to append when a field's type was guessed rather than declared.
+     *
+     * Only for an inferred schema: if the caller declared the type themselves,
+     * telling them what they declared is noise.
+     */
+    private function becauseInferred(string $field): string
+    {
+        if (!$this->schema->isInferred()) {
+            return '';
+        }
+
+        $type = $this->schema->typeOf($field);
+
+        if ($type === null) {
+            return ". The schema was inferred and holds no field '$field'"
+                . ' — a field absent from the schema is stored but never filtered';
+        }
+
+        return ". Its type was inferred as $type from the values it was given"
+            . ' — pass numbers as int or float rather than as strings, or declare the field'
+            . ' with Schema::number() to settle it';
     }
 
     /**
