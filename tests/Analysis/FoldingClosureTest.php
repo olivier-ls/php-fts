@@ -39,21 +39,21 @@ class FoldingClosureTest extends TestCase
     private const LAST_CODEPOINT = 0x2FA1F;
 
     /**
-     * How far from closed the tables are today. **Both numbers are countdowns
-     * to zero**, and neither may ever go up.
+     * **Both are closed, and both must stay closed.**
      *
-     * They are here rather than as a plain `assertSame(0, …)` because closing
-     * them is a body of work — a generated case-folding table, and a decision
-     * per script about its punctuation — that will land over several commits
-     * and possibly after 2.0. A test that stays red for weeks stops being a
-     * signal and starts being noise, and the next real regression hides behind
-     * it. A ceiling that only ever falls keeps the gate meaningful in the
-     * meantime: it cannot get worse, and the message prints what is left.
+     * They were 916 and 79 when this test was written, and were ceilings then
+     * rather than assertions: closing them was a body of work — a generated
+     * case-folding table, twelve scripts that had been missing outright, and a
+     * decision per script about its punctuation — that could not land in one
+     * commit, and a test that stays red for weeks stops being a signal.
      *
-     * Lower them in the same commit that earns it.
+     * They are zero now, so the ceiling and the assertion are the same thing.
+     * The form is kept because the ceiling is what makes *adding a script* safe:
+     * a new range brings its own punctuation and its own capitals with it, and
+     * this will say how many before anyone has to find out from a user.
      */
-    private const CASE_GAPS = 916;
-    private const PUNCTUATION_GAPS = 79;
+    private const CASE_GAPS = 0;
+    private const PUNCTUATION_GAPS = 0;
 
     /**
      * Every code point `Script::of()` claims for a writing system.

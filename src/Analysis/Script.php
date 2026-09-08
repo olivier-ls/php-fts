@@ -28,13 +28,25 @@ namespace Ols\PhpFts\Analysis;
  */
 enum Script
 {
-    // Written with spaces between words → padded trigrams.
+    // Written with spaces between words → one word is one term.
     case Latin;
     case Cyrillic;
     case Greek;
     case Arabic;
     case Hebrew;
     case Devanagari;
+    case Bengali;
+    case Gurmukhi;
+    case Gujarati;
+    case Oriya;
+    case Tamil;
+    case Telugu;
+    case Kannada;
+    case Malayalam;
+    case Sinhala;
+    case Armenian;
+    case Georgian;
+    case Ethiopic;
 
     // Written without spaces → bigrams over the run.
     case Han;
@@ -91,6 +103,20 @@ enum Script
      * Only the ranges the engine can index are named; everything else — Latin
      * punctuation, symbols, emoji, control characters, unassigned code points —
      * is a Separator, so it breaks runs and never reaches the index.
+     *
+     * ── Why a block is not a set of letters ────────────────────────────────
+     *
+     * {@see blockOf()} answers by Unicode block, and a block holds its script's
+     * own punctuation alongside its letters. Left at that, the Arabic comma is
+     * a letter: `كتاب، جديد` yields the term `كتاب،`, which no query for
+     * `كتاب` ever produces. The Hebrew maqaf glues `בית־ספר` into one term, the
+     * Devanagari danda ends every Hindi sentence and rides on its last word,
+     * and `×` makes `3×4` a single unsearchable token.
+     *
+     * So the block answer is filtered through {@see FoldingTables::NOT_LETTERS},
+     * which is generated from Unicode's own general categories — every claimed
+     * code point that is punctuation or a symbol. One `isset` on an int-keyed
+     * array, after the ASCII fast path that most text never leaves.
      */
     public static function of(int $codepoint): self
     {
@@ -106,12 +132,50 @@ enum Script
             return self::Separator;
         }
 
+        return isset(FoldingTables::NOT_LETTERS[$codepoint])
+            ? self::Separator
+            : self::blockOf($codepoint);
+    }
+
+    /**
+     * Which block a code point falls in, punctuation included.
+     *
+     * Separated from {@see of()} so that the generator in `tools/` can ask what
+     * the ranges *claim* — which is the input it needs to work out what to
+     * exclude. Asking `of()` would be circular: once the exclusions exist, the
+     * excluded code points stop being claimed and regenerating would produce an
+     * empty list.
+     *
+     * @internal for tools/generate-folding.php and the closure test
+     */
+    public static function blockOf(int $codepoint): self
+    {
+        if ($codepoint < 0x80) {
+            if (($codepoint >= 0x61 && $codepoint <= 0x7A)
+                || ($codepoint >= 0x41 && $codepoint <= 0x5A)
+                || ($codepoint >= 0x30 && $codepoint <= 0x39)
+            ) {
+                return self::Latin;
+            }
+
+            return self::Separator;
+        }
+
         return match (true) {
             // Latin supplement, Extended-A, Extended-B, Extended Additional.
             // Digits are treated as Latin so that "iphone12" stays one run,
             // matching 1.x's behaviour, rather than splitting on the digit.
             $codepoint >= 0x00C0 && $codepoint <= 0x024F,
-            $codepoint >= 0x1E00 && $codepoint <= 0x1EFF => self::Latin,
+            $codepoint >= 0x1E00 && $codepoint <= 0x1EFF,
+
+            // Extended-C, D and E. Rare — phonetic transcription, Cornish, Old
+            // Irish, medieval abbreviations — and they earn their line by
+            // closing the case property rather than by their traffic: the
+            // capitals of ȿ and ɀ live in Extended-C, so leaving it out left
+            // two Latin letters whose two cases could never meet.
+            $codepoint >= 0x2C60 && $codepoint <= 0x2C7F,
+            $codepoint >= 0xA720 && $codepoint <= 0xA7FF,
+            $codepoint >= 0xAB30 && $codepoint <= 0xAB6F => self::Latin,
 
             $codepoint >= 0x0370 && $codepoint <= 0x03FF,
             $codepoint >= 0x1F00 && $codepoint <= 0x1FFF => self::Greek,
@@ -124,6 +188,32 @@ enum Script
             $codepoint >= 0x08A0 && $codepoint <= 0x08FF => self::Arabic,
 
             $codepoint >= 0x0900 && $codepoint <= 0x097F => self::Devanagari,
+
+            // The rest of the Brahmic family, all written with spaces between
+            // words exactly as Devanagari is. They were absent rather than
+            // rejected, which meant `চামড়ার জুতা` analysed to nothing at all —
+            // the same silent deletion that 1.x's `[^a-z0-9]+` performed on
+            // Cyrillic and Japanese, and that this release exists to end.
+            $codepoint >= 0x0980 && $codepoint <= 0x09FF => self::Bengali,
+            $codepoint >= 0x0A00 && $codepoint <= 0x0A7F => self::Gurmukhi,
+            $codepoint >= 0x0A80 && $codepoint <= 0x0AFF => self::Gujarati,
+            $codepoint >= 0x0B00 && $codepoint <= 0x0B7F => self::Oriya,
+            $codepoint >= 0x0B80 && $codepoint <= 0x0BFF => self::Tamil,
+            $codepoint >= 0x0C00 && $codepoint <= 0x0C7F => self::Telugu,
+            $codepoint >= 0x0C80 && $codepoint <= 0x0CFF => self::Kannada,
+            $codepoint >= 0x0D00 && $codepoint <= 0x0D7F => self::Malayalam,
+            $codepoint >= 0x0D80 && $codepoint <= 0x0DFF => self::Sinhala,
+
+            $codepoint >= 0x0530 && $codepoint <= 0x058F => self::Armenian,
+
+            // Three blocks, because Georgian encodes its cases apart: Mkhedruli
+            // is the everyday one, Mtavruli its capitals, Nuskhuri the
+            // ecclesiastical lower case.
+            $codepoint >= 0x10A0 && $codepoint <= 0x10FF,
+            $codepoint >= 0x1C90 && $codepoint <= 0x1CBF,
+            $codepoint >= 0x2D00 && $codepoint <= 0x2D2F => self::Georgian,
+
+            $codepoint >= 0x1200 && $codepoint <= 0x139F => self::Ethiopic,
 
             $codepoint >= 0x0E00 && $codepoint <= 0x0E7F => self::Thai,
             $codepoint >= 0x0E80 && $codepoint <= 0x0EFF => self::Lao,

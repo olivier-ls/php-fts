@@ -20,29 +20,27 @@ class CharacterFolderTest extends TestCase
     // that; a list of examples does not.
     // =========================================================================
 
-    #[Test]
-    public function lowercasing_is_idempotent(): void
-    {
-        // The guard that would have caught the real bug in this file: Latin
-        // Extended-A does not keep the same upper/lower parity throughout, so
-        // an even *lowercase* letter such as ł (U+0142) was being "lowercased"
-        // into Ń (U+0143). Folding twice would then have moved it again.
-        for ($codepoint = 0; $codepoint <= 0x2FFF; $codepoint++) {
-            $once  = CharacterFolder::caseFold($codepoint);
-            $twice = CharacterFolder::caseFold($once);
-
-            $this->assertSame(
-                $once,
-                $twice,
-                sprintf('U+%04X folds to U+%04X, which folds again to U+%04X', $codepoint, $once, $twice)
-            );
-        }
-    }
+    // `lowercasing_is_idempotent` and `no_lowercase_letter_is_moved_by_case_folding`
+    // stood here and are gone with `caseFold()`, which was the intermediate step
+    // they tested. Neither property was lost: case symmetry is now asserted over
+    // *every* code point the engine claims, in FoldingClosureTest, which is a
+    // far wider net than two hand-listed ranges — and the idempotence half is
+    // the sweep below, which reaches the same conclusion through the only method
+    // a caller can actually see.
 
     #[Test]
     public function folding_is_idempotent(): void
     {
-        for ($codepoint = 0; $codepoint <= 0x2FFF; $codepoint++) {
+        // The guard that would have caught the original bug in this file: Latin
+        // Extended-A does not keep the same upper/lower parity throughout, so
+        // an even *lowercase* letter such as ł (U+0142) was being "lowercased"
+        // into Ń (U+0143). Folding twice would then have moved it again.
+        //
+        // The range is the whole Basic Multilingual Plane now rather than
+        // 0x2FFF, because a generated table is exactly as trustworthy as the
+        // sweep over it: Georgian Mtavruli at U+1C90 and the presentation-form
+        // ligatures at U+FB00 both sit past where this used to stop.
+        for ($codepoint = 0; $codepoint <= 0xFFFF; $codepoint++) {
             $folded = CharacterFolder::fold($codepoint);
 
             if ($folded === '') {
@@ -59,27 +57,27 @@ class CharacterFolderTest extends TestCase
     }
 
     #[Test]
-    public function no_lowercase_letter_is_moved_by_case_folding(): void
+    public function an_unaccented_lowercase_letter_folds_to_itself(): void
     {
-        // Every lowercase Latin, Greek and Cyrillic letter must be a fixed
-        // point. Checked against the code points the folder claims to know.
+        // Folding is allowed to remove accents; it is not allowed to move a
+        // letter that has none. The Greek and Cyrillic ranges are the ones
+        // worth sweeping — Latin loses its diacritics on purpose, so a-z is
+        // the only stretch of it where this holds unconditionally.
         $lowercase = array_merge(
             range(0x61, 0x7A),      // a-z
-            range(0xE0, 0xFE),      // Latin-1 lowercase
             range(0x3B1, 0x3C9),    // Greek lowercase
             range(0x430, 0x44F),    // Cyrillic lowercase
-            range(0x450, 0x45F),    // Cyrillic ѐ-џ
         );
 
         foreach ($lowercase as $codepoint) {
-            if ($codepoint === 0xF7) {   // division sign, not a letter
+            if ($codepoint === 0x3C2) {   // final sigma, folded onto σ on purpose
                 continue;
             }
 
             $this->assertSame(
-                $codepoint,
-                CharacterFolder::caseFold($codepoint),
-                sprintf('U+%04X is already lowercase', $codepoint)
+                Utf8::chr($codepoint),
+                CharacterFolder::fold($codepoint),
+                sprintf('U+%04X is already lowercase and unaccented', $codepoint)
             );
         }
     }
