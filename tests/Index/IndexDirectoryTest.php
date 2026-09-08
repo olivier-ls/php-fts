@@ -7,6 +7,7 @@ namespace Ols\PhpFts\Tests\Index;
 use Ols\PhpFts\Exception\StorageException;
 use Ols\PhpFts\Index\IndexDirectory;
 use Ols\PhpFts\Index\MergePolicy;
+use Ols\PhpFts\Schema;
 use Ols\PhpFts\Storage\Manifest;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
@@ -896,6 +897,123 @@ class IndexDirectoryTest extends TestCase
         $this->assertCount(1, glob($this->dir . '/seg_*.fts') ?: []);
         $this->assertSame(20, $reopened->count(), 'and the index is still whole');
         $this->assertSame(20, $reopened->search('cuir')->total);
+    }
+
+    // =========================================================================
+    // An import spills into several segments, and is still one transaction
+    // =========================================================================
+
+    /**
+     * A policy that spills after every document, so the behaviour is exercised
+     * without an import large enough to actually exhaust anything.
+     *
+     * `segmentsPerTier` is raised out of the way on purpose: the automatic
+     * merge that follows a commit would otherwise collapse what was just spilled
+     * and the test could not see it happen.
+     */
+    private function spilling(?Schema $schema = null): IndexDirectory
+    {
+        return IndexDirectory::open(
+            $this->dir,
+            $schema,
+            policy: new MergePolicy(segmentsPerTier: 1000, memoryBudgetBytes: 1),
+        );
+    }
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    private function batch(int $count): array
+    {
+        $documents = [];
+
+        for ($n = 0; $n < $count; $n++) {
+            $documents["sku-$n"] = ['title' => "chaussure cuir numero $n", 'price' => 10.0 + $n];
+        }
+
+        return $documents;
+    }
+
+    #[Test]
+    public function a_large_import_spills_into_several_segments(): void
+    {
+        $index = $this->spilling();
+        $index->putMany($this->batch(12));
+
+        $this->assertGreaterThan(
+            1,
+            count(glob($this->dir . '/seg_*.fts') ?: []),
+            'the import was supposed to spill'
+        );
+
+        $this->assertSame(12, $index->count());
+        $this->assertSame(12, $index->search('cuir')->total, 'and every document is searchable');
+    }
+
+    #[Test]
+    public function a_spilled_import_is_still_one_commit(): void
+    {
+        // The property the spilling must not cost: a reader sees the whole
+        // batch or none of it. Segments are written before the commit and are
+        // named by no manifest until it lands, which is the same invisibility
+        // that makes a half-finished merge debris rather than damage.
+        $index = $this->spilling();
+
+        $before = count(Manifest::generations($this->dir));
+        $index->putMany($this->batch(12));
+        $after = count(Manifest::generations($this->dir));
+
+        $this->assertSame($before + 1, $after, 'twelve segments, one commit');
+    }
+
+    #[Test]
+    public function an_import_that_fails_partway_leaves_nothing_behind(): void
+    {
+        // Declared rather than inferred, because a declared type is the one the
+        // schema enforces — inference decides what a field *is*, it does not
+        // refuse what disagrees with it.
+        $index = $this->spilling(Schema::make()->text('title')->number('price'));
+
+        $documents = (function (): \Generator {
+            yield 'sku-1' => ['title' => 'chaussure cuir', 'price' => 10.0];
+            yield 'sku-2' => ['title' => 'botte cuir', 'price' => 20.0];
+            yield 'sku-3' => ['title' => 'sandale', 'price' => ['not', 'a', 'number']];
+        })();
+
+        try {
+            $index->putMany($documents);
+            $this->fail('the malformed document should have taken its batch with it');
+        } catch (\Throwable) {
+            // Expected.
+        }
+
+        $this->assertSame(0, $this->index()->count(), 'the index is exactly as it was');
+
+        // Not merely invisible — gone. A segment named by no manifest is
+        // already unreadable, but nothing else would ever collect it, so a
+        // refused import would leave its debris on disk for good.
+        $this->assertSame([], glob($this->dir . '/seg_*.fts') ?: []);
+    }
+
+    #[Test]
+    public function a_duplicate_id_is_refused_across_a_spill(): void
+    {
+        // The writer's own duplicate check is per-segment, so it stops seeing
+        // across a spill. A generator can yield the same key twice where an
+        // array cannot, and `put()` is documented as idempotent, so two live
+        // copies of one id would be a silent contradiction of that.
+        $index = $this->spilling();
+
+        $documents = (function (): \Generator {
+            yield 'sku-1' => ['title' => 'chaussure cuir'];
+            yield 'sku-2' => ['title' => 'botte cuir'];
+            yield 'sku-1' => ['title' => 'chaussure cuir again'];
+        })();
+
+        $this->expectException(StorageException::class);
+        $this->expectExceptionMessage("Duplicate document id in this batch: 'sku-1'");
+
+        $index->putMany($documents);
     }
 
     #[Test]

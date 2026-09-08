@@ -275,6 +275,25 @@ final class MergePolicy
      * The share of the process's remaining memory a merge may plan to use,
      * or null when there is no limit to take a share of.
      */
+    /**
+     * Bytes an index-building operation may plan to use, or null when there is
+     * no `memory_limit` to take a share of.
+     *
+     * A merge turns this into a document count, because a carried document
+     * costs a predictable amount. An import cannot: what a document costs to
+     * *analyse* depends on how much text it holds, and a catalogue of one-line
+     * titles and one of thousand-word descriptions differ by two orders of
+     * magnitude. So the import side spends this budget by watching, not by
+     * predicting — see `IndexDirectory::putMany()`.
+     *
+     * Public for that caller. It is the same question either way: how much of
+     * what is left may this operation plan on.
+     */
+    public function budgetBytes(): ?int
+    {
+        return $this->memoryBudgetBytes ?? $this->freeShare();
+    }
+
     private function freeShare(): ?int
     {
         if ($this->memoryFraction <= 0.0) {

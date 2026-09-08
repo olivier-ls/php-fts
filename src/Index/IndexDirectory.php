@@ -92,6 +92,25 @@ final class IndexDirectory
     /** Commit files kept behind the newest, so a rollback has somewhere to land. */
     private const COMMITS_KEPT = 3;
 
+    /**
+     * How much more an import peaks at than the documents it is holding.
+     *
+     * `put()` keeps the document and nothing else; the term map is built inside
+     * `write()`, and that is the peak. Measured on the reference catalogue,
+     * three scales, documents held against peak allocation:
+     *
+     *      5 000 documents    10 MB ->  40 MB   4.0x
+     *     15 000 documents    36 MB -> 120 MB   3.3x
+     *     30 000 documents    72 MB -> 242 MB   3.4x
+     *
+     * Stable, and it should be: both sides scale with the same text. That is
+     * what makes a ratio usable here where an absolute figure per document is
+     * not — a catalogue of one-line titles and one of thousand-word
+     * descriptions differ by two orders of magnitude on the second and not on
+     * the first. Rounded up to 4, the safe way, as MergePolicy rounds its own.
+     */
+    private const WRITE_PEAK_FACTOR = 4;
+
     private function __construct(
         private readonly string $directory,
         private readonly LockManager $lock,
@@ -289,30 +308,121 @@ final class IndexDirectory
             // this object was opened, and its work must not be dropped.
             $this->load();
 
-            // The frozen schema goes to every new segment, not only to merges:
-            // otherwise a later batch could infer a different type for a field
-            // and a filter would work on some segments and fail on others.
-            $writer = new SegmentIndexWriter(null, $this->frozenSchema());
+            // ── Why this spills into several segments ─────────────────────
+            //
+            // Because one segment used to mean one batch, and a batch is the
+            // caller's whole input. Analysing a document holds it as a PHP
+            // array and holds its postings as a nested one, so the writer grew
+            // at a measured ~8 KB per document: 10 MB at a thousand documents,
+            // 38 MB at five thousand, **120 MB at fifteen thousand**. On a
+            // shared host with 128 MB the documented example — yielding rows
+            // straight out of a PDO cursor — died at about fifteen thousand of
+            // them, and the docblock on SearchEngine::putMany() promised the
+            // opposite in as many words.
+            //
+            // A segment is written when the writer's own growth crosses the
+            // budget, and a new one started. Nothing is published until the
+            // end, so the transaction is unharmed: a segment named by no
+            // manifest is invisible, which is the same property that lets a
+            // half-finished merge be debris rather than damage.
+            //
+            // Watched rather than predicted, unlike a merge's cap. What a
+            // document costs to analyse depends on how much text it holds, and
+            // a catalogue of one-line titles and one of thousand-word
+            // descriptions differ by two orders of magnitude — so a coefficient
+            // per document would be a guess where a subtraction is a fact.
+            //
+            // ── Two things measurement corrected here ──────────────────────
+            //
+            // **What the loop holds is not what the import costs.** `put()`
+            // only keeps the document; the postings map is built inside
+            // `write()`, and that is where the peak is. Watching the loop and
+            // comparing it against the whole budget therefore never fired: at
+            // five thousand documents the loop had grown 10 MB and the write
+            // peaked at 40. So the budget is divided by what the write
+            // multiplies it by — see WRITE_PEAK_FACTOR, which is a ratio
+            // between two quantities that both scale with the same text, and
+            // is measured stable where a per-document figure would not be.
+            //
+            // **`memory_get_usage(true)` cannot see a spill happen.** It
+            // reports what the allocator holds from the OS, and that never
+            // shrinks: after the first segment is written the high-water mark
+            // stays, so the next document would look like it had already blown
+            // the budget and every one after it would spill alone. The
+            // accounted figure drops when the writer is released, which is
+            // exactly the event being waited on.
+            $budget   = $this->policy->budgetBytes();
+            $baseline = memory_get_usage();
 
-            $replacing = [];
-
-            foreach ($documents as $id => $document) {
-                $id = (string) $id;
-                $writer->put($id, $document);
-
-                $located = $this->locate($id);
-
-                if ($located !== null) {
-                    $replacing[] = $located;
-                }
+            if ($budget !== null) {
+                $budget = intdiv($budget, self::WRITE_PEAK_FACTOR);
             }
 
-            if ($writer->count() === 0) {
+            // Fixed for the whole import. The first segment may infer it; every
+            // one after that is handed what the first decided, because
+            // inference reads the batch it is given and two segments of one
+            // import must not disagree about a field's type.
+            $schema = $this->frozenSchema();
+
+            $writer    = new SegmentIndexWriter(null, $schema);
+            $written   = [];
+            $replacing = [];
+            $inferred  = null;
+
+            // Batch-wide, because the writer's own duplicate check is
+            // per-segment and would stop seeing across a spill. One small entry
+            // per id, against the ~8 KB the writer holds for the same document.
+            $seen = [];
+
+            $spill = function (SegmentIndexWriter $full) use (&$written, &$inferred): void {
+                $name = $this->newSegmentName();
+                $full->write($this->segmentPath($name));
+
+                $inferred ??= $full->schema();
+                $written[]  = ['name' => $name, 'documents' => $full->count(), 'deleted' => ''];
+            };
+
+            try {
+                foreach ($documents as $id => $document) {
+                    $id = (string) $id;
+
+                    if (isset($seen[$id])) {
+                        throw new StorageException("Duplicate document id in this batch: '$id'");
+                    }
+
+                    $seen[$id] = true;
+                    $writer->put($id, $document);
+
+                    $located = $this->locate($id);
+
+                    if ($located !== null) {
+                        $replacing[] = $located;
+                    }
+
+                    if ($budget !== null && memory_get_usage() - $baseline > $budget) {
+                        $spill($writer);
+                        $writer = new SegmentIndexWriter(null, $schema ?? $inferred);
+                    }
+                }
+
+                if ($writer->count() > 0) {
+                    $spill($writer);
+                }
+            } catch (\Throwable $failure) {
+                // The segments written so far are named by no manifest and are
+                // therefore already invisible. Removing them anyway keeps a
+                // refused import from leaving its debris on disk for good —
+                // nothing else would ever collect them.
+                foreach ($written as $entry) {
+                    @unlink($this->segmentPath($entry['name']));
+                }
+
+                throw $failure;
+            }
+
+            if ($written === []) {
                 return;
             }
-
-            $name = $this->newSegmentName();
-            $writer->write($this->segmentPath($name));
 
             $segments = $this->manifest->segments;
 
@@ -327,16 +437,17 @@ final class IndexDirectory
                 $segments[$position]['deleted'] = $deleted->bytes();
             }
 
-            $segments[] = [
-                'name'      => $name,
-                'documents' => $writer->count(),
-                'deleted'   => '',
-            ];
+            foreach ($written as $entry) {
+                $segments[] = $entry;
+            }
 
+            // One commit for every segment the import produced, so the batch
+            // still lands whole or not at all.
+            //
             // The schema is frozen at the first commit and carried forward, so
             // that a later merge cannot re-infer a field into a different type.
             $this->commit($segments, schema: $this->manifest->schema === []
-                ? $writer->schema()->toArray()
+                ? ($inferred ?? Schema::make())->toArray()
                 : null);
 
             // Commit first, maintain second. The write is durable before any
