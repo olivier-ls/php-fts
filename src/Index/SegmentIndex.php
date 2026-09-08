@@ -870,19 +870,41 @@ final class SegmentIndex
             // a slot counts once, for the closest thing to what was typed.
             //
             // What it costs, stated: a document saying `couteau` twice and
-            // `couteaux` once now carries 2.0 rather than 2.857. The plural
-            // stops adding on top of the singular. That is the honest price of
-            // the property, and `tests/Query/RelevanceTest.php` holds both ends
-            // of it — near misses may not stack, and the typed word's own
+            // `couteaux` once carries 2.0 rather than 2.857. The plural stops
+            // adding on top of the singular. That is the honest price of the
+            // property, and `tests/Query/RelevanceTest.php` holds both ends of
+            // it — near misses may not stack, and the typed word's own
             // repetition must still count.
             //
-            // Weighting the *frequency* rather than the finished score is
-            // unchanged and still load-bearing: it makes the difference work
-            // through the saturation instead of around it. An earlier version
-            // multiplied the score afterwards, which let a distant variant
-            // occurring often beat the exact word occurring once.
+            // ── Why the weight is applied to the score, not to the frequency ─
             //
-            // @var array<int, array<int, float>> ordinal => bit => weighted tf
+            // Because those are different axes and BM25 has one slot for them.
+            // A variant's weight says how sure the reader is that this is the
+            // word that was meant; term frequency says how much the document
+            // talks about it. Multiplying the weight into `tf` trades the first
+            // against the second, and `tf` is unbounded, so it always loses:
+            // `Ranger Point Precision Ranger Point Precision` says `point`
+            // twice, and 0.667 × 2 = 1.334 beat the exact word's 1.0. A doubt
+            // about *which word this is* cannot be repaired by repetition, so
+            // it must not be expressible in the same units as repetition.
+            //
+            // So each variant is scored whole — its own raw frequencies,
+            // normalised per field and saturated — and the weight multiplies
+            // the finished number. A slot then takes the best of those, which
+            // is what "one word, one match, read as well as it can be" means.
+            // One posting carries a variant's frequency in every field at once,
+            // so this needs no extra pass and no per-variant map: the score is
+            // finished where the posting is read.
+            //
+            // The remaining exposure, since it should be written down rather
+            // than discovered: no multiplicative weight makes *every* exact
+            // match beat *every* near miss, because saturation tops out at
+            // k1 + 1 and 0.667 × 2.2 is still 1.47. A near miss said ten times
+            // outranks the word said once. That is arguably correct, and it is
+            // out of reach of anything but refusing the candidate — which is
+            // what the prefix anchor in TermExpansion does.
+            //
+            // @var array<int, float> ordinal => this slot's best variant score
             $reached = [];
 
             foreach ($slot->candidates as [$term, $weight]) {
@@ -902,31 +924,25 @@ final class SegmentIndex
                 while ($cursor->current() !== PostingsFormat::END) {
                     $ordinal = $cursor->current();
 
-                    foreach ($this->frequenciesAt($records, $index) as $bit => $frequency) {
-                        $reached[$ordinal][$bit] = max(
-                            $reached[$ordinal][$bit] ?? 0.0,
-                            $weight * $frequency
-                        );
-                    }
+                    $reached[$ordinal] = max(
+                        $reached[$ordinal] ?? 0.0,
+                        $weight * $this->scorer->fieldedScore($slot->idf, $this->scorer->fieldedFrequency(
+                            $this->frequenciesAt($records, $index),
+                            $weightByBit,
+                            $this->fieldLengthsOf($ordinal),
+                            $averages,
+                            $bByBit,
+                        ))
+                    );
 
                     $index++;
                     $cursor->next();
                 }
             }
 
-            foreach ($reached as $ordinal => $frequencies) {
+            foreach ($reached as $ordinal => $slotScore) {
                 $gathered[$ordinal] = ($gathered[$ordinal] ?? 0.0) + $slot->idf;
-
-                $combined = $this->scorer->fieldedFrequency(
-                    $frequencies,
-                    $weightByBit,
-                    $this->fieldLengthsOf($ordinal),
-                    $averages,
-                    $bByBit,
-                );
-
-                $weights[$ordinal] = ($weights[$ordinal] ?? 0.0)
-                    + $this->scorer->fieldedScore($slot->idf, $combined);
+                $weights[$ordinal]  = ($weights[$ordinal] ?? 0.0) + $slotScore;
             }
         }
 
@@ -1153,11 +1169,11 @@ final class SegmentIndex
     ): array {
         [$driverSlot, $driverPosition] = $driver;
 
-        /** @var array<int, array<int, array<int, float>>> ordinal => slot => bit => weighted tf */
+        /** @var array<int, array<int, float>> ordinal => slot => that slot's best variant score */
         $reached = [];
 
-        foreach ($this->slotFrequencies($driverSlot) as $ordinal => $frequencies) {
-            $reached[$ordinal][$driverPosition] = $frequencies;
+        foreach ($this->slotScores($driverSlot, $weightByBit, $averages, $bByBit) as $ordinal => $score) {
+            $reached[$ordinal][$driverPosition] = $score;
         }
 
         if ($reached === []) {
@@ -1196,16 +1212,21 @@ final class SegmentIndex
                         continue;
                     }
 
-                    // The best reading of this slot in this field, not the sum
-                    // of its variants — see matchQuery(), which explains why
-                    // and what it costs. The two walks have to agree, so the
-                    // rule lives in both.
-                    foreach ($this->frequenciesAt($records, $cursor->index()) as $bit => $frequency) {
-                        $reached[$ordinal][$position][$bit] = max(
-                            $reached[$ordinal][$position][$bit] ?? 0.0,
-                            $weight * $frequency
-                        );
-                    }
+                    // Each variant scored whole, the slot keeping the best —
+                    // see matchQuery(), which explains why the weight belongs
+                    // on the score rather than on the frequency. The two walks
+                    // have to agree hit for hit *and score for score*, so the
+                    // rule lives in both and DrivenWalkTest says so.
+                    $reached[$ordinal][$position] = max(
+                        $reached[$ordinal][$position] ?? 0.0,
+                        $weight * $this->scorer->fieldedScore($slot->idf, $this->scorer->fieldedFrequency(
+                            $this->frequenciesAt($records, $cursor->index()),
+                            $weightByBit,
+                            $this->fieldLengthsOf($ordinal),
+                            $averages,
+                            $bByBit,
+                        ))
+                    );
                 }
             }
         }
@@ -1216,23 +1237,19 @@ final class SegmentIndex
 
         foreach ($reached as $ordinal => $bySlot) {
             $gathered = 0.0;
+            $score    = 0.0;
 
-            foreach (array_keys($bySlot) as $position) {
+            // The slots a document reached, and what they came to. Both are
+            // read off the same map now that a slot's contribution is finished
+            // where its posting was read — the threshold and the score are one
+            // pass rather than two.
+            foreach ($bySlot as $position => $slotScore) {
                 $gathered += $plan->slots[$position]->idf;
+                $score    += $slotScore;
             }
 
             if ($gathered < $required) {
                 continue;
-            }
-
-            $lengths = $this->fieldLengthsOf($ordinal);
-            $score   = 0.0;
-
-            foreach ($bySlot as $position => $frequencies) {
-                $score += $this->scorer->fieldedScore(
-                    $plan->slots[$position]->idf,
-                    $this->scorer->fieldedFrequency($frequencies, $weightByBit, $lengths, $averages, $bByBit),
-                );
             }
 
             $matches->set($ordinal);
@@ -1243,13 +1260,22 @@ final class SegmentIndex
     }
 
     /**
-     * One slot's postings in this segment: ordinal => weighted frequency per
-     * field, with its variants already blended.
+     * One slot's postings in this segment: ordinal => what the slot came to
+     * there, its variants already reduced to the best reading.
      *
-     * @return array<int, array<int, float>>
+     * The driver's half of the walk. Its counterpart is the loop in
+     * matchDriven() that jumps the other slots through, and the two have to
+     * produce the same shape — a finished per-slot score — because the caller
+     * adds them up without knowing which walk produced which.
+     *
+     * @param array<int, float> $weightByBit
+     * @param array<int, float> $averages
+     * @param array<int, float> $bByBit
+     *
+     * @return array<int, float>
      * @throws CorruptSegmentException
      */
-    private function slotFrequencies(QuerySlot $slot): array
+    private function slotScores(QuerySlot $slot, array $weightByBit, array $averages, array $bByBit): array
     {
         $found = [];
 
@@ -1270,11 +1296,18 @@ final class SegmentIndex
             while ($cursor->current() !== PostingsFormat::END) {
                 $ordinal = $cursor->current();
 
-                // Same rule as the other two walks: the best variant, not the
-                // sum. See matchQuery().
-                foreach ($this->frequenciesAt($records, $index) as $bit => $frequency) {
-                    $found[$ordinal][$bit] = max($found[$ordinal][$bit] ?? 0.0, $weight * $frequency);
-                }
+                // Same rule as the other two walks: each variant scored whole,
+                // the slot keeping the best. See matchQuery().
+                $found[$ordinal] = max(
+                    $found[$ordinal] ?? 0.0,
+                    $weight * $this->scorer->fieldedScore($slot->idf, $this->scorer->fieldedFrequency(
+                        $this->frequenciesAt($records, $index),
+                        $weightByBit,
+                        $this->fieldLengthsOf($ordinal),
+                        $averages,
+                        $bByBit,
+                    ))
+                );
 
                 $index++;
                 $cursor->next();
