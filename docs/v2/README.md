@@ -117,7 +117,7 @@ rather than a count of words. In `couteau de cuisine inox`, `de` sits in 38 555
 of 45 000 documents and carries 1.8% of what the query is about — so it cannot
 satisfy anything on its own, while `cuisine` at 52% is close to mandatory. That
 is what a person typing those four words meant, and counting words instead
-reported 17 728 matches where the truthful answer was 1 080.
+reported 17 728 matches where the truthful answer was 1 140.
 
 **What it does not do.** It does not find a word buried inside a longer one:
 `inox` will not return the *Victorinox* brand, and that is deliberate — the
@@ -141,8 +141,8 @@ not a fallback — finding word boundaries there needs a segmentation dictionary
 which this library does not ship and does not intend to. For everything else a
 word is the term, and tolerance for a misspelling or an unfinished word is
 resolved against the **vocabulary** at query time rather than baked into the
-documents. That is the change that made a four-word search cost 293 ms instead
-of 2.3 seconds, and made it return 1 080 documents instead of 10 877.
+documents. That is the change that made a four-word search cost 319 ms instead
+of 2.3 seconds, and made it return 1 140 documents instead of 10 877.
 
 Nothing to configure. The analyzer detects the script per field and adapts.
 

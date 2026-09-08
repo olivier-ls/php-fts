@@ -37,13 +37,18 @@ Measured on a 45 000-product catalogue, warm, one segment:
 
 | query | 1.x terms | 2.0 | matches then → now |
 |---|---|---|---|
-| `steel` | 210.7 ms | **23.8 ms** | 2 945 → 1 400 |
-| `steel cold` | 443.5 ms | **62.9 ms** | 1 421 → 758 |
-| `stel` (a typo) | 181.0 ms | **32.8 ms** | 2 831 → 1 528 |
-| `couteau de cuisine inox` | 2 261.7 ms | **293.0 ms** | 10 877 → 1 080 |
-| `couteau de cuisine inox pliant` | 2 833.6 ms | **587.1 ms** | 11 469 → 427 |
+| `steel` | 210.7 ms | **24.9 ms** | 2 945 → 1 412 |
+| `steel cold` | 443.5 ms | **68.5 ms** | 1 421 → 758 |
+| `stel` (a typo) | 181.0 ms | **33.5 ms** | 2 831 → 1 530 |
+| `leath` (a prefix) | — | **10.0 ms** | — → 249 |
+| `chromé` | 252.2 ms | **28.0 ms** | 528 → 496 |
+| with 4 facets | 340.0 ms | **141.1 ms** | |
+| `couteau de cuisine inox` | 2 261.7 ms | **318.6 ms** | 10 877 → 1 140 |
+| `couteau de cuisine inox pliant` | 2 833.6 ms | **432.0 ms** | 11 469 → 721 |
 
-Index size 71 MB → 69.8 MB.
+Index size 71 MB → 69.8 MB. The four-word query is the one case still above the
+150 ms a results page is budgeted; four fifths of what remains is walking
+posting lists, and the mandatory-slot driver already halved it.
 
 **Results changed, deliberately and for the better.** The old threshold applied
 to a flat list of a query's trigrams with no notion of which word each came
@@ -80,6 +85,14 @@ and `Sencut Braxx` in its top five and now returns `POIGNARD PLIANT MUELA INOX`.
 
 ### Fixed
 
+- **A stray `<` no longer eats the rest of the text.** `strip_tags()` treats
+  every `<` as the start of a tag and drops everything to the next `>`, or to
+  the end of the string when there is none — so a catalogue writing
+  `lame <3 mm` or `prix <30 euros` had the rest of its description missing from
+  the **index**, not only from the highlight, and the product could not be found
+  by any word after the bracket. HTML's own rule is narrower: a `<` opens a tag
+  only when a letter, `/`, `!` or `?` follows it. Real markup is stripped
+  exactly as before.
 - **An all-digit term came back as an integer.** `Analyzer::analyze()`
   deduplicates through array keys and PHP turns a numeric key into an int, so a
   model number or a year was rejected by every string signature downstream. The

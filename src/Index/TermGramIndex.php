@@ -131,16 +131,35 @@ final class TermGramIndex
     }
 
     /**
-     * One term appended to a gram's list, given the term written before it.
+     * One term appended to a gram's list, front-coded against the one before.
      *
-     * Front-coded against the previous term. Byte-wise rather than by
-     * character, which is safe because the result is only ever reassembled as
-     * bytes: a shared prefix cut in the middle of a UTF-8 sequence still
-     * rebuilds the same string.
+     * Byte-wise rather than by character, which is safe because the result is
+     * only ever reassembled as bytes: a shared prefix cut in the middle of a
+     * UTF-8 sequence still rebuilds the same string.
+     *
+     * ── The words are stored, and storing a number instead was tried ───────
+     *
+     * A term could be named by its **ordinal** in the term dictionary, as a
+     * delta varint, and the section would shrink from 7.7 MB to 918 KB on the
+     * reference catalogue. It was built, measured, and reverted.
+     *
+     * The reason is locality. The terms sharing a gram are scattered across the
+     * whole vocabulary — `couteau` and `route` both contain `out` and sit at
+     * opposite ends of the dictionary — so resolving ordinals back to words is
+     * a join with no locality at all. Measured on `stel`: 1 279 candidates
+     * spread over 362 blocks of 64, which is **3.5 wanted entries per block**,
+     * so 23 168 dictionary entries are decoded to obtain 1 279. Reading the
+     * gram lists cost 2.7 ms and resolving them cost 72.0 ms, against
+     * effectively nothing here — the word arrives *with* the list.
+     *
+     * A typo query went from 33 ms to 114. That is 6.8 MB bought on an index
+     * whose document store is 73% of it, in exchange for a third of the latency
+     * budget. Front coding earning little is a fair price for a join never
+     * happening: this is a space-for-time denormalisation, on purpose.
      */
     public static function append(string $term, string $previous): string
     {
-        $shared  = 0;
+        $shared   = 0;
         $shortest = min(strlen($previous), strlen($term));
 
         while ($shared < $shortest && $previous[$shared] === $term[$shared]) {
@@ -155,7 +174,7 @@ final class TermGramIndex
     /**
      * A gram's list of terms, back from its payload.
      *
-     * @return string[]
+     * @return string[] in key order
      */
     public static function decode(string $payload): array
     {

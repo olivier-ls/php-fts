@@ -191,11 +191,16 @@ tf 255 and of tf 4 000 differ by 0.4 %. The formula stops caring long before the
 byte does.
 
 Cost: one byte per field per posting, against one byte per posting for the
-bitmap. On the reference catalogue — three text fields, 2.1 M postings — 2.2 MB
-becomes 6.5 MB of a 70 MB index. **Written whatever the schema**, unlike the
-bitmap: a single-field schema's masks all held the same bit and said nothing,
-where a single field's *frequency* still says how often the document uses the
-word.
+bitmap it replaces — so it scales with how many fields the schema searches,
+which is the thing to know before declaring a wide one. On the reference
+catalogue that is **five** searchable fields (`name`, `description`, `model`,
+`brand`, `categories`) over 2 171 183 postings: 2.2 MB becomes **10.9 MB** of a
+69.8 MB index, and is the largest search structure in it. A three-field schema
+would pay 6.5 MB.
+
+**Written whatever the schema**, unlike the bitmap: a single-field schema's
+masks all held the same bit and said nothing, where a single field's *frequency*
+still says how often the document uses the word.
 
 ---
 
@@ -220,16 +225,43 @@ Terms of a continuous script are not written here: their terms are n-grams
 already and the query side never expands them, so a wholly Japanese vocabulary
 costs this section nothing.
 
-Front-coded because the writer builds it in memory bounded by the *vocabulary*
-rather than by the postings: terms arrive sorted, so each list is encoded as it
-grows and never held as an array of strings — 25 000 buffers of a few hundred
-bytes instead of 590 000 array slots. On a host that merges inside a
-`memory_limit`, that is the difference between a section and a crash.
+### Why the words are stored, and not a number pointing at them
 
-Cost, measured: 7.7 MB on the reference catalogue, which makes it the largest
-search structure in the segment — larger than the postings. **Known and not yet
-taken:** storing term ordinals as delta varints instead of the strings would
-bring it to roughly 1.2 MB. It changes no result and has not been done.
+This section costs **3.7 MB** on the reference catalogue once merged into one
+segment, and 7.7 MB spread across nine — a vocabulary is duplicated per segment,
+so this is one of the structures `optimize()` shrinks most. Either way front
+coding earns almost nothing, because the terms sharing an *interior* gram are
+not alphabetical neighbours: `couteau` and `route` both contain `out` and sit at
+opposite ends of the dictionary. Only the prefix grams compress.
+
+Naming each term by its **ordinal** in `§ terms` instead, as a delta varint,
+brings the section to **918 KB**. That was built, measured, and reverted, and
+the reason is the same locality the front coding failed on. Resolving an ordinal
+means decoding a dictionary block, and the candidates of one gram are scattered
+across the whole vocabulary. Measured on `stel`:
+
+    1 279 candidates, spread over 362 blocks of 64
+      = 3.5 wanted entries per block
+      = 23 168 dictionary entries decoded to obtain 1 279
+
+    reading the gram lists      2.7 ms
+    resolving the ordinals     72.0 ms
+
+A typo query went from **33.5 ms to 114.1**, and `chromé` from 28.0 to 95.1,
+with everything else held constant. Storing the word means the join never
+happens at all: it arrives *with* the list. So this is a space-for-time
+denormalisation on purpose — 2.8 MB on an index whose document store is 70% of
+it, against three times the latency on exactly the queries tolerance exists for.
+
+Worth revisiting only alongside the block size, which is 64 because that suited
+`§ terms`. At 8 the waste would fall by roughly half, at some cost to `§ terms`
+itself and to every `get()`.
+
+The writer builds this in memory bounded by the *vocabulary* rather than by the
+postings: terms arrive sorted, so each list is encoded as it grows and never
+held as an array of strings — 25 000 buffers of a few hundred bytes instead of
+590 000 array slots. On a host that merges inside a `memory_limit`, that is the
+difference between a section and a crash.
 
 ---
 
@@ -559,12 +591,17 @@ deletion; the failure is benign and retried on the next commit.
 
 ## 13. Open questions
 
-1. **§ termgrams stores strings where ordinals would do.** 7.7 MB against
-   roughly 1.2 MB, on the largest search structure in the segment. No effect on
-   any result; needs an ordinal-addressable term dictionary to resolve back.
-   *Settled since: § fieldfreq's size is no longer an open question — one byte
-   per field per posting buys the term frequency BM25 was missing, and it is
-   written whatever the schema.*
+1. **Block size, now that there are two dictionaries.** 64 entries suits
+   `§ terms`, where a lookup wants the smallest possible decode. `§ termgrams`
+   has different traffic: a handful of gram lookups per query word, each
+   returning a payload read whole. And a smaller block for `§ terms` is what
+   would make the ordinal encoding of `§ termgrams` viable — §4b. Worth
+   measuring as one question rather than inheriting a number chosen for the
+   other structure.
+
+   *Settled since this document was written: `§ fieldfreq`'s size is no longer
+   an open question — one byte per field per posting buys the term frequency
+   BM25 was missing, and it is written whatever the schema.*
 2. **Docstore compression** when `ext-zlib` is available — portability trade-off.
 3. **Ordinal width.** `u32` caps a segment at 4 G documents; that is plenty, but
    it fixes the maximum merge output. Confirm.

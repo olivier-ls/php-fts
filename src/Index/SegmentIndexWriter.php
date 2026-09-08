@@ -503,10 +503,11 @@ final class SegmentIndexWriter
     {
         $searchable = $schema->searchableFields();
 
-        // One byte per field, where the mask was one *bit* per field. Three
-        // searchable fields therefore cost three bytes a posting instead of
-        // one — on the reference catalogue, 2.2 MB becoming ~6.5 MB out of 61,
-        // which buys the term frequency BM25 had been missing.
+        // One byte per field, where the mask was one *bit* per field, so this
+        // scales with how many fields a schema searches. The reference
+        // catalogue searches five, over 2 171 183 postings: 2.2 MB of masks
+        // becomes 10.9 MB of frequencies out of a 69.8 MB index, and buys the
+        // term frequency BM25 had been missing entirely.
         $width = max(1, count($searchable));
 
         // The two ways a segment can come by its postings. Both hand over the
@@ -523,9 +524,9 @@ final class SegmentIndexWriter
 
         // The second tier, built as the terms stream past. Two buffers per gram
         // rather than a list of terms per gram: the terms arrive sorted, so
-        // each list can be front-coded the moment it grows and never held as
-        // an array. That bounds this by the vocabulary — around 25 000 grams
-        // and a few megabytes — instead of by the postings, which on this
+        // each list can be encoded the moment it grows and never held as an
+        // array. That bounds this by the vocabulary — around 25 000 grams and
+        // a couple of megabytes — instead of by the postings, which on this
         // catalogue would have been 590 000 array slots. See TermGramIndex.
         /** @var array<string, string> gram => front-coded payload so far */
         $gramPayloads = [];
