@@ -14,6 +14,7 @@ declare(strict_types=1);
  *     --phase=index    time, throughput, memory and size, by catalogue size
  *     --phase=source   what source() actually saves, on real text
  *     --phase=search   query latency, p50 and p95, by kind of query
+ *     --phase=relevance  whether the answers are *right*, which no timing says
  *     --phase=cold     open() + one search in a *fresh process*, which is the
  *                      only number that describes a real request
  *     --phase=merge    what an automatic merge costs at this scale
@@ -35,6 +36,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/autoload.php';
 
+use Ols\PhpFts\Analysis\Analyzer;
 use Ols\PhpFts\Facet;
 use Ols\PhpFts\Filter;
 use Ols\PhpFts\Highlight;
@@ -417,6 +419,121 @@ if ($phase === 'search' || $phase === 'all') {
 
         printf("%-30s  %7.1f  %7.1f  %7.1f  %7.1f  %9s\n",
             $label, $d['p50'], $d['p95'], $d['min'], $d['max'], number_format($total));
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Phase: relevance
+//
+//  Every other phase here answers "how fast". This one answers "how right",
+//  and it exists because nothing else did. The suite's query tests are all
+//  *equivalence* tests — driven walk against undriven, merged segment against
+//  fresh — and a ranking that is wrong the same way twice satisfies every one
+//  of them. It did: 797 tests were green while a search for `pliant` returned
+//  a product holding no form of the word, first.
+//
+//  Two numbers per query, and the first is the one that matters:
+//
+//    first junk    the rank of the first hit holding none of a typed word.
+//                  At rank 1 a shopper sees the engine fail; at rank 150 they
+//                  never reach it. A share alone hides that difference.
+//    junk@100      how much of the first page-depth is like that.
+//
+//  "Junk" is measured against the *typed* words, re-analysed out of the
+//  returned document — so a legitimate morphological match (`pliante` for
+//  `pliant`) counts against us. The number is therefore pessimistic by
+//  construction, which is the right direction for a gauge: it can only
+//  understate an improvement.
+// ---------------------------------------------------------------------------
+
+if ($phase === 'relevance' || $phase === 'all') {
+    $scale = max($scales);
+    $dir   = $root . '/bench_search';
+
+    heading('Relevance — ' . number_format($scale) . ' products');
+
+    if (!is_dir($dir) || size_mb($dir) === 0.0) {
+        printf("building the index first…\n");
+        build($dir, $corpus, $scale, $batch, schema());
+    }
+
+    $engine   = SearchEngine::open($dir);
+    $analyzer = new Analyzer();
+
+    // Corpus-derived so the list is stable across runs and not tuned to the
+    // defect being chased, plus the hand-picked words that exposed it. A gauge
+    // made only of known-bad cases measures the fix, not the engine.
+    $frequencies = [];
+
+    foreach (corpus($corpus, min($scale, 5000)) as $product) {
+        foreach (preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower($product['name']), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
+            if (mb_strlen($word) >= 4) {
+                $frequencies[$word] = ($frequencies[$word] ?? 0) + 1;
+            }
+        }
+    }
+
+    arsort($frequencies);
+
+    $queries = array_values(array_unique(array_merge(
+        array_slice(array_keys($frequencies), 0, 6),
+        ['pliant', 'bois', 'inox', 'cuir', 'acier', 'couteau de cuisine inox'],
+    )));
+
+    /** Every term a document produces, as a set. */
+    $bagOf = static function (array $document) use ($analyzer): array {
+        $bag = [];
+
+        foreach (['name', 'description', 'model'] as $field) {
+            foreach ($analyzer->analyze((string) ($document[$field] ?? '')) as $term) {
+                $bag[(string) $term] = true;
+            }
+        }
+
+        return $bag;
+    };
+
+    printf("%-28s  %9s  %10s  %9s   %s\n", 'query', 'total', 'first junk', 'junk@100', 'top hit');
+
+    foreach ($queries as $query) {
+        $typed = array_map('strval', $analyzer->analyze($query));
+
+        if ($typed === []) {
+            continue;
+        }
+
+        $result = $engine->search($query, limit: 100);
+
+        $rank      = 0;
+        $firstJunk = null;
+        $junk      = 0;
+        // ASCII, because printf pads by bytes and an em dash is three of them —
+        // which silently misaligns the one column a before/after read scans.
+        $top       = '-';
+
+        foreach ($result as $hit) {
+            $rank++;
+            $bag = $bagOf($hit->document);
+
+            if ($rank === 1) {
+                $top = substr(preg_replace('/\s+/', ' ', (string) ($hit->document['name'] ?? '')) ?? '', 0, 38);
+            }
+
+            foreach ($typed as $word) {
+                if (!isset($bag[$word])) {
+                    $junk++;
+                    $firstJunk ??= $rank;
+                    break;
+                }
+            }
+        }
+
+        printf("%-28s  %9s  %10s  %9s   %s\n",
+            substr($query, 0, 28),
+            number_format($result->total),
+            $firstJunk === null ? 'none' : '#' . $firstJunk,
+            $rank === 0 ? '-' : sprintf('%d%%', (int) round(100 * $junk / $rank)),
+            $top);
     }
 }
 
