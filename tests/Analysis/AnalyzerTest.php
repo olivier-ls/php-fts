@@ -82,6 +82,34 @@ class AnalyzerTest extends TestCase
     }
 
     #[Test]
+    public function a_bracket_that_cannot_open_a_tag_costs_nothing(): void
+    {
+        // `strip_tags()` treats every `<` as a tag start and drops everything
+        // after it, so `lame <3 mm` indexed as `lame` and the rest of the
+        // description was not searchable at all. A catalogue writes this.
+        $this->assertSame(
+            ['couteau', '3', 'cm', 'de', 'lame'],
+            $this->analyzer->analyze('Couteau <3 cm de lame')
+        );
+
+        $this->assertSame(['prix', '30', 'euros'], $this->analyzer->analyze('prix <30 euros'));
+
+        // Deduplicated, so the second `2` is not a second term.
+        $this->assertSame(['1', '2', 'et', '3'], $this->analyzer->analyze('1<2 et 3>2'));
+    }
+
+    #[Test]
+    public function a_bracket_that_does_open_a_tag_still_strips(): void
+    {
+        $this->assertSame(['sac', 'en', 'cuir'], $this->analyzer->analyze('Sac <b>en <i>cuir</i></b>'));
+        $this->assertSame(['description'], $this->analyzer->analyze('<p style="color:red">Description</p>'));
+        $this->assertSame(['visible'], $this->analyzer->analyze('<!-- caché -->visible'));
+
+        // Entities still decode, and one written as an entity is text.
+        $this->assertSame(['a', 'b', 'c'], $this->analyzer->analyze('a &amp; b &lt;c&gt;'));
+    }
+
+    #[Test]
     public function an_all_digit_word_comes_back_as_a_string(): void
     {
         // Deduplication goes through array keys, and PHP turns a key that looks

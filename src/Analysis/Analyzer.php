@@ -149,9 +149,31 @@ final class Analyzer
      * Exposed because it is what a highlight is a substring of, so a caller
      * asking for byte positions rather than HTML needs the string those
      * positions index into.
+     *
+     * ── Why `<` is escaped before the tags are stripped ────────────────────
+     *
+     * Because `strip_tags()` treats every `<` as the start of a tag and drops
+     * everything up to the next `>` — or to the end of the string if there is
+     * none. A catalogue writes `lame <3 mm` and `prix <30 euros`, and the
+     * engine indexed `lame ` and `prix `. Everything after was gone from the
+     * index, not merely from the highlight, so the product could not be found
+     * by any word in the rest of its description. Silently, and for the whole
+     * life of a shop's index.
+     *
+     * HTML's own rule is narrower than PHP's: a `<` opens a tag only when a
+     * letter, `/`, `!` or `?` follows it. Anything else is text, and browsers
+     * render it as text. So the ones that cannot open a tag are turned into
+     * entities first, and the `html_entity_decode()` that was already here
+     * turns them back — which is why this costs no extra pass.
+     *
+     * A `<` that *does* look like a tag start and is never closed still eats
+     * the rest, as it does in a browser. That is malformed markup rather than
+     * a number.
      */
     public function plain(string $text): string
     {
+        $text = preg_replace('/<(?![a-zA-Z\/!?])/', '&lt;', $text) ?? $text;
+
         return html_entity_decode(strip_tags($text), ENT_QUOTES | ENT_HTML5, 'UTF-8');
     }
 

@@ -247,20 +247,43 @@ class HighlighterTest extends TestCase
     }
 
     #[Test]
-    public function a_stray_angle_bracket_truncates_the_text_the_analyzer_sees(): void
+    public function a_stray_angle_bracket_no_longer_truncates_the_text(): void
     {
-        // Documented, not endorsed. The analyzer opens with strip_tags(), which
-        // reads `<3` as the beginning of a tag and drops everything after it.
-        // Indexing has always done this — `euros` is not in the index either —
-        // but a highlight is where it becomes visible to a reader. Worth
-        // revisiting where it belongs, in Analyzer::plain().
-        $this->assertSame('Sac en <mark>cuir</mark> ', $this->mark('cuir', 'Sac en cuir <3 euros'));
+        // It used to. `strip_tags()` reads `<3` as the start of a tag and drops
+        // everything to the next `>` or to the end, so a catalogue writing
+        // `lame <3 mm` had the rest of its description missing — from the
+        // index, not only from the highlight, which meant the product could not
+        // be found by any word after the bracket. Fixed in Analyzer::plain().
+        $this->assertSame(
+            'Sac en <mark>cuir</mark> &lt;3 euros',
+            $this->mark('cuir', 'Sac en cuir <3 euros')
+        );
 
-        // A `<` followed by a space is left alone, which is why this is a
-        // sharp edge rather than a constant nuisance.
+        // A `<` followed by a space was always safe, and still is.
         $this->assertSame(
             'Sac en <mark>cuir</mark>, &lt; 100 euros',
             $this->mark('cuir', 'Sac en cuir, < 100 euros')
+        );
+    }
+
+    #[Test]
+    public function real_markup_is_still_stripped(): void
+    {
+        // The bracket fix must not have bought text back by letting markup
+        // through: a `<` that HTML would read as a tag start still is one.
+        $this->assertSame(
+            'Sac en <mark>cuir</mark> souple',
+            $this->mark('cuir', 'Sac <b>en <i>cuir</i></b> souple')
+        );
+
+        $this->assertSame(
+            '<mark>Cuir</mark> pleine fleur',
+            $this->mark('cuir', '<p style="color:red">Cuir pleine fleur</p>')
+        );
+
+        $this->assertSame(
+            'du <mark>cuir</mark>',
+            $this->mark('cuir', '<!-- caché -->du cuir')
         );
     }
 
