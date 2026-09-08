@@ -320,6 +320,7 @@ final class SegmentIndexWriter
             $store->writeTo($segment, 'docs');
 
             $segment->addSection('keys', $this->encodeKeys());
+            $segment->addSection('keyfwd', $this->encodeForwardKeys());
             $segment->addSection('meta', (string) json_encode([
                 'documentCount'    => $documentCount,
                 'termLengthSum'    => $this->termLengthSum,
@@ -843,6 +844,46 @@ final class SegmentIndexWriter
     /**
      * @throws StorageException
      */
+    /**
+     * The other direction: local ordinal back to the caller's id.
+     *
+     * `§ keys` is sorted by key, which is the direction a lookup needs and the
+     * wrong one for reporting a result. The reverse used to be derived at read
+     * time by walking the whole dictionary and inverting it — **60.7 ms and
+     * 5.4 MB on a 45 000-document segment, per request, to serve the twenty
+     * ids of one page**, and linear in the size of the index. The format
+     * document said this direction was free because a docstore record carried
+     * its own key; it does not, and has not for as long as
+     * `DocumentStoreWriter` has existed, where the id is only used to name a
+     * document that fails to encode.
+     *
+     * So it is written down instead. Fixed-width offsets then the keys back to
+     * back — the same shape as `§ docstore`, and the same rule as everywhere
+     * else in this format: variable length where you scan, fixed width where
+     * you jump. Measured cost on the reference catalogue: `§ keys` is 317 732
+     * bytes, so this adds about 500 KB to a 73 MB segment, or 0.7%. The
+     * docstore is 70% of it.
+     *
+     * One offset more than there are documents, so the last key's length is
+     * read the same way as every other's.
+     */
+    private function encodeForwardKeys(): string
+    {
+        $offsets = '';
+        $keys    = '';
+        $at      = 0;
+
+        // `$this->keys` is appended in ordinal order by both put() and carry(),
+        // which is what makes this a plain traversal rather than a sort.
+        foreach ($this->keys as $key) {
+            $offsets .= pack('V', $at);
+            $keys    .= $key;
+            $at      += strlen($key);
+        }
+
+        return $offsets . pack('V', $at) . $keys;
+    }
+
     private function encodeKeys(): string
     {
         $sorted = $this->keys;

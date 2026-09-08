@@ -347,8 +347,39 @@ term dictionary, so it reuses the same reader.
 
 Serves `get()`, `has()`, and `put()` (detecting that a key already exists).
 
-The reverse direction (`ordinal → key`, needed for `$hit->id`) is free: each
-docstore record stores its own key.
+The reverse direction — `ordinal → key`, which every returned hit needs — has
+its own section.
+
+### `§ keyfwd`
+
+```
+offsets    u32 × (documentCount + 1)     where each key starts, and the end
+keys       the keys, back to back
+```
+
+A lookup is one `unpack` and a read of exactly the bytes wanted. The offset
+table is read once per segment and the keys are not, which is the same trade
+`§ docstore` makes: a page wants twenty of the payloads and none of the rest.
+
+**This section exists because this document was wrong about it.** It used to
+say the reverse direction was free, because each docstore record stored its own
+key. It does not, and has not since `DocumentStoreWriter` was introduced —
+there the id only names a document that fails to encode. Believing the document
+rather than the code left `SegmentIndex::keyOf()` inverting the whole key
+dictionary on the first hit of every request: **60.7 ms and 5.4 MB on a
+45 000-document segment, to serve the twenty ids of one page**, growing with
+the index rather than with the page. It was the largest single cost in a cold
+request, larger than matching the query.
+
+Measured after: 0.13 ms and 0.17 MB, for 402 928 bytes on a 70.2 MB segment —
+**0.56%**.
+
+Storing the key in the docstore record, as this document claimed, would not
+have worked either: `source(false)` writes no record at all, so the key would
+have gone with it.
+
+A segment written before this section falls back to inverting the dictionary,
+so old indexes keep answering — slowly enough that reindexing is worth it.
 
 ---
 
