@@ -30,7 +30,9 @@ One segment = one file, `seg_<id>.fts`.
 ├─────────────────────────────────────────────────┤
 │ § postings       posting lists + skip lists     │
 │ § terms          term dictionary                │
-│ § fieldmask      per-posting field bitmaps      │
+│ § termgrams      n-grams of the vocabulary      │
+│ § fieldfreq      per-posting field frequencies  │
+│ § lengths        per-document field lengths     │
 │ § docvalues      columnar values                │
 │ § keys           user key → local ordinal       │
 │ § docstore       the documents themselves       │
@@ -159,22 +161,75 @@ proportional to the size of the *result*, not the size of the list.
 
 ---
 
-## 4. § fieldmask — BM25F without re-tokenising
+## 4. § fieldfreq — BM25F without re-tokenising
 
-One byte per posting, in the same order as the delta stream: a bitmap of which
-fields contain this term in this document (8 text fields; a second byte if more).
+**One byte per searchable field per posting**, in the same order as the delta
+stream: how often this term occurs in that field of that document, clamped at
+255. A zero byte means the field does not hold the term, so the bitmap the
+section used to be is still there — it is the set of non-zero bytes.
 
 **Stored as a separate parallel stream, not interleaved.** Candidate selection
-reads only the compact delta stream; field masks are touched exclusively for the
-handful of documents that reach scoring. Interleaving would have wrecked both
-compression and skipping.
+reads only the compact delta stream; frequencies are touched exclusively for the
+documents that reach scoring. Interleaving would have wrecked both compression
+and skipping.
 
 This is what allows BM25F to weight a title match above a description match
 **without re-analysing the document at query time** — v1's single largest CPU
 cost (§4.1: `extractTrigrams()` is re-run on every returned document).
 
-Cost: +1 byte per posting, ≈ +28 % on total index size. The section is omitted
-entirely when the schema declares a single text field (flag in the header).
+### Why a frequency and not a bit
+
+It was a bit per field for as long as a document's terms were its trigrams: the
+analyzer deduplicated them, so a term occurred at most once and the bit *was*
+the frequency. Honest, and it silently disabled half of BM25 — `k1` scales a
+constant, so it scaled every score identically. Measured on the reference
+catalogue, a search for `opinel` returned four products scoring 10.29 each with
+nothing to separate them, while one of them said `opinel` twice in its own name.
+
+Clamping at 255 is nearly free: with `k1 = 1.2` the saturated contribution of
+tf 255 and of tf 4 000 differ by 0.4 %. The formula stops caring long before the
+byte does.
+
+Cost: one byte per field per posting, against one byte per posting for the
+bitmap. On the reference catalogue — three text fields, 2.1 M postings — 2.2 MB
+becomes 6.5 MB of a 70 MB index. **Written whatever the schema**, unlike the
+bitmap: a single-field schema's masks all held the same bit and said nothing,
+where a single field's *frequency* still says how often the document uses the
+word.
+
+---
+
+## 4b. § termgrams — where tolerance lives
+
+A block dictionary keyed by n-gram, whose payload is the front-coded list of
+**vocabulary terms** containing that n-gram.
+
+This is the second tier, and the reason a query can find the words it might have
+meant without reading the term dictionary. Trigramming 45 000 documents produced
+8.5 M postings whose lists averaged 336 documents; trigramming their 87 000
+distinct words produces 590 K whose lists average 24 words — and unlike a
+catalogue, a vocabulary stops growing. The n-grams did not disappear when
+documents stopped being n-grammed. They moved one floor up.
+
+**It is a pure function of § terms.** Nothing in it comes from a document, which
+is what makes it safe under merges: a merge carries terms across without reading
+any text — it has to, since `source(false)` means the text is not there — and
+this section is rebuilt from the terms alone.
+
+Terms of a continuous script are not written here: their terms are n-grams
+already and the query side never expands them, so a wholly Japanese vocabulary
+costs this section nothing.
+
+Front-coded because the writer builds it in memory bounded by the *vocabulary*
+rather than by the postings: terms arrive sorted, so each list is encoded as it
+grows and never held as an array of strings — 25 000 buffers of a few hundred
+bytes instead of 590 000 array slots. On a host that merges inside a
+`memory_limit`, that is the difference between a section and a crash.
+
+Cost, measured: 7.7 MB on the reference catalogue, which makes it the largest
+search structure in the segment — larger than the postings. **Known and not yet
+taken:** storing term ordinals as delta varints instead of the strings would
+bring it to roughly 1.2 MB. It changes no result and has not been done.
 
 ---
 
@@ -504,8 +559,12 @@ deletion; the failure is benign and retried on the next commit.
 
 ## 13. Open questions
 
-1. **§ fieldmask: +28 % index size for correct field weighting.** Recommended:
-   keep it, schema-driven, omitted for single-text-field schemas.
+1. **§ termgrams stores strings where ordinals would do.** 7.7 MB against
+   roughly 1.2 MB, on the largest search structure in the segment. No effect on
+   any result; needs an ordinal-addressable term dictionary to resolve back.
+   *Settled since: § fieldfreq's size is no longer an open question — one byte
+   per field per posting buys the term frequency BM25 was missing, and it is
+   written whatever the schema.*
 2. **Docstore compression** when `ext-zlib` is available — portability trade-off.
 3. **Ordinal width.** `u32` caps a segment at 4 G documents; that is plenty, but
    it fixes the maximum merge output. Confirm.

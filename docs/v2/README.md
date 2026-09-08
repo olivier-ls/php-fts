@@ -90,11 +90,59 @@ schedule. The engine maintains itself.
 
 ---
 
+## Typos, and words you have not finished typing
+
+Tolerance is a setting, not a property of the index. A query's words are
+compared against the words the index actually holds, and a word is accepted two
+ways:
+
+| you typed | it finds | why |
+|---|---|---|
+| `couteau` | `couteau` | the word itself |
+| `couteu` | `couteau` | within the edit budget |
+| `chromé` | `chrome`, `chromee` | accents fold before anything is compared |
+| `leath` | `leatherman`, `leather` | a completion of what you started |
+| `inox` | `inoxydable`, `inox` | likewise |
+| `stel` | `steel` — **not** `pastel` | two edits away, out of budget |
+| `inoxx` | `inox` — **not** `maxx` | three edits away |
+
+The budget is Elasticsearch's `fuzziness: AUTO`: nothing for a word of one or
+two characters, one edit up to five, two beyond. A completion needs at least
+three characters, because two reach a fifth of a French vocabulary and say
+nothing about intent. Distances are counted in **characters, not bytes**, so one
+mistyped Cyrillic or Arabic letter costs one edit rather than two.
+
+Both rules feed one threshold, and the threshold is an amount of *information*
+rather than a count of words. In `couteau de cuisine inox`, `de` sits in 38 555
+of 45 000 documents and carries 1.8% of what the query is about — so it cannot
+satisfy anything on its own, while `cuisine` at 52% is close to mandatory. That
+is what a person typing those four words meant, and counting words instead
+reported 17 728 matches where the truthful answer was 1 080.
+
+**What it does not do.** It does not find a word buried inside a longer one:
+`inox` will not return the *Victorinox* brand, and that is deliberate — the
+vocabulary says 16 words complete `inox` usefully and 14 merely contain it, and
+all 14 are noise. It does not bridge a language that inflects by **prefix**:
+Arabic and Hebrew attach the definite article at the front, so `مطبخ` is a
+suffix of `المطبخ` and neither rule above reaches it. And correction is help,
+not magic — someone who mistypes and sees the wrong answers will retype, and the
+engine's job is to make the right answer reachable, not to guess.
+
+---
+
 ## Any language, out of the box
 
-php-fts indexes **character n-grams**, which is the standard approach for
-languages written without spaces — Japanese, Chinese, Thai. For those languages
-n-gram indexing is not a fallback, it is the correct technique.
+php-fts indexes **whole words** where a language has them, and **character
+n-grams** where it does not. The analyzer decides per run of text, so a field
+holding both gets both.
+
+For Japanese, Chinese, Thai, Lao, Khmer, Burmese and Korean, n-gram indexing is
+not a fallback — finding word boundaries there needs a segmentation dictionary,
+which this library does not ship and does not intend to. For everything else a
+word is the term, and tolerance for a misspelling or an unfinished word is
+resolved against the **vocabulary** at query time rather than baked into the
+documents. That is the change that made a four-word search cost 293 ms instead
+of 2.3 seconds, and made it return 1 080 documents instead of 10 877.
 
 Nothing to configure. The analyzer detects the script per field and adapts.
 
@@ -110,9 +158,16 @@ $engine->search('جلدي');        // ✔
 
 Handled automatically: full-width forms folded to ASCII, case folded across
 Latin, Greek and Cyrillic, combining marks dropped, diacritics folded to their
-base letter, and the n-gram size chosen per script — 2 for scripts written
-without spaces, 3 for the rest, with runs broken at script changes so a bigram
-never straddles the seam in 革靴ブラウン.
+base letter, and the term chosen per script — one word at a time where words
+are separated, bigrams where they are not, with runs broken at script changes so
+a bigram never straddles the seam in 革靴ブラウン.
+
+**One asymmetry worth stating.** A continuous script keeps the cost profile that
+words escape: its terms are n-grams, so a query walks longer posting lists, and
+its terms are never expanded — an n-gram one edit away from another is a
+different word, not a misspelling of the same one, so correcting them would
+manufacture nonsense. Japanese and Thai searches are correct and are not as
+cheap as French ones.
 
 Katakana is deliberately *not* folded to hiragana: it marks loanwords in
 Japanese, and erasing that makes distinct words collide. Half-width katakana
@@ -601,24 +656,22 @@ because there is only one set of rules.
 
 Each term the analyzer produces knows the characters it was cut from. A query's
 terms are looked up, their spans are merged where they overlap, and the union is
-marked. `leather` becomes seven trigrams whose spans tile the word, so the union
-is `leather`; 革靴 becomes bigrams, and the same code marks it with no special
-case for the script. Nothing here knows what a word is, which is exactly why it
-works in scripts that have none.
+marked. In a script with words a term *is* a word, so its span is the word and
+there is nothing to reassemble; 革靴 arrives as bigrams whose spans overlap, and
+the same code merges them with no special case for the script.
 
 Two consequences worth knowing:
 
-- **A partial match is marked as a partial match.** Searching `shoe` marks
-  `snow⟦shoe⟧s`, and `leather` marks `w⟦eather⟧`. That is genuinely why the
-  document ranked, and 1.x could not say so — having only words, it wrapped the
-  whole one.
-- **A coincidence is not marked.** `leather` and `The` share the trigram `the`,
-  and `leather` and `over` share `er#`. Neither is marked: a span survives only
-  if every term the *document* produced inside it is one the query asked for,
-  and only if some term of it is about a word's content rather than its edge.
-  Ranking absorbs coincidences like these — one term out of seven barely scores
-  — but a highlight is either drawn or not, and drawn over `The` it makes the
-  engine look broken.
+- **What gets marked is what the document says, not what you typed.** Searching
+  `leath` marks `⟦leather⟧` whole, and `lether` does too. The highlighter is
+  given the words the query planner resolved, so a completion and a correction
+  both mark the real word — which is the honest answer to "why did this rank?".
+- **A word inside a longer word is not marked.** Searching `shoe` does not mark
+  `snow⟦shoe⟧s`. That was the old behaviour and it came from the same rule that
+  returned `victorinox` for `inox`; a *prefix* is expanded and matches, anything
+  buried mid-word is not. 1.x marked whole words and could not explain itself;
+  the trigram engine explained itself and over-matched; this marks whole words
+  and can say which word it meant.
 
 ---
 
@@ -657,8 +710,9 @@ Three properties follow, for free:
 - **Maintenance is incremental.** Small segments merge into larger ones a little
   at a time, bounded by a time budget — never a full rebuild.
 
-Scoring is BM25 over character n-grams, with per-field boosts and IDF computed
-across the whole index.
+Scoring is BM25F over words — per-field term frequencies, per-field boosts,
+per-field length normalisation, and IDF computed across the whole index rather
+than per segment, so a merge cannot change a ranking.
 
 ---
 

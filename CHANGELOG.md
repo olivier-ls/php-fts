@@ -7,6 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased] — 2.0
+
+A rewrite of the index and the query planner. **Segment format version 2:
+existing indexes must be rebuilt by reindexing from your own source data.**
+There is no migration path and there cannot be one — the terms a 1.x index holds
+are the trigrams of documents, and this build looks up words.
+
+Opening a version-1 index raises `UnsupportedFormatException`, which is
+deliberately outside the `CorruptSegmentException` hierarchy so that the
+rollback machinery cannot mistake an old index for a torn commit and quietly
+present it as empty.
+
+### Changed — words are the terms
+
+Documents were indexed as character trigrams. They are now indexed as **words**,
+in every script that separates them; the scripts that do not — Han, Hiragana,
+Katakana, Hangul, Thai, Lao, Khmer, Burmese — keep their n-grams, because
+finding word boundaries there needs a segmentation dictionary this library does
+not ship.
+
+Trigrams did not go away. They index the **vocabulary** instead of the
+documents, in a new `§ termgrams` section, and a query expands what was typed
+into the words the index holds before touching a document. Tolerance therefore
+costs the size of the vocabulary rather than the size of the corpus, and a
+vocabulary stops growing where a catalogue does not.
+
+Measured on a 45 000-product catalogue, warm, one segment:
+
+| query | 1.x terms | 2.0 | matches then → now |
+|---|---|---|---|
+| `steel` | 210.7 ms | **23.8 ms** | 2 945 → 1 400 |
+| `steel cold` | 443.5 ms | **62.9 ms** | 1 421 → 758 |
+| `stel` (a typo) | 181.0 ms | **32.8 ms** | 2 831 → 1 528 |
+| `couteau de cuisine inox` | 2 261.7 ms | **293.0 ms** | 10 877 → 1 080 |
+| `couteau de cuisine inox pliant` | 2 833.6 ms | **587.1 ms** | 11 469 → 427 |
+
+Index size 71 MB → 69.8 MB.
+
+**Results changed, deliberately and for the better.** The old threshold applied
+to a flat list of a query's trigrams with no notion of which word each came
+from, so a document could clear the bar on one word's trigrams plus a handful of
+strays — `couteau de cuisine inox` matched 10 877 documents, many containing no
+form of `cuisine` at all. Compared side by side on the catalogue, the new
+ranking is better on every query tried: `inoxx pliant` returned `Meyerco Maxx-Q`
+and `Sencut Braxx` in its top five and now returns `POIGNARD PLIANT MUELA INOX`.
+
+### Added
+
+- **Typo tolerance you can reason about.** A query word is accepted if it is
+  within an edit budget of an indexed word (Elasticsearch's `fuzziness: AUTO`:
+  nothing under three characters, one edit to five, two beyond). Distances are
+  counted in **characters, not bytes**, so one mistyped Cyrillic or Arabic
+  letter costs one edit rather than two.
+- **Prefix completion.** `leath` finds `leatherman`, `inox` finds `inoxydable`.
+  Three characters minimum. This is also the safety net for suffix-inflecting
+  languages — Turkish, Finnish, Hungarian — that no corpus here can test.
+- **Per-field term frequency** (`§ fieldfreq`, replacing `§ fieldmask`). BM25's
+  `k1` had no effect for as long as terms were deduplicated trigrams; it does
+  now. A search for `opinel` used to return four products scoring 10.29 each,
+  indistinguishable, one of which named Opinel twice.
+- **`minimum_should_match` weighed in IDF rather than counted in words.** In
+  `couteau de cuisine inox`, `de` sits in 38 555 of 45 000 documents and carries
+  1.8% of the query's information, so it can no longer satisfy the threshold on
+  its own.
+- **`PostingsCursor::advance()` is finally called.** The skip tables were
+  written from the start and no query path had ever used them. A slot the
+  threshold makes mandatory now drives the walk and the other lists are jumped
+  through — worth roughly half the posting time on a four-word query, and exact
+  by construction rather than by measurement (`tests/Index/DrivenWalkTest.php`
+  asserts the driven and undriven walks agree hit for hit and score for score).
+
+### Fixed
+
+- **An all-digit term came back as an integer.** `Analyzer::analyze()`
+  deduplicates through array keys and PHP turns a numeric key into an int, so a
+  model number or a year was rejected by every string signature downstream. The
+  `#` padding had hidden this for the life of the trigram index, because `#21#`
+  is not numeric.
+- `suggest: ext-intl` claimed a normalisation capability nothing in the library
+  had used for some time. Removed.
+
+### Known limits
+
+- **Validated in French only.** The reference catalogue is a French production
+  catalogue; the relevance work was measured against it and against nothing
+  else. Latin, Cyrillic and Greek share its mechanics exactly. Continuous
+  scripts keep their own, unchanged.
+- **A language that inflects by prefix is not bridged.** Arabic and Hebrew
+  attach the definite article at the front, so `مطبخ` is a *suffix* of `المطبخ`
+  and neither the edit budget nor prefix completion reaches it. The mirror rule
+  would fix it and would also return the *Victorinox* brand for `inox`, so it is
+  not the default; it belongs behind an explicit option.
+- **A word inside a longer word is not found.** `shoe` does not match
+  `snowshoes`. Deliberate — see above.
+- **Continuous scripts are not cheaper than before.** Their terms are n-grams,
+  so they keep the longer posting lists, and they are never expanded: an n-gram
+  one edit from another is a different word, not a misspelling of it.
+
+---
+
 ## [1.1.4] — 2026-09-06
 
 Security and correctness release. No format change — existing indexes are read
