@@ -86,18 +86,6 @@ enum Script
     }
 
     /**
-     * Whether a run of this script gets `#` markers at its ends.
-     *
-     * Only word-separated scripts do. A run of Japanese is a phrase rather than
-     * a word, so marking its edges would say something untrue about where the
-     * words are.
-     */
-    public function usesWordBoundaries(): bool
-    {
-        return !$this->isContinuous() && $this !== self::Separator;
-    }
-
-    /**
      * Classifies one code point.
      *
      * Only the ranges the engine can index are named; everything else — Latin

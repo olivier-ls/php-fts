@@ -116,14 +116,14 @@ final class Analyzer
      * arrives as bigrams whose spans overlap, and merging them rebuilds the
      * phrase — the same three lines, with no special case for the script.
      *
-     * The fourth value said whether a term was *only* anchored to a word edge,
-     * which was a real distinction while `over` produced `er#`: that term
-     * described how the word ended and nothing about what it said. No term is
-     * edge-anchored now that a word is its own term, so the value is always
-     * false. It stays in the shape because Highlighter reads it, and it is the
-     * next thing to remove once the query side has settled.
+     * A fourth value used to travel with each term, saying whether it was
+     * *only* anchored to a word edge. That was a real distinction while `over`
+     * produced `er#` — a term describing how a word ended and nothing about
+     * what it said — and it stopped being one when a word became its own term.
+     * It had been constant since, carried through three call sites and a
+     * `!$edge` that could not be false. Gone.
      *
-     * @return array{text: string, terms: array<int, array{0: string, 1: int, 2: int, 3: bool}>}
+     * @return array{text: string, terms: array<int, array{0: string, 1: int, 2: int}>}
      */
     public function occurrences(string $text): array
     {
@@ -131,12 +131,8 @@ final class Analyzer
         $terms = [];
 
         foreach ($this->runsOf($plain) as $run) {
-            foreach ($this->termsOf($run) as [$term, $start, $end]) {
-                // No term is edge-anchored any more: a word-separated script
-                // yields the whole word, and a continuous one never carried a
-                // boundary marker to begin with. The flag stays in the shape
-                // because Highlighter reads it, and it is now always false.
-                $terms[] = [$term, $start, $end, false];
+            foreach ($this->termsOf($run) as $term) {
+                $terms[] = $term;
             }
         }
 

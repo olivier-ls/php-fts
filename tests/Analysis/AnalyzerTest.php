@@ -480,8 +480,8 @@ class AnalyzerTest extends TestCase
         $terms = $this->analyzer->occurrences('cuir cuir')['terms'];
 
         $this->assertCount(2, $terms);
-        $this->assertSame(['cuir', 0, 4, false], $terms[0]);
-        $this->assertSame(['cuir', 5, 9, false], $terms[1]);
+        $this->assertSame(['cuir', 0, 4], $terms[0]);
+        $this->assertSame(['cuir', 5, 9], $terms[1]);
     }
 
     #[Test]
@@ -523,25 +523,12 @@ class AnalyzerTest extends TestCase
         $this->assertSame('cafe' . "\xcc\x81", substr($text, $last[1], $last[2] - $last[1]));
     }
 
-    #[Test]
-    public function no_term_is_edge_anchored_now_that_a_word_is_a_term(): void
-    {
-        // The flag distinguished `er#`, which said how `over` ended and nothing
-        // about what it meant, from `ove`, which was about its content. A word
-        // is its own term now, so nothing is edge-anchored and the flag is
-        // always false. It is the next thing to remove from occurrences().
-        foreach ($this->analyzer->occurrences('over cuir')['terms'] as [, , , $edge]) {
-            $this->assertFalse($edge);
-        }
-    }
-
-    #[Test]
-    public function a_continuous_script_has_no_edges_to_be_anchored_to(): void
-    {
-        foreach ($this->analyzer->occurrences('日本革靴業界')['terms'] as [, , , $edge]) {
-            $this->assertFalse($edge);
-        }
-    }
+    // `no_term_is_edge_anchored_now_that_a_word_is_a_term` and
+    // `a_continuous_script_has_no_edges_to_be_anchored_to` stood here. Both
+    // asserted that a flag was false, and it had been unconditionally false
+    // since a word became its own term — a test of a constant. The flag is
+    // gone from `occurrences()` and they go with it, rather than being kept as
+    // a way of noticing that `false === false`.
 
     #[Test]
     public function occurrences_agree_with_analyze(): void

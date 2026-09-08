@@ -28,14 +28,18 @@ use Ols\PhpFts\Schema;
  *
  * Every term the analyzer produces knows the bytes it was cut from. A query's
  * terms are looked up in that list, their spans are merged where they overlap,
- * and what is left is marked. Because `leather` analyses to seven trigrams
- * whose spans tile the word, marking the union of them marks `leather`, and the
- * same three lines mark 革靴 from its bigrams. Nothing here knows what a word
- * is, which is precisely why it works in scripts that have none.
+ * and what is left is marked. In a script that separates words the term *is*
+ * the word, so its span is the word and there is nothing to reconstruct; in a
+ * continuous script 革靴 arrives as overlapping bigrams and merging them
+ * rebuilds the phrase. The same three lines, with no special case for the
+ * script — nothing here knows what a word is, which is precisely why it works
+ * where there are none.
  *
- * It also means a highlight is honest about what matched: a query for `shoe`
- * marks `shoe` inside `snowshoes`, because that is genuinely why the document
- * came back. 1.x wrapped the whole word — and had to, having only words.
+ * A query for `shoe` therefore marks `shoe` and leaves `snowshoes` alone. That
+ * is a change: while a document's terms were its trigrams, the two shared
+ * enough of them to mark the inside of the longer word, and this file used to
+ * describe that as a feature. Words are the terms now, `snowshoes` is a
+ * different one, and it never matched to begin with.
  *
  * ── What is highlighted is the plain text ───────────────────────────────────
  *
@@ -149,9 +153,9 @@ final class Highlighter
 
         $spans = [];
 
-        foreach ($occurrences as [$term, $start, $end, $edge]) {
+        foreach ($occurrences as [$term, $start, $end]) {
             if ($end > $start && isset($terms[$term])) {
-                $spans[] = [$start, $end, !$edge];
+                $spans[] = [$start, $end];
             }
         }
 
@@ -186,11 +190,8 @@ final class Highlighter
      * trigram of a four-letter word only meet, and `#cu` plus `ir#` has to come
      * out as `cuir` rather than as two marks around one letter each.
      *
-     * The third value travels with the span: a merged span counts as content
-     * as soon as one of its parts did.
-     *
-     * @param array<int, array{0: int, 1: int, 2: bool}> $spans
-     * @return array<int, array{0: int, 1: int, 2: bool}>
+     * @param array<int, array{0: int, 1: int}> $spans
+     * @return array<int, array{0: int, 1: int}>
      */
     private static function merge(array $spans): array
     {
@@ -202,7 +203,6 @@ final class Highlighter
         foreach ($spans as $span) {
             if ($span[0] <= $current[1]) {
                 $current[1] = max($current[1], $span[1]);
-                $current[2] = $current[2] || $span[2];
                 continue;
             }
 
@@ -225,32 +225,33 @@ final class Highlighter
      * cushion: it is either drawn or not, and drawn over `The` it makes the
      * engine look broken.
      *
-     * Two tests, because there are two ways to look like a match.
-     *
      * **The document must not disagree.** A span is kept only when every term
      * the *document* produced inside it is also a term the query asked for.
-     * Over `The`, the document also produced `#th` and `he#`, which a query for
-     * `leather` did not ask for, so the span goes. Over the real `leather`, all
-     * seven agree. It is the word-boundary markers that do the refusing here,
-     * which is why scripts that have word boundaries get the strictness and
-     * scripts that do not are left alone: 革靴 is a genuine two-character match
-     * and stays one.
      *
-     * **A shared word edge is not a match.** `leather` and `over` share `er#`,
-     * and no other n-gram fits inside the two characters it spans, so nothing
-     * can contradict it — the first test cannot see this one. But an
-     * edge-anchored term says only how a word ends; a span needs at least one
-     * term that is about the word's content. `#en` matching the word `en`
-     * counts as content, because a marker outside the span means the span is
-     * the whole word.
+     * ── What this is still for, now that words are the terms ───────────────
      *
-     * What survives is a partial match that is genuinely why the document came
-     * back: `shoe` marks `snow⟦shoe⟧s`, `leather` marks `w⟦eather⟧`. Both are
-     * honest, and both are what ranking saw.
+     * Very little in a script that separates words, and everything in one that
+     * does not. A word-separated field produces one term per word and one span
+     * per match, so no span can contain another term to disagree with it —
+     * `shoe` marks `shoe` and does not mark `snowshoes`, because `snowshoes`
+     * is a different term and never matched in the first place. That is a
+     * change from the trigram index, where it did, and where the examples this
+     * docblock used to give were drawn from.
      *
-     * @param array<int, array{0: int, 1: int, 2: bool}>            $spans merged spans
-     * @param array<int, array{0: string, 1: int, 2: int, 3: bool}> $occurrences every term the field produced
-     * @param array<string, true>                                   $terms
+     * A continuous script is where it earns its place. `革靴` inside `高級革靴`
+     * is a genuine bigram match with overlapping neighbours around it, and this
+     * is what keeps a span honest about which of them the query actually asked
+     * for.
+     *
+     * A second test stood here — that a span needed at least one term about a
+     * word's *content* rather than only its edge, for cases like `leather` and
+     * `over` sharing `er#`. There are no edge-anchored terms any more, so it
+     * was a condition that could not be false, and it is gone along with the
+     * flag it read.
+     *
+     * @param array<int, array{0: int, 1: int}>            $spans merged spans
+     * @param array<int, array{0: string, 1: int, 2: int}> $occurrences every term the field produced
+     * @param array<string, true>                          $terms
      *
      * @return array<int, array{0: int, 1: int}>
      */
@@ -266,11 +267,7 @@ final class Highlighter
 
         $kept = [];
 
-        foreach ($spans as [$from, $to, $content]) {
-            if (!$content) {
-                continue;
-            }
-
+        foreach ($spans as [$from, $to]) {
             foreach ($contradictions as [$start, $end]) {
                 if ($start >= $from && $end <= $to) {
                     continue 2;
