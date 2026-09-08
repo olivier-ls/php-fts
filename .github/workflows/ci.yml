@@ -19,7 +19,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        php: ['8.1', '8.2', '8.3', '8.4']
+        # Every version the library says it supports, up to the current one:
+        # `>=8.1` is an unbounded claim, and the folding tables are the reason
+        # it has to be checked — they are generated from the Unicode data of
+        # one PHP and asserted against the Unicode data of the runtime, so a
+        # new release is exactly what moves the answer.
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
         include:
           # The library ships no extensions, so it has to be proven on Windows
           # and macOS too — symlink handling and rename() semantics differ.

@@ -15,6 +15,23 @@ namespace Ols\PhpFts\Analysis;
  * Covers every code point `Script::blockOf()` claims. Regenerate it whenever
  * that changes, and `tests/Analysis/FoldingClosureTest.php` will say whether
  * the result is closed.
+ *
+ * ── Which Unicode this is ───────────────────────────────────────────────────
+ *
+ * Whichever the PHP that ran the generator carried: mbstring answers for case
+ * folding, intl for decompositions and categories. So the table has a Unicode
+ * version, and the runtime reading it has another — the library itself needs
+ * no extension, which is the point, and therefore cannot notice the
+ * difference. `FoldingClosureTest` is what notices: it asks the *running*
+ * mbstring, so a PHP shipping newer tables than this file will raise the gap
+ * count. That is the file being older than the runtime, not a regression, and
+ * the remedy is to run the generator again on the newest PHP to hand.
+ *
+ * Doing so is additive in practice — Unicode's stability policy fixes the case
+ * mapping of a character once it has one, and the regeneration that took this
+ * file from PHP 8.3's tables to PHP 8.5's added seven Latin Extended-D letters
+ * and changed nothing. An index built before it stays readable and its terms
+ * stay reachable.
  */
 final class FoldingTables
 {
@@ -1460,9 +1477,16 @@ final class FoldingTables
         0xA7C6 => 'ᶎ',
         0xA7C7 => 'ꟈ',
         0xA7C9 => 'ꟊ',
+        0xA7CB => 'ɤ',
+        0xA7CC => 'ꟍ',
+        0xA7CE => '꟏',
         0xA7D0 => 'ꟑ',
+        0xA7D2 => 'ꟓ',
+        0xA7D4 => 'ꟕ',
         0xA7D6 => 'ꟗ',
         0xA7D8 => 'ꟙ',
+        0xA7DA => 'ꟛ',
+        0xA7DC => 'l',
         0xA7F5 => 'ꟶ',
         0xFB00 => 'ff',
         0xFB01 => 'fi',

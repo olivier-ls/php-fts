@@ -51,6 +51,17 @@ class FoldingClosureTest extends TestCase
      * The form is kept because the ceiling is what makes *adding a script* safe:
      * a new range brings its own punctuation and its own capitals with it, and
      * this will say how many before anyone has to find out from a user.
+     *
+     * ── The other way this goes red, and what it means ─────────────────────
+     *
+     * Unicode itself. The authority here is the *running* mbstring, and
+     * `FoldingTables` was generated from some other PHP's — so a runtime whose
+     * tables are newer knows capitals this file has never heard of, and says
+     * so. It happened between 8.3 and 8.5: seven code points on 8.4, thirteen
+     * on 8.5, all of them Latin Extended-D letters added by Unicode after the
+     * table was built. The count is therefore a *version skew* and not a
+     * defect, and the fix is one command — `php tools/generate-folding.php`,
+     * run on the newest PHP available, which is what put it back to zero.
      */
     private const CASE_GAPS = 0;
     private const PUNCTUATION_GAPS = 0;
