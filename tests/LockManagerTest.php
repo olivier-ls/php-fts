@@ -192,8 +192,15 @@ class LockManagerTest extends TestCase
     public function acquire_reclaims_a_lock_older_than_the_maximum_age(): void
     {
         $this->simulateForeignLock(getmypid());
+
+        // Both, because the timestamp that decides this is the pid file's now.
+        // A directory's cannot be refreshed portably — `touch()` on one is not
+        // — and the age rule needs something a living holder can keep moving,
+        // or a long import on a host without ext-posix declares itself dead.
+        // An abandoned lock has both of these old anyway.
         touch($this->lockDir(), time() - 600);
-        clearstatcache(true, $this->lockDir());
+        touch($this->pidFile(), time() - 600);
+        clearstatcache();
 
         $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
         $lm->acquire();
@@ -201,6 +208,36 @@ class LockManagerTest extends TestCase
         $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
 
         $lm->release();
+    }
+
+    #[Test]
+    public function a_lock_kept_warm_is_not_reclaimed_however_old_it_is(): void
+    {
+        // The other half, and the reason the age rule was dangerous on its own:
+        // `optimize()` on a large index legitimately holds the write lock for
+        // minutes, and a shared host is not a fast machine. Declaring that
+        // writer dead put two processes in the critical section together, both
+        // reading the same generation and both publishing `commit.N+1` — the
+        // second rename overwriting the first, one commit gone in silence.
+        $holder = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
+        $holder->acquire();
+
+        touch($this->pidFile(), time() - 600);
+        touch($this->lockDir(), time() - 600);
+        clearstatcache();
+
+        $holder->heartbeat();
+        clearstatcache();
+
+        $waiting = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 300);
+
+        $this->expectException(LockException::class);
+
+        try {
+            $waiting->acquire();
+        } finally {
+            $holder->release();
+        }
     }
 
     #[Test]

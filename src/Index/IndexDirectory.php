@@ -378,6 +378,12 @@ final class IndexDirectory
                 $name = $this->newSegmentName();
                 $full->write($this->segmentPath($name));
 
+                // A large import holds the write lock for a long time, and on a
+                // host where `posix_kill()` is unavailable the only evidence a
+                // waiting process has that this one is alive is the clock. Each
+                // segment is a natural place to put something on it.
+                $this->lock->heartbeat();
+
                 $inferred ??= $full->schema();
                 $written[]  = ['name' => $name, 'documents' => $full->count(), 'deleted' => ''];
             };
@@ -932,6 +938,11 @@ final class IndexDirectory
             }
 
             $this->performMerge($positions);
+
+            // See the same call in putMany(): a merge is the other operation
+            // long enough for a waiting process to start wondering whether this
+            // one is still alive.
+            $this->lock->heartbeat();
         }
     }
 
