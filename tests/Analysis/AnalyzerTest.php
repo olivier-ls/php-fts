@@ -189,6 +189,81 @@ class AnalyzerTest extends TestCase
     }
 
     #[Test]
+    public function arabic_and_hebrew_meet_their_own_vocalised_spellings(): void
+    {
+        // Both write their vowels as optional marks and both normally leave
+        // them out — harakat belong to scripture, poetry and schoolbooks, and
+        // niqqud to the same. Kept, they split a word in two: a vocalised
+        // catalogue could not be found by anyone typing the ordinary spelling,
+        // and neither could the reverse.
+        $plain = $this->analyzer->analyze('كتاب');
+
+        $this->assertSame($plain, $this->analyzer->analyze('كِتَاب'), 'harakat');
+        $this->assertSame($plain, $this->analyzer->analyze('كــتاب'), 'tatweel');
+
+        $this->assertSame(
+            $this->analyzer->analyze('נעל'),
+            $this->analyzer->analyze('נַעַל'),
+            'niqqud'
+        );
+    }
+
+    #[Test]
+    public function a_script_own_punctuation_ends_a_word(): void
+    {
+        // A Unicode block holds its script's punctuation alongside its letters,
+        // so these used to ride on the word beside them: `كتاب،` is a term no
+        // query for `كتاب` ever produces, and the maqaf glued two Hebrew words
+        // into one.
+        $this->assertSame(['كتاب', 'جديد'], $this->analyzer->analyze('كتاب، جديد'), 'Arabic comma');
+        $this->assertSame(['בית', 'ספר'], $this->analyzer->analyze('בית־ספר'), 'Hebrew maqaf');
+        $this->assertSame(['3', '4'], $this->analyzer->analyze('3×4'), 'multiplication sign');
+    }
+
+    #[Test]
+    public function digits_meet_across_writing_systems(): void
+    {
+        // Unicode knows what each digit is worth, so this is derived rather
+        // than decided: a catalogue writing ٢٠٢٤ and a shopper typing 2024 are
+        // saying the same thing.
+        $this->assertSame(['123'], $this->analyzer->analyze('١٢٣'), 'Arabic-Indic');
+        $this->assertSame(['123'], $this->analyzer->analyze('۱۲۳'), 'Extended Arabic-Indic');
+        $this->assertSame(['123'], $this->analyzer->analyze('१२३'), 'Devanagari');
+    }
+
+    #[Test]
+    public function scripts_that_used_to_be_deleted_are_indexed(): void
+    {
+        // Every one of these analysed to nothing at all, silently — the same
+        // deletion 1.x performed on Cyrillic and Japanese with a single
+        // `[^a-z0-9]+`, and the reason this release exists.
+        $samples = [
+            'Bengali'   => 'চামড়ার জুতা',
+            'Tamil'     => 'தோல் காலணி',
+            'Telugu'    => 'తోలు బూట్లు',
+            'Gujarati'  => 'ચામડાના જૂતા',
+            'Gurmukhi'  => 'ਚਮੜੇ ਦੀ ਜੁੱਤੀ',
+            'Kannada'   => 'ಚರ್ಮದ ಶೂ',
+            'Malayalam' => 'ലെതർ ഷൂ',
+            'Sinhala'   => 'සම් සපත්තු',
+            'Georgian'  => 'ტყავის ფეხსაცმელი',
+            'Armenian'  => 'կաշվե կոշիկ',
+            'Ethiopic'  => 'የቆዳ ጫማ',
+        ];
+
+        foreach ($samples as $script => $text) {
+            // Counted off the sample rather than written down beside it: these
+            // are two and three words depending on the language, and hardcoding
+            // the number tests my reading of Gurmukhi rather than the analyzer.
+            $this->assertCount(
+                count(explode(' ', $text)),
+                $this->analyzer->analyze($text),
+                $script
+            );
+        }
+    }
+
+    #[Test]
     public function html_is_stripped_and_entities_decoded(): void
     {
         $this->assertSame(

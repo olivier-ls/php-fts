@@ -155,6 +155,17 @@ function foldOf(int $codepoint, Script $script): ?string
     // itself while its capital folded to β — seventy Greek code points where
     // the two cases could not meet. Case folding maps them onto the canonical
     // letter, and throws in ẞ → ss and ς → σ for free.
+    // Digits, in whatever system they are written. Unicode knows what each one
+    // is worth, so this is derived rather than decided: a catalogue writing
+    // ٢٠٢٤ and a shopper typing 2024 are saying the same thing, and so are
+    // ١٢٣ and १२३ and 123. Folding them onto ASCII is also what makes them
+    // *one* term across scripts instead of one per script.
+    $value = IntlChar::charDigitValue($codepoint);
+
+    if ($value >= 0 && $value <= 9) {
+        return (string) $value;
+    }
+
     $lower = mb_convert_case($character, MB_CASE_FOLD, 'UTF-8');
 
     $folded = match ($script) {

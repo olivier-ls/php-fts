@@ -156,11 +156,26 @@ final class CharacterFolder
      * Handles text that arrives decomposed: `e` + U+0301 gives the same result
      * as the precomposed `é`, so both spellings reach the index as `e`.
      *
-     * Deliberately not "everything Unicode calls a mark". A Devanagari matra
-     * and a Thai vowel sign are marks and are *obligatory* — stripping them
-     * would delete the vowels of the word. What belongs here is only the marks
-     * a script treats as optional, which is a judgement per script rather than
+     * Deliberately not "everything Unicode calls a mark", which is why this is
+     * a hand-written list beside a generated table. A Devanagari matra and a
+     * Thai vowel sign are marks and are *obligatory* — stripping them would
+     * delete the vowels of the word. What belongs here is only the marks a
+     * script treats as optional, and that is a judgement per script rather than
      * a category lookup.
+     *
+     * ── Arabic and Hebrew ─────────────────────────────────────────────────
+     *
+     * Both write their vowels as optional marks and both normally leave them
+     * out: harakat appear in Qur'anic text, poetry and children's books, and
+     * niqqud in scripture and dictionaries. Kept, they split a word in two —
+     * `كِتَاب` and `كتاب` were different terms, so a vocalised catalogue could
+     * not be found by anyone typing the ordinary spelling, and neither could
+     * the reverse.
+     *
+     * The tatweel is not a mark at all — Unicode calls it a modifier letter —
+     * but it belongs here for the same reason and more plainly: it is a
+     * *typographic stretch*, inserted to justify a line, carrying no sound.
+     * `كــتاب` is `كتاب` written wide.
      */
     public static function isCombiningMark(int $codepoint): bool
     {
@@ -168,6 +183,24 @@ final class CharacterFolder
             || ($codepoint >= 0x1AB0 && $codepoint <= 0x1AFF)
             || ($codepoint >= 0x1DC0 && $codepoint <= 0x1DFF)
             || ($codepoint >= 0x20D0 && $codepoint <= 0x20FF)
-            || ($codepoint >= 0xFE20 && $codepoint <= 0xFE2F);
+            || ($codepoint >= 0xFE20 && $codepoint <= 0xFE2F)
+
+            // Hebrew: cantillation marks, then the vowel points. U+05BE is the
+            // maqaf and U+05C0/05C3/05C6 are punctuation — all four are already
+            // separators, so they are stepped over rather than stripped.
+            || ($codepoint >= 0x0591 && $codepoint <= 0x05BD)
+            || $codepoint === 0x05BF
+            || ($codepoint >= 0x05C1 && $codepoint <= 0x05C2)
+            || ($codepoint >= 0x05C4 && $codepoint <= 0x05C5)
+            || $codepoint === 0x05C7
+
+            // Arabic: the tatweel, the harakat, the superscript alef, and the
+            // Qur'anic annotation marks.
+            || $codepoint === 0x0640
+            || ($codepoint >= 0x064B && $codepoint <= 0x065F)
+            || $codepoint === 0x0670
+            || ($codepoint >= 0x06D6 && $codepoint <= 0x06DC)
+            || ($codepoint >= 0x06DF && $codepoint <= 0x06E8)
+            || ($codepoint >= 0x06EA && $codepoint <= 0x06ED);
     }
 }
