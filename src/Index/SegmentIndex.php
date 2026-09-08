@@ -16,7 +16,10 @@ use Ols\PhpFts\Highlight;
 use Ols\PhpFts\Hit;
 use Ols\PhpFts\Query\CollectionStatistics;
 use Ols\PhpFts\Query\Highlighter;
+use Ols\PhpFts\Query\QueryPlan;
+use Ols\PhpFts\Query\QuerySlot;
 use Ols\PhpFts\Query\Scorer;
+use Ols\PhpFts\Query\TermExpansion;
 use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
@@ -81,20 +84,6 @@ use Ols\PhpFts\Storage\Varint;
  */
 final class SegmentIndex
 {
-    /**
-     * Fraction of a query's terms a document must hold to match.
-     *
-     * Sets the balance between recall and precision, and it is the single knob
-     * that decides whether "lether sho" still finds "leather shoe": those two
-     * share six trigrams out of the query's nine, so anything up to 0.66 keeps
-     * them together. Lower it and unrelated words creep in; raise it and typos
-     * stop working.
-     *
-     * A placeholder for the tunable it should become, and for the scoring that
-     * will make the cut-off matter less.
-     */
-    private const MIN_SHOULD_MATCH = 0.6;
-
     private SegmentReader $segment;
     private Analyzer $analyzer;
 
@@ -104,6 +93,9 @@ final class SegmentIndex
 
     private ?BlockDictionaryReader $terms = null;
     private ?BlockDictionaryReader $keys = null;
+
+    /** The grams of this segment's vocabulary; absent on segments written before it existed. */
+    private ?BlockDictionaryReader $termGrams = null;
 
     /** Reverse of the key dictionary, built on first use. @var string[]|null */
     private ?array $keysByOrdinal = null;
@@ -122,7 +114,8 @@ final class SegmentIndex
     /** @var array<int, int> bit => summed field length */
     private array $fieldLengthSums = [];
 
-    private int $maskWidth = 1;
+    /** Bytes per posting in `fieldfreq`: one per searchable field. */
+    private int $frequencyWidth = 1;
 
     private int $termLengthSum = 0;
 
@@ -148,7 +141,7 @@ final class SegmentIndex
         $this->schema           = Schema::fromArray($meta['schema']);
         $this->searchableFields = array_values($meta['searchableFields'] ?? []);
         $this->fieldLengthSums  = $meta['fieldLengthSums'] ?? [];
-        $this->maskWidth        = max(1, (int) ($meta['maskWidth'] ?? 1));
+        $this->frequencyWidth   = max(1, (int) ($meta['frequencyWidth'] ?? 1));
         $this->documents        = DocumentStore::open($segment, 'docs');
         $this->scorer           = new Scorer();
     }
@@ -235,10 +228,19 @@ final class SegmentIndex
         // such rather than by every hit quietly missing a highlight.
         $highlight = Highlight::normalise($highlight);
         $marker    = $highlight === null ? null : $this->highlighter($highlight);
-        $marked    = $highlight === null ? [] : array_fill_keys($this->analyzer->analyze($query), true);
 
-        $filter                = Filter::normalise($filters) ?? Filter::all();
-        [$candidates, $scores] = $this->candidates($query, boosts: $boosts);
+        // Normalised before the plan is resolved, so that a malformed filter is
+        // still reported before a single posting list is read.
+        $filter = Filter::normalise($filters) ?? Filter::all();
+
+        $plan = $this->planFor($query);
+
+        // What the *documents* say, not what was typed: a search for `stel`
+        // finds documents containing `steel`, and marking `stel` would mark
+        // nothing at all.
+        $marked = $highlight === null ? [] : array_fill_keys($plan->terms(), true);
+
+        [$candidates, $scores] = $this->candidates($plan, boosts: $boosts);
 
         $matches = $this->narrow($candidates, $filter);
         $total   = $matches->count();
@@ -312,7 +314,7 @@ final class SegmentIndex
      * @throws FilterException
      */
     public function select(
-        string $query,
+        QueryPlan|string $query,
         Filter|array $filters = [],
         ?Bitset $deleted = null,
         ?CollectionStatistics $statistics = null,
@@ -343,13 +345,19 @@ final class SegmentIndex
      * @throws CorruptSegmentException
      */
     public function candidates(
-        string $query,
+        QueryPlan|string $query,
         ?Bitset $deleted = null,
         ?CollectionStatistics $statistics = null,
         array $boosts = [],
     ): array {
+        // A string is the convenience for the single-segment case: the plan is
+        // resolved against this segment, which is only right when it is the
+        // whole index. The multi-segment layer always passes a plan it built
+        // from every vocabulary — see QueryPlan.
+        $plan = $query instanceof QueryPlan ? $query : $this->planFor($query, $statistics);
+
         [$matches, $scores] = $this->matchQuery(
-            $query,
+            $plan,
             $statistics ?? new CollectionStatistics($this->documentCount, $this->averageLength()),
             $boosts,
         );
@@ -439,7 +447,7 @@ final class SegmentIndex
      * difference between merging and dying.
      *
      * @internal for SegmentMerger
-     * @return \Generator<string, array<int, int>> term => ordinal => field mask
+     * @return \Generator<string, array<int, string>> term => ordinal => frequency record
      * @throws CorruptSegmentException
      */
     public function postingsByTerm(): \Generator
@@ -447,23 +455,25 @@ final class SegmentIndex
         // A schema with one searchable field writes no masks, because every
         // mask would hold the same single bit. Carried across, that bit still
         // has to be set: bit 0 is that one field.
-        $masked = $this->usesFieldMasks();
-
         foreach ($this->terms()->iterate() as $term => $payload) {
             $entry  = self::decodeEntry($payload);
             $cursor = PostingsCursor::open(
                 $this->segment->read('postings', $entry['offset'], $entry['length'])
             );
 
-            $masks = $masked
-                ? $this->segment->read('fieldmask', $entry['masks'], $entry['documents'] * $this->maskWidth)
-                : null;
-
+            $records   = $this->frequenciesFor($entry);
             $byOrdinal = [];
             $index     = 0;
 
             while ($cursor->current() !== PostingsFormat::END) {
-                $byOrdinal[$cursor->current()] = $masks === null ? 1 : $this->maskAt($masks, $index);
+                // Carried across as the bytes they are, not decoded into
+                // per-field numbers and re-encoded. A merge's job here is to
+                // renumber documents, not to reinterpret what was measured.
+                $byOrdinal[$cursor->current()] = substr(
+                    $records,
+                    $index * $this->frequencyWidth,
+                    $this->frequencyWidth
+                );
 
                 $index++;
                 $cursor->next();
@@ -583,7 +593,7 @@ final class SegmentIndex
         $frequencies = [];
 
         foreach ($terms as $term) {
-            $entry = $this->entryFor($term);
+            $entry = $this->entryFor((string) $term);
 
             if ($entry !== null) {
                 $frequencies[$term] = $entry['documents'];
@@ -591,6 +601,180 @@ final class SegmentIndex
         }
 
         return $frequencies;
+    }
+
+    /**
+     * For each of the query's words, the terms *this segment* holds that are
+     * within its edit budget.
+     *
+     * Positional rather than keyed by the word, because PHP would turn a
+     * numeric word into an integer key — and a word can now be `21` or a model
+     * number. The caller pairs the result back up with the words it passed.
+     *
+     * ── How the candidates are found ───────────────────────────────────────
+     *
+     * Through the segment's second tier: the grams of its own vocabulary, so a
+     * typed word reaches its neighbours through a handful of short lookups.
+     * Only terms sharing enough grams to still be within the edit budget are
+     * measured, and the share required is a sound bound rather than a tuned
+     * one — see TermGramIndex::shareRequired().
+     *
+     * A segment written before that section existed has none, and falls back
+     * to reading the whole dictionary. Correct, and slow enough that it is
+     * worth reindexing: measured at 2.9 seconds a search on 45 000 products,
+     * against milliseconds through the section.
+     *
+     * @param string[] $typed the query's terms, from the analyzer
+     * @return array<int, array<string, float>> by position, term => weight
+     * @internal for IndexDirectory, which unions these across segments
+     * @throws CorruptSegmentException
+     */
+    public function expandTerms(array $typed): array
+    {
+        $found      = [];
+        $expansions = [];
+
+        foreach (array_values($typed) as $position => $word) {
+            $word             = (string) $word;
+            // Weight 1.0, not 0: the word itself counts for everything. It read
+            // as a *distance* of zero until candidates started carrying weights
+            // instead, and left as it was it would have made every exact match
+            // contribute nothing at all.
+            $found[$position] = $this->entryFor($word) === null ? [] : [$word => 1.0];
+
+            if (!TermExpansion::tolerates($word)) {
+                continue;
+            }
+
+            $expansion = new TermExpansion($word);
+
+            if ($expansion->budget() > 0) {
+                $expansions[$position] = $expansion;
+            }
+        }
+
+        if ($expansions === []) {
+            return $found;
+        }
+
+        if (!$this->segment->has('termgrams')) {
+            return $this->expandByScan($found, $expansions);
+        }
+
+        foreach ($expansions as $position => $expansion) {
+            $grams  = TermGramIndex::of($expansion->typed);
+            $shared = [];
+
+            foreach ($grams as $gram) {
+                $payload = $this->termGrams()->get($gram);
+
+                if ($payload === null) {
+                    continue;
+                }
+
+                foreach (TermGramIndex::decode($payload) as $candidate) {
+                    $shared[$candidate] = ($shared[$candidate] ?? 0) + 1;
+                }
+            }
+
+            $required = TermGramIndex::shareRequired(count($grams), $expansion->budget());
+
+            foreach ($shared as $candidate => $grammes) {
+                if ($grammes < $required) {
+                    continue;
+                }
+
+                $candidate = (string) $candidate;
+
+                if (isset($found[$position][$candidate])) {
+                    continue;
+                }
+
+                $weight = $expansion->accepts($candidate);
+
+                if ($weight !== null) {
+                    $found[$position][$candidate] = $weight;
+                }
+            }
+        }
+
+        return $found;
+    }
+
+    /**
+     * Expansion for a segment with no second tier, by reading every term.
+     *
+     * One traversal however many words the query has, because the dictionary
+     * is the expensive thing to walk and a word is cheap to test against.
+     *
+     * @param array<int, array<string, float>> $found
+     * @param array<int, TermExpansion>        $expansions
+     * @return array<int, array<string, float>>
+     * @throws CorruptSegmentException
+     */
+    private function expandByScan(array $found, array $expansions): array
+    {
+        foreach ($this->terms()->iterate() as $term => $payload) {
+            $term = (string) $term;
+
+            foreach ($expansions as $position => $expansion) {
+                if (isset($found[$position][$term])) {
+                    continue;
+                }
+
+                $weight = $expansion->accepts($term);
+
+                if ($weight !== null) {
+                    $found[$position][$term] = $weight;
+                }
+            }
+        }
+
+        return $found;
+    }
+
+    private function termGrams(): BlockDictionaryReader
+    {
+        return $this->termGrams ??= new BlockDictionaryReader($this->segment, 'termgrams');
+    }
+
+    /**
+     * A plan for a query, resolved against this segment alone.
+     *
+     * Correct only when this segment *is* the index, which is the case
+     * `search()` serves and the case the tests exercise. The multi-segment
+     * layer builds its own plan from every segment's vocabulary — see
+     * QueryPlan, which explains why that distinction is not optional.
+     *
+     * @throws CorruptSegmentException
+     */
+    public function planFor(string $query, ?CollectionStatistics $statistics = null): QueryPlan
+    {
+        $typed = $this->analyzer->analyze($query);
+
+        if ($typed === []) {
+            return QueryPlan::matchAll();
+        }
+
+        $candidates = $this->expandTerms($typed);
+        $terms      = [];
+
+        foreach ($candidates as $byTerm) {
+            foreach (array_keys($byTerm) as $term) {
+                $terms[] = (string) $term;
+            }
+        }
+
+        // No field averages: fieldAverages() falls back to this segment's own
+        // sums when the statistics carry none, which is exactly right when the
+        // segment is the index.
+        $statistics ??= new CollectionStatistics(
+            $this->documentCount,
+            $this->averageLength(),
+            $this->documentFrequencies($terms),
+        );
+
+        return QueryPlan::build($typed, $candidates, $statistics, $this->scorer);
     }
 
     /**
@@ -638,112 +822,132 @@ final class SegmentIndex
      * @return array{0: Bitset, 1: array<int, float>} the matches, and their BM25 scores
      * @throws CorruptSegmentException
      */
-    private function matchQuery(string $query, CollectionStatistics $statistics, array $boosts = []): array
+    private function matchQuery(QueryPlan $plan, CollectionStatistics $statistics, array $boosts = []): array
     {
-        $terms = $this->analyzer->analyze($query);
-
-        if ($terms === []) {
+        if ($plan->matchesEverything) {
             return [Bitset::full($this->documentCount), []];
         }
 
-        /** @var array<int, int> ordinal => how many query terms it holds */
-        $held = [];
+        if ($plan->matchesNothing()) {
+            return [Bitset::empty($this->documentCount), []];
+        }
 
-        /** @var array<int, float> ordinal => summed IDF of those terms */
+        /** @var array<int, float> ordinal => IDF it has gathered across slots */
+        $gathered = [];
+
+        /** @var array<int, float> ordinal => score so far */
         $weights = [];
 
         $weightByBit = $this->boostsByBit($boosts);
         $averages    = $this->fieldAverages($statistics);
         $bByBit      = $this->bByBit();
 
-        foreach ($terms as $term) {
-            $entry = $this->entryFor($term);
+        // The one slot every match must hold, if there is one, and the shortest
+        // such. See mandatorySlot(): it turns the walk from "read every list"
+        // into "read the shortest mandatory list, then jump through the others",
+        // which is what the skip tables were written for and what nothing had
+        // ever called them for.
+        $driver = $plan->driven ? $this->mandatorySlot($plan) : null;
 
-            if ($entry === null) {
-                continue;
-            }
+        if ($driver !== null) {
+            return $this->matchDriven($plan, $driver, $statistics, $weightByBit, $averages, $bByBit);
+        }
 
-            // Computed once per term, before any document is looked at. 1.x
-            // called log() and a dictionary lookup inside the per-document loop.
-            $idf = $this->scorer->idf(
-                $statistics->documentFrequency($term) ?: $entry['documents'],
-                $statistics->documentCount ?: $this->documentCount,
-            );
+        foreach ($plan->slots as $slot) {
+            // Gathered per slot rather than per term, because the variants of
+            // one typed word are one match and not several. A document holding
+            // `couteau` twice and `couteaux` once has said `couteau` three
+            // times as far as the query is concerned — but not equally: each
+            // occurrence counts for how close its variant is to what was
+            // actually typed, so the exact word outweighs the correction.
+            //
+            // Weighting the *frequency* rather than the finished score is what
+            // makes that work through the saturation instead of around it. The
+            // first version multiplied the score afterwards, which let a
+            // distant variant occurring often beat the exact word occurring
+            // once — the opposite of the intent.
+            //
+            // @var array<int, array<int, float>> ordinal => bit => weighted tf
+            $reached = [];
 
-            $cursor = PostingsCursor::open(
-                $this->segment->read('postings', $entry['offset'], $entry['length'])
-            );
+            foreach ($slot->candidates as [$term, $weight]) {
+                $entry = $this->entryFor($term);
 
-            $masks = $this->masksFor($entry);
-            $index = 0;
-
-            while ($cursor->current() !== PostingsFormat::END) {
-                $ordinal = $cursor->current();
-
-                $held[$ordinal] = ($held[$ordinal] ?? 0) + 1;
-
-                if ($masks === null) {
-                    // A segment written before field masks existed: fall back to
-                    // plain BM25, which normalises against the whole document.
-                    $weights[$ordinal] = ($weights[$ordinal] ?? 0.0) + $idf;
-                } else {
-                    $combined = $this->scorer->fieldedFrequency(
-                        $this->maskAt($masks, $index),
-                        $weightByBit,
-                        $this->fieldLengthsOf($ordinal),
-                        $averages,
-                        $bByBit,
-                    );
-
-                    $weights[$ordinal] = ($weights[$ordinal] ?? 0.0)
-                        + $this->scorer->fieldedScore($idf, $combined);
+                if ($entry === null) {
+                    continue;
                 }
 
-                $index++;
-                $cursor->next();
+                $cursor = PostingsCursor::open(
+                    $this->segment->read('postings', $entry['offset'], $entry['length'])
+                );
+
+                $records = $this->frequenciesFor($entry);
+                $index   = 0;
+
+                while ($cursor->current() !== PostingsFormat::END) {
+                    $ordinal = $cursor->current();
+
+                    foreach ($this->frequenciesAt($records, $index) as $bit => $frequency) {
+                        $reached[$ordinal][$bit] = ($reached[$ordinal][$bit] ?? 0.0)
+                            + $weight * $frequency;
+                    }
+
+                    $index++;
+                    $cursor->next();
+                }
+            }
+
+            foreach ($reached as $ordinal => $frequencies) {
+                $gathered[$ordinal] = ($gathered[$ordinal] ?? 0.0) + $slot->idf;
+
+                $combined = $this->scorer->fieldedFrequency(
+                    $frequencies,
+                    $weightByBit,
+                    $this->fieldLengthsOf($ordinal),
+                    $averages,
+                    $bByBit,
+                );
+
+                $weights[$ordinal] = ($weights[$ordinal] ?? 0.0)
+                    + $this->scorer->fieldedScore($slot->idf, $combined);
             }
         }
 
-        if ($held === []) {
+        if ($gathered === []) {
             return [Bitset::empty($this->documentCount), []];
         }
 
-        // A document has to hold enough of the query's terms, rather than all of
-        // them or merely one.
+        // A document has to account for most of what the query was about.
         //
-        // The first version of this jumped: it took the documents holding every
-        // term, and if there were none it fell back to those holding any. That
-        // decision was made per segment, so the same query answered differently
-        // depending on how the documents happened to be spread across segments —
-        // and merging them changed the result. A test comparing a search before
-        // and after a merge caught it.
+        // The threshold comes from the plan, which was built from the whole
+        // index before any segment was asked anything — never from what this
+        // segment happens to contain. That is what makes the answer
+        // independent of write history, and it is not a theoretical concern:
+        // an earlier version decided per segment, so the same query answered
+        // differently depending on how documents had been spread across
+        // segments, and merging them changed the result. A test comparing a
+        // search before and after a merge caught it.
         //
-        // The threshold is computed from the query alone, never from what this
-        // segment happens to contain, which is what makes the answer independent
-        // of write history. It also degrades smoothly: a typo costs a few
-        // trigrams and stays above the bar, while an unrelated word does not.
-        $required = max(1, (int) ceil(count($terms) * self::MIN_SHOULD_MATCH));
+        // Compared with a tolerance because both sides are sums of floats: a
+        // document holding every slot gathers exactly the total the threshold
+        // was taken from, and must not lose to the last bit of a mantissa.
+        $required = $plan->required - 1e-9;
+        $matches  = Bitset::empty($this->documentCount);
+        $scores   = [];
 
-        $matches       = Bitset::empty($this->documentCount);
-        $scores        = [];
-        $fielded       = $this->usesFieldMasks();
-        $averageLength = $statistics->averageLength > 0.0
-            ? $statistics->averageLength
-            : $this->averageLength();
-
-        foreach ($held as $ordinal => $count) {
-            if ($count < $required) {
+        foreach ($gathered as $ordinal => $carried) {
+            if ($carried < $required) {
                 continue;
             }
 
             $matches->set($ordinal);
 
-            // With masks the per-term scores are already normalised per field
-            // and saturated, so they only need adding up. Without them the
-            // accumulated IDF still has to be scaled by the document's length.
-            $scores[$ordinal] = $fielded
-                ? $weights[$ordinal]
-                : $this->scorer->score($weights[$ordinal], $this->lengthOf($ordinal), $averageLength);
+            // Already normalised per field and saturated, so the per-slot
+            // scores only need adding up. There is no longer an unfielded
+            // path: frequencies are written whatever the schema, because a
+            // frequency on a single field still says something a mask bit
+            // could not.
+            $scores[$ordinal] = $weights[$ordinal];
         }
 
         return [$matches, $scores];
@@ -825,46 +1029,266 @@ final class SegmentIndex
      * @param array{documents: int, offset: int, length: int, masks: int} $entry
      * @throws CorruptSegmentException
      */
-    private function masksFor(array $entry): ?string
+    private function frequenciesFor(array $entry): string
     {
-        if (!$this->usesFieldMasks()) {
-            return null;
-        }
-
         return $this->segment->read(
-            'fieldmask',
+            'fieldfreq',
             $entry['masks'],
-            $entry['documents'] * $this->maskWidth
+            $entry['documents'] * $this->frequencyWidth
         );
     }
 
     /**
-     * Whether this segment carries field masks at all.
+     * The cheapest slot no matching document can do without, or null.
      *
-     * A schema with one searchable field does not: every mask byte would hold
-     * the same single bit, and BM25F over one neutral field gives exactly what
-     * plain BM25 gives. Scoring then takes the unfielded path, which normalises
-     * against the whole document instead of per field — the same answer, and
-     * 23% of a segment saved.
+     * The threshold is an amount of IDF, so a document is allowed to miss at
+     * most `slack()` of it. A slot worth more than that cannot be missed by
+     * anything that matches — it is mandatory, and every match is therefore
+     * somewhere in *its* posting lists. That makes it a starting point: read it
+     * once and jump through the rest.
+     *
+     * Which mandatory slot to start from is decided by how many postings it
+     * costs in this segment, not by its IDF: the point is to drive the loop
+     * from the shortest list. On `couteau de cuisine inox` the slack is 3.36
+     * and `cuisine` is worth 4.40, so 1 071 postings drive the query instead of
+     * `couteau`'s 17 274 being read in full.
+     *
+     * Returns null when no slot is mandatory — a query of several words of
+     * similar, low weight, where every combination can reach the bar and there
+     * is nothing to anchor on. The full walk handles that, correctly and no
+     * more slowly than before.
+     *
+     * @return array{0: QuerySlot, 1: int}|null the slot and its position
+     * @throws CorruptSegmentException
      */
-    private function usesFieldMasks(): bool
+    private function mandatorySlot(QueryPlan $plan): ?array
     {
-        return count($this->searchableFields) > 1 && $this->segment->has("fieldmask");
-    }
+        if (count($plan->slots) < 2) {
+            return null;
+        }
 
-    private function maskAt(string $masks, int $index): int
-    {
-        $mask = 0;
+        $slack   = $plan->slack() + 1e-9;
+        $best    = null;
+        $cheapest = PHP_INT_MAX;
 
-        for ($byte = 0; $byte < $this->maskWidth; $byte++) {
-            $position = $index * $this->maskWidth + $byte;
+        foreach ($plan->slots as $position => $slot) {
+            if ($slot->idf <= $slack) {
+                continue;
+            }
 
-            if ($position < strlen($masks)) {
-                $mask |= ord($masks[$position]) << ($byte * 8);
+            $postings = 0;
+
+            foreach ($slot->candidates as [$term]) {
+                $entry = $this->entryFor($term);
+
+                if ($entry !== null) {
+                    $postings += $entry['documents'];
+                }
+            }
+
+            // A mandatory slot this segment holds nothing for means no document
+            // here can match at all — reported as an empty driver rather than
+            // discovered by walking every other list first.
+            if ($postings === 0) {
+                return [$slot, $position];
+            }
+
+            if ($postings < $cheapest) {
+                $cheapest = $postings;
+                $best     = [$slot, $position];
             }
         }
 
-        return $mask;
+        return $best;
+    }
+
+    /**
+     * The match set, driven from one mandatory slot.
+     *
+     * Every match holds the driver, so its postings are the only documents
+     * worth asking the other slots about — and asking is `advance()`, which
+     * bisects a skip table and decodes one block instead of every gap along the
+     * way. The saving is the difference between the driver's length and the
+     * others': it is large exactly when one word of the query is rare and the
+     * rest are common, which is the shape of most real searches.
+     *
+     * Identical results to the full walk by construction rather than by
+     * measurement: nothing is pruned on a score estimate, only on the fact that
+     * a document without the driver cannot reach the threshold. That is
+     * arithmetic on the plan, not a heuristic — which is what lets `total` stay
+     * exact while the walk gets cheaper.
+     *
+     * @param array{0: QuerySlot, 1: int} $driver
+     * @param array<int, float>           $weightByBit
+     * @param array<int, float>           $averages
+     * @param array<int, float>           $bByBit
+     *
+     * @return array{0: Bitset, 1: array<int, float>}
+     * @throws CorruptSegmentException
+     */
+    private function matchDriven(
+        QueryPlan $plan,
+        array $driver,
+        CollectionStatistics $statistics,
+        array $weightByBit,
+        array $averages,
+        array $bByBit,
+    ): array {
+        [$driverSlot, $driverPosition] = $driver;
+
+        /** @var array<int, array<int, array<int, float>>> ordinal => slot => bit => weighted tf */
+        $reached = [];
+
+        foreach ($this->slotFrequencies($driverSlot) as $ordinal => $frequencies) {
+            $reached[$ordinal][$driverPosition] = $frequencies;
+        }
+
+        if ($reached === []) {
+            return [Bitset::empty($this->documentCount), []];
+        }
+
+        // Ascending, because that is the only order a forward-only cursor can
+        // be pushed through.
+        ksort($reached);
+        $candidates = array_keys($reached);
+
+        foreach ($plan->slots as $position => $slot) {
+            if ($position === $driverPosition) {
+                continue;
+            }
+
+            foreach ($slot->candidates as [$term, $weight]) {
+                $entry = $this->entryFor($term);
+
+                if ($entry === null) {
+                    continue;
+                }
+
+                $cursor = PostingsCursor::open(
+                    $this->segment->read('postings', $entry['offset'], $entry['length'])
+                );
+
+                $records = $this->frequenciesFor($entry);
+
+                foreach ($candidates as $ordinal) {
+                    if ($cursor->advance($ordinal) === PostingsFormat::END) {
+                        break;
+                    }
+
+                    if ($cursor->current() !== $ordinal) {
+                        continue;
+                    }
+
+                    foreach ($this->frequenciesAt($records, $cursor->index()) as $bit => $frequency) {
+                        $reached[$ordinal][$position][$bit] = ($reached[$ordinal][$position][$bit] ?? 0.0)
+                            + $weight * $frequency;
+                    }
+                }
+            }
+        }
+
+        $required = $plan->required - 1e-9;
+        $matches  = Bitset::empty($this->documentCount);
+        $scores   = [];
+
+        foreach ($reached as $ordinal => $bySlot) {
+            $gathered = 0.0;
+
+            foreach (array_keys($bySlot) as $position) {
+                $gathered += $plan->slots[$position]->idf;
+            }
+
+            if ($gathered < $required) {
+                continue;
+            }
+
+            $lengths = $this->fieldLengthsOf($ordinal);
+            $score   = 0.0;
+
+            foreach ($bySlot as $position => $frequencies) {
+                $score += $this->scorer->fieldedScore(
+                    $plan->slots[$position]->idf,
+                    $this->scorer->fieldedFrequency($frequencies, $weightByBit, $lengths, $averages, $bByBit),
+                );
+            }
+
+            $matches->set($ordinal);
+            $scores[$ordinal] = $score;
+        }
+
+        return [$matches, $scores];
+    }
+
+    /**
+     * One slot's postings in this segment: ordinal => weighted frequency per
+     * field, with its variants already blended.
+     *
+     * @return array<int, array<int, float>>
+     * @throws CorruptSegmentException
+     */
+    private function slotFrequencies(QuerySlot $slot): array
+    {
+        $found = [];
+
+        foreach ($slot->candidates as [$term, $weight]) {
+            $entry = $this->entryFor($term);
+
+            if ($entry === null) {
+                continue;
+            }
+
+            $cursor = PostingsCursor::open(
+                $this->segment->read('postings', $entry['offset'], $entry['length'])
+            );
+
+            $records = $this->frequenciesFor($entry);
+            $index   = 0;
+
+            while ($cursor->current() !== PostingsFormat::END) {
+                $ordinal = $cursor->current();
+
+                foreach ($this->frequenciesAt($records, $index) as $bit => $frequency) {
+                    $found[$ordinal][$bit] = ($found[$ordinal][$bit] ?? 0.0) + $weight * $frequency;
+                }
+
+                $index++;
+                $cursor->next();
+            }
+        }
+
+        return $found;
+    }
+
+    /**
+     * One posting's term frequencies, by field bit.
+     *
+     * Zero-frequency fields are left out rather than reported as zero: the
+     * caller adds these up per query slot and then iterates what is there, so
+     * a field the term is absent from should not cost a loop iteration. On a
+     * three-field schema most postings name one field.
+     *
+     * @return array<int, int> bit => occurrences in that field
+     */
+    private function frequenciesAt(string $records, int $index): array
+    {
+        $at    = $index * $this->frequencyWidth;
+        $found = [];
+
+        for ($bit = 0; $bit < $this->frequencyWidth; $bit++) {
+            $position = $at + $bit;
+
+            if ($position >= strlen($records)) {
+                break;
+            }
+
+            $frequency = ord($records[$position]);
+
+            if ($frequency > 0) {
+                $found[$bit] = $frequency;
+            }
+        }
+
+        return $found;
     }
 
     /**
@@ -940,21 +1364,6 @@ final class SegmentIndex
         ];
     }
 
-    /**
-     * How many terms one document produced.
-     *
-     * @throws CorruptSegmentException
-     */
-    private function lengthOf(int $ordinal): int
-    {
-        $this->lengths ??= $this->segment->has('lengths')
-            ? $this->segment->read('lengths')
-            : '';
-
-        $packed = substr($this->lengths, $ordinal * 2, 2);
-
-        return strlen($packed) === 2 ? unpack('v', $packed)[1] : 0;
-    }
 
     private function averageLength(): float
     {

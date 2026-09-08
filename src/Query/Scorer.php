@@ -28,21 +28,17 @@ namespace Ols\PhpFts\Query;
  *
  * ── A shortcut this engine is entitled to ──────────────────────────────────
  *
- * The analyzer deduplicates, so a term appears at most once per document and
- * the term frequency is always 1. BM25 then collapses to
- *
- *     score(d) = normFactor(d) · Σ IDF(t)
- *
- * with `normFactor` depending only on the document's length. So the IDF of each
- * query term is computed once, before any document is looked at, and scoring a
- * document is an addition per matched term plus one multiplication at the end.
+ * The IDF of each query term is computed once, before any document is looked
+ * at, so scoring a document is an addition per matched term and no logarithms.
  * That matters: the audit of 1.x found it calling `log()` and a dictionary
  * lookup *inside* the per-document loop.
  *
- * The saturation parameter `k1` therefore has no effect on ranking here — with
- * a constant term frequency it scales every score identically. It is kept
- * because it is part of the formula and will matter as soon as BM25F combines
- * several fields, and because 1.x claimed a saturation it never had.
+ * `k1` is load-bearing again. It was not, for as long as a document's terms
+ * were its trigrams: the analyzer deduplicated them, term frequency was always
+ * 1, and a saturation parameter applied to a constant scales every score
+ * identically. Words are the terms now, a document can say one three times,
+ * and saturating that is the difference between "mentions it" and "is about
+ * it". See fieldedFrequency().
  *
  * ── Why the score is not scaled to 0-100 ───────────────────────────────────
  *
@@ -133,10 +129,24 @@ final class Scorer
      * a term in the title and in the description contributes more than either
      * alone, but not proportionally more — which is what saturation is for.
      *
-     * Term frequency is 0 or 1 per field, because the analyzer deduplicates, so
-     * the mask bit is the frequency.
+     * ── Term frequency used to be missing, and said so ─────────────────────
      *
-     * @param int     $mask     which fields hold the term, one bit each
+     * While a document's terms were its trigrams, the analyzer deduplicated
+     * them and `tf` was always 1 — so this method took a *bitmask* and the bit
+     * was the frequency. That was honest for what the index held and it cost
+     * real ranking signal once words became the terms: a search for `opinel`
+     * returned four products scoring 10.29 each, indistinguishable, while one
+     * of them said `opinel` twice in its own name. Frequencies arrive per
+     * field now, and `k1` finally does something.
+     *
+     * They arrive as floats rather than counts because a query slot blends its
+     * variants: a document holding `couteau` twice and `couteaux` once carries
+     * both towards the same typed word, each weighted by how close it is to
+     * what was actually typed. See QuerySlot.
+     *
+     * @param float[] $frequencies bit => how often the term occurs in that
+     *        field, weighted. A field absent from the map, or zero, does not
+     *        hold the term and contributes nothing.
      * @param float[] $boosts   bit => weight
      * @param int[]   $lengths  bit => terms this document has in that field
      * @param float[] $averages bit => mean across the index
@@ -146,7 +156,7 @@ final class Scorer
      *        it penalising the handful of brands that happen to be two words.
      */
     public function fieldedFrequency(
-        int $mask,
+        array $frequencies,
         array $boosts,
         array $lengths,
         array $averages,
@@ -154,8 +164,8 @@ final class Scorer
     ): float {
         $combined = 0.0;
 
-        foreach ($boosts as $bit => $boost) {
-            if ((($mask >> $bit) & 1) === 0) {
+        foreach ($frequencies as $bit => $frequency) {
+            if ($frequency <= 0.0) {
                 continue;
             }
 
@@ -166,7 +176,7 @@ final class Scorer
                 ? 1.0 - $b + $b * (($lengths[$bit] ?? 0) / $average)
                 : 1.0;
 
-            $combined += $boost / $normalisation;
+            $combined += ($boosts[$bit] ?? 1.0) * $frequency / $normalisation;
         }
 
         return $combined;

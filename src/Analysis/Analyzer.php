@@ -8,13 +8,13 @@ namespace Ols\PhpFts\Analysis;
  * Turns text into the terms the index stores.
  *
  *     $analyzer->analyze('Chaussure en cuir');
- *         → #ch, cha, hau, aus, uss, ssu, sur, ure, re#, #en, en#, #cu, cui, uir, ir#
+ *         → chaussure, en, cuir
  *
  *     $analyzer->analyze('革靴 ブラウン');
  *         → 革靴, ブラ, ラウ, ウン
  *
  *     $analyzer->analyze('Коричневые туфли');
- *         → #ко, кор, ори, рич, …
+ *         → коричневые, туфли
  *
  * The same object analyses documents and queries, which is the only way the
  * two can be guaranteed to agree: any rule applied to one is applied to the
@@ -30,8 +30,8 @@ namespace Ols\PhpFts\Analysis;
  *      marks, diacritics.
  *   4. The result is cut into runs of a single script, breaking on separators
  *      and on script changes.
- *   5. Each run yields n-grams, with the size and the padding its script calls
- *      for (see Script).
+ *   5. Each run yields its terms: one word for a script that separates words,
+ *      n-grams for one that does not (see Script, and termsOf() below).
  *   6. Terms are deduplicated.
  *
  * ── Why this replaces 1.x's tokenizer outright ──────────────────────────────
@@ -53,22 +53,50 @@ namespace Ols\PhpFts\Analysis;
  */
 final class Analyzer
 {
-    private const WORD_BOUNDARY = 0x23;   // '#'
-
     /**
      * @return string[] unique terms, in order of first appearance
      */
     public function analyze(string $text): array
     {
-        $terms = [];
+        // Deduplication goes through array keys, and PHP turns a key that
+        // looks like an integer into one. A term that is all digits — `21`,
+        // `2024`, a model number — would therefore come back as an int and be
+        // rejected by every string signature downstream. The `#` markers used
+        // to hide this, because `#21#` is not numeric; a word is.
+        return array_map('strval', array_keys($this->frequencies($text)));
+    }
+
+    /**
+     * The same terms, with how many times each one occurs.
+     *
+     * What indexing needs and {@see analyze()} throws away. BM25 weighs a term
+     * by how often a document uses it, and until words became the terms there
+     * was nothing to weigh: a document's trigrams were deduplicated, so every
+     * frequency was 1 and Scorer said so plainly — `k1 therefore has no effect
+     * on ranking here`. With words that silence is a real loss. Measured on
+     * the catalogue, a search for `opinel` returned four products scoring
+     * 10.29 each, indistinguishable, because every one of them said `opinel`
+     * once as far as the index could tell — while one of them said it twice in
+     * its own name.
+     *
+     * Note the keys: PHP will have turned an all-digit term into an integer,
+     * so a caller reading them back has to cast. Returned as a map anyway,
+     * because the count belongs *with* the term and every caller here wants
+     * both.
+     *
+     * @return array<string, int> term => occurrences
+     */
+    public function frequencies(string $text): array
+    {
+        $counts = [];
 
         foreach ($this->runs($text) as $run) {
-            foreach ($this->nGrams($run) as [$term]) {
-                $terms[$term] = true;
+            foreach ($this->termsOf($run) as [$term]) {
+                $counts[$term] = ($counts[$term] ?? 0) + 1;
             }
         }
 
-        return array_keys($terms);
+        return $counts;
     }
 
     /**
@@ -82,20 +110,18 @@ final class Analyzer
      * bytes there and two here.
      *
      * A term's span is the bytes of the characters it was cut from, which is
-     * why highlighting needs no separate notion of a word. The query `leather`
-     * analyses to `#le … er#`, whose seven spans tile the whole word, so
-     * merging what overlaps reconstructs `leather` — and does the same for
-     * `革靴` from its bigrams, in the same three lines and with no special
-     * case for the script.
+     * why highlighting needs no separate notion of a word. In a script that
+     * separates words the term *is* the word, so its span is the word and
+     * there is nothing to reconstruct. In a continuous script `革靴` still
+     * arrives as bigrams whose spans overlap, and merging them rebuilds the
+     * phrase — the same three lines, with no special case for the script.
      *
-     * The fourth value of each entry says whether the term is *only* anchored
-     * to a word edge: it contains a boundary marker, and the text it spans is
-     * not the whole word. `er#` from `over` is such a term — it describes how
-     * the word ends and nothing about what it says. `#en` from the word `en`
-     * is not, because a marker that is the only thing outside the span means
-     * the span is the entire word. Highlighting needs the distinction and the
-     * index does not, which is why it is computed here rather than carried
-     * through the n-gram loop that indexing also walks.
+     * The fourth value said whether a term was *only* anchored to a word edge,
+     * which was a real distinction while `over` produced `er#`: that term
+     * described how the word ended and nothing about what it said. No term is
+     * edge-anchored now that a word is its own term, so the value is always
+     * false. It stays in the shape because Highlighter reads it, and it is the
+     * next thing to remove once the query side has settled.
      *
      * @return array{text: string, terms: array<int, array{0: string, 1: int, 2: int, 3: bool}>}
      */
@@ -105,15 +131,12 @@ final class Analyzer
         $terms = [];
 
         foreach ($this->runsOf($plain) as $run) {
-            $sources = $run['sources'];
-            $from    = $sources[0];
-            $to      = $sources[count($sources) - 1];
-
-            foreach ($this->nGrams($run) as [$term, $start, $end]) {
-                $marked = str_contains($term, chr(self::WORD_BOUNDARY));
-                $whole  = $start === $from && $end === $to;
-
-                $terms[] = [$term, $start, $end, $marked && !$whole];
+            foreach ($this->termsOf($run) as [$term, $start, $end]) {
+                // No term is edge-anchored any more: a word-separated script
+                // yields the whole word, and a continuous one never carried a
+                // boundary marker to begin with. The flag stays in the shape
+                // because Highlighter reads it, and it is now always false.
+                $terms[] = [$term, $start, $end, false];
             }
         }
 
@@ -234,52 +257,78 @@ final class Analyzer
     }
 
     /**
-     * Slices one run into n-grams.
+     * Slices one run into the terms the index stores.
+     *
+     * Two regimes, and which one applies is the whole architecture:
+     *
+     *     word-separated scripts   one run is one word, and one word is one term
+     *     continuous scripts       one run is a phrase, and is cut into n-grams
      *
      * Character offsets were recorded while the run was built, so a term is a
      * substr rather than a re-encode — which matters, because this is the
      * innermost loop of indexing.
      *
+     * ── Why a word, and not its trigrams ───────────────────────────────────
+     *
+     * Because the trigrams of a *document* are the wrong place to buy typo
+     * tolerance, and that is what this used to do.
+     *
+     * Measured on a 45 000-product catalogue: trigramming the documents
+     * produced 8.5 million postings whose lists averaged 336 documents, and
+     * 38 trigrams sat in more than half the corpus. Trigramming the
+     * *vocabulary* of the same catalogue produces 590 000 postings whose lists
+     * average 24 words. Tolerance then costs the size of the vocabulary rather
+     * than the size of the corpus — and a vocabulary stops growing long before
+     * a catalogue does. The trigrams did not go away; they moved one floor up,
+     * to the term dictionary, where a query expands what was typed into the
+     * words that resemble it before any document is touched.
+     *
+     * It also buys back something a flat list of trigrams could not express:
+     * which word a match came from. A four-word query used to become twenty
+     * anonymous trigrams under a single threshold, so a document could clear
+     * the bar on `couteau`'s trigrams plus five strays and match without
+     * containing `cuisine` at all — which is why `couteau de cuisine inox`
+     * reported 10 877 matches where the truthful answer was near 460. Terms
+     * that are words make "every word present, each allowing a typo" sayable,
+     * and make tolerance a dial rather than the substrate.
+     *
+     * ── Why continuous scripts keep their n-grams ──────────────────────────
+     *
+     * Because there is no alternative. Finding word boundaries in Japanese,
+     * Chinese or Thai needs a segmentation dictionary, which this engine does
+     * not have and will not ship — so a run of those scripts is a phrase, and
+     * n-grams over the phrase are the only terms available. They keep the cost
+     * profile that words escape. That is a known and accepted asymmetry, not
+     * an oversight.
+     *
      * @param array{script: Script, bytes: string, offsets: int[], sources: int[]} $run
      * @return array<int, array{0: string, 1: int, 2: int}> term, and the bytes
      *         of the plain text it was cut from
      */
-    private function nGrams(array $run): array
+    private function termsOf(array $run): array
     {
-        $script  = $run['script'];
         $bytes   = $run['bytes'];
-        $offsets = $run['offsets'];
         $sources = $run['sources'];
 
-        // Word-separated scripts get markers at both ends, so that a run of one
-        // character still yields a term and so that prefixes and suffixes are
-        // searchable: "cuir" gives #cu … ir#.
-        if ($script->usesWordBoundaries()) {
-            $marker  = chr(self::WORD_BOUNDARY);
-            $bytes   = $marker . $bytes . $marker;
-            $shifted = [0];
-
-            foreach ($offsets as $offset) {
-                $shifted[] = $offset + 1;
-            }
-
-            $shifted[] = strlen($bytes);
-            $offsets   = $shifted;
-
-            // The markers are text the run never contained, so they are given
-            // no bytes of their own: the leading one collapses onto the start
-            // of the first character, the trailing one onto the end of the
-            // last. `#cu` and `ir#` then span exactly `cu` and `ir`.
-            $sources = array_merge([$sources[0]], $sources, [$sources[count($sources) - 1]]);
+        if ($bytes === '') {
+            return [];
         }
 
+        // One word, one term. The run is already folded, and its span is the
+        // whole word — which is also what makes highlighting a word exact,
+        // rather than a reconstruction from overlapping trigrams.
+        if (!$run['script']->isContinuous()) {
+            return [[$bytes, $sources[0], $sources[count($sources) - 1]]];
+        }
+
+        $offsets    = $run['offsets'];
         $characters = count($offsets) - 1;
-        $size       = $script->nGramSize();
+        $size       = $run['script']->nGramSize();
 
         // A run shorter than one n-gram is indexed whole, so that a single
         // Japanese character in a field is not simply lost.
         if ($characters < $size) {
-            return $bytes === '' ? [] : [[$bytes, $sources[0], $sources[count($sources) - 1]]];
+            return [[$bytes, $sources[0], $sources[count($sources) - 1]]];
         }
 
         $terms = [];

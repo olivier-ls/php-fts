@@ -186,12 +186,12 @@ final class SegmentMerger
      * @param SegmentIndex[]                    $sources segment position => segment
      * @param array<int, array<int, int>>       $remaps  position => source ordinal => new ordinal
      *
-     * @return \Generator<string, array<int, int>>
+     * @return \Generator<string, array<int, string>>
      * @throws CorruptSegmentException
      */
     private function mergedPostings(array $sources, array $remaps): \Generator
     {
-        /** @var \Generator<string, array<int, int>>[] */
+        /** @var \Generator<string, array<int, string>>[] */
         $heads = [];
 
         foreach ($remaps as $position => $_) {
@@ -222,16 +222,17 @@ final class SegmentMerger
 
                 $remap = $remaps[$position];
 
-                foreach ($walk->current() as $ordinal => $mask) {
+                foreach ($walk->current() as $ordinal => $record) {
                     if (isset($remap[$ordinal])) {
-                        // A term one source holds in the title and another in
-                        // the description keeps one posting per document with
-                        // both bits set — but only ever for the same document,
-                        // which cannot come from two sources. The union is
-                        // there because the shape says it may, not because it
-                        // does.
-                        $new        = $remap[$ordinal];
-                        $live[$new] = ($live[$new] ?? 0) | $mask;
+                        // Assigned, not combined. A document exists in exactly
+                        // one source — that is what a merge of disjoint
+                        // segments means — so its frequency record is whole
+                        // when it arrives and there is nothing to reconcile.
+                        // The mask version wrote a defensive union here for a
+                        // case that cannot occur; per-field frequencies make
+                        // the pretence expensive as well as untrue, since two
+                        // records would have to be added byte by byte.
+                        $live[$remap[$ordinal]] = $record;
                     }
                 }
 

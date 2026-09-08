@@ -90,9 +90,20 @@ class HighlighterTest extends TestCase
     }
 
     #[Test]
-    public function the_query_does_not_have_to_be_a_whole_word(): void
+    public function a_fragment_of_a_word_is_not_a_match_here(): void
     {
-        $this->assertSame('l<mark>eath</mark>er', $this->mark('eath', 'leather'));
+        // It used to be: a document was trigrammed, so `eath` shared `eat` and
+        // `ath` with `leather` and came back marked as `l<mark>eath</mark>er`.
+        // Terms are whole words now, and this class only ever sees the terms
+        // the query planner resolved — so a fragment reaching it means the
+        // planner decided it meant nothing, and marking it anyway would invent
+        // a match the search did not make.
+        //
+        // The useful half of that old behaviour is a *prefix*, and it lives
+        // where it belongs: `inox` finds and marks `inoxydable` because the
+        // planner expands it, not because the highlighter guesses. See
+        // SearchEngineTest.
+        $this->assertNull($this->mark('eath', 'leather'));
     }
 
     #[Test]
@@ -110,35 +121,34 @@ class HighlighterTest extends TestCase
     }
 
     // =========================================================================
-    // The two ways an n-gram engine over-matches, and what closes them
+    // The over-matching an n-gram engine had to defend against, and which
+    // whole-word terms remove instead
     // =========================================================================
+    //
+    // These three used to be the hard cases of this file, and each needed a
+    // rule to close it: `leather` and `The` shared the trigram `the`, `leather`
+    // and `over` shared the word-ending `er#`, and telling those apart from a
+    // real partial match took the edge-anchoring flag and the span-agreement
+    // check. None of it is load-bearing any more — two different words share no
+    // term at all — so they are kept as the regression they now guard rather
+    // than as the puzzle they were.
 
     #[Test]
-    public function a_shared_interior_trigram_is_not_a_match(): void
+    public function two_different_words_share_nothing(): void
     {
-        // "leather" and "The" share exactly `the`. The document also produced
-        // `#th` and `he#` there, which the query never asked for, and that
-        // disagreement is what refuses the span.
         $this->assertNull($this->mark('leather', 'The quick brown fox'));
-    }
-
-    #[Test]
-    public function a_shared_word_ending_is_not_a_match(): void
-    {
-        // "leather" and "over" share `er#` — and nothing else fits inside the
-        // two characters it spans, so no disagreement can be found. It is
-        // refused because it describes how a word ends, not what it says.
         $this->assertNull($this->mark('leather', 'jumps over the lazy dog'));
+        $this->assertNull($this->mark('leather', 'The weather today'));
     }
 
     #[Test]
-    public function a_partial_match_that_is_real_stays_marked(): void
+    public function a_word_inside_a_longer_word_is_not_marked(): void
     {
-        // Both of these are genuinely why the document was a candidate, and
-        // marking them is more honest than marking the whole word: the reader
-        // sees what the engine actually matched.
-        $this->assertSame('A pair of snow<mark>shoe</mark>s', $this->mark('shoe', 'A pair of snowshoes'));
-        $this->assertSame('The w<mark>eather</mark> today', $this->mark('leather', 'The weather today'));
+        // `shoe` and `snowshoes` are separate words to the index, so nothing
+        // is marked. Deliberate: a query that is a *prefix* is expanded by the
+        // planner and does match, while one buried in the middle of a longer
+        // word is the case that used to return `victorinox` for `inox`.
+        $this->assertNull($this->mark('shoe', 'A pair of snowshoes'));
     }
 
     #[Test]

@@ -154,8 +154,8 @@ class ScorerTest extends TestCase
     {
         $scorer = new Scorer();
 
-        $inTitle       = $scorer->fieldedFrequency(0b01, [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 100], [0 => 10.0, 1 => 100.0]);
-        $inDescription = $scorer->fieldedFrequency(0b10, [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 100], [0 => 10.0, 1 => 100.0]);
+        $inTitle       = $scorer->fieldedFrequency([0 => 1], [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 100], [0 => 10.0, 1 => 100.0]);
+        $inDescription = $scorer->fieldedFrequency([1 => 1], [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 100], [0 => 10.0, 1 => 100.0]);
 
         $this->assertGreaterThan($inDescription, $inTitle);
     }
@@ -166,8 +166,8 @@ class ScorerTest extends TestCase
         $scorer = new Scorer();
         $boosts = [0 => 1.0, 1 => 1.0];
 
-        $both = $scorer->fieldedFrequency(0b11, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]);
-        $one  = $scorer->fieldedFrequency(0b01, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]);
+        $both = $scorer->fieldedFrequency([0 => 1, 1 => 1], $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]);
+        $one  = $scorer->fieldedFrequency([0 => 1], $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]);
 
         $this->assertGreaterThan($one, $both);
     }
@@ -182,8 +182,8 @@ class ScorerTest extends TestCase
         $boosts = [0 => 1.0, 1 => 1.0];
         $idf    = 2.0;
 
-        $one  = $scorer->fieldedScore($idf, $scorer->fieldedFrequency(0b01, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]));
-        $both = $scorer->fieldedScore($idf, $scorer->fieldedFrequency(0b11, $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]));
+        $one  = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 1], $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]));
+        $both = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 1, 1 => 1], $boosts, [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0]));
 
         $this->assertGreaterThan($one, $both);
         $this->assertLessThan($one * 2.0, $both, 'twice the fields must not be twice the score');
@@ -199,8 +199,8 @@ class ScorerTest extends TestCase
         $boosts = [0 => 1.0, 1 => 1.0];
 
         // Same field length, wildly different averages.
-        $shortField = $scorer->fieldedFrequency(0b01, $boosts, [0 => 5, 1 => 5], [0 => 5.0, 1 => 500.0]);
-        $longField  = $scorer->fieldedFrequency(0b10, $boosts, [0 => 5, 1 => 5], [0 => 5.0, 1 => 500.0]);
+        $shortField = $scorer->fieldedFrequency([0 => 1], $boosts, [0 => 5, 1 => 5], [0 => 5.0, 1 => 500.0]);
+        $longField  = $scorer->fieldedFrequency([1 => 1], $boosts, [0 => 5, 1 => 5], [0 => 5.0, 1 => 500.0]);
 
         $this->assertGreaterThan(
             $shortField,
@@ -216,7 +216,7 @@ class ScorerTest extends TestCase
 
         $this->assertSame(
             0.0,
-            $scorer->fieldedFrequency(0b00, [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0])
+            $scorer->fieldedFrequency([], [0 => 3.0, 1 => 1.0], [0 => 10, 1 => 10], [0 => 10.0, 1 => 10.0])
         );
 
         $this->assertSame(0.0, $scorer->fieldedScore(2.0, 0.0));
@@ -231,7 +231,7 @@ class ScorerTest extends TestCase
 
         $fielded = $scorer->fieldedScore(
             $idf,
-            $scorer->fieldedFrequency(0b01, [0 => 1.0], [0 => 100], [0 => 100.0])
+            $scorer->fieldedFrequency([0 => 1], [0 => 1.0], [0 => 100], [0 => 100.0])
         );
 
         $this->assertEqualsWithDelta($scorer->score($idf, 100, 100.0), $fielded, 1.0E-9);
@@ -242,10 +242,12 @@ class ScorerTest extends TestCase
     {
         $scorer = new Scorer();
 
+        $shapes = [[], [0 => 1], [0 => 1, 1 => 1], [0 => 255, 1 => 0], [0 => 0.5]];
+
         foreach ([0.0, 0.5, 20.0] as $idf) {
-            foreach ([0b00, 0b01, 0b11] as $mask) {
+            foreach ($shapes as $frequencies) {
                 foreach ([[0 => 0.0, 1 => 0.0], [0 => 3.0, 1 => 1.0]] as $boosts) {
-                    $combined = $scorer->fieldedFrequency($mask, $boosts, [0 => 0, 1 => 0], [0 => 0.0, 1 => 0.0]);
+                    $combined = $scorer->fieldedFrequency($frequencies, $boosts, [0 => 0, 1 => 0], [0 => 0.0, 1 => 0.0]);
                     $score    = $scorer->fieldedScore($idf, $combined);
 
                     $this->assertGreaterThanOrEqual(0.0, $score);
@@ -253,6 +255,51 @@ class ScorerTest extends TestCase
                 }
             }
         }
+    }
+
+    #[Test]
+    public function saying_a_word_more_often_scores_higher_but_saturates(): void
+    {
+        // What the index could not express while a document's terms were its
+        // deduplicated trigrams: every frequency was 1, so `k1` scaled every
+        // score identically and four products could come back scoring exactly
+        // 10.29 with nothing to separate them.
+        $scorer = new Scorer();
+        $boosts = [0 => 1.0];
+        $idf    = 2.0;
+
+        $once   = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 1], $boosts, [0 => 10], [0 => 10.0]));
+        $thrice = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 3], $boosts, [0 => 10], [0 => 10.0]));
+        $often  = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 40], $boosts, [0 => 10], [0 => 10.0]));
+
+        $this->assertGreaterThan($once, $thrice, 'three mentions beat one');
+        $this->assertGreaterThan($thrice, $often);
+
+        // But saturating, not proportional: tripling the count must not triple
+        // the score, or one keyword-stuffed description would own the results.
+        $this->assertLessThan(3 * $once, $thrice);
+
+        // And the byte the index stores is enough, because the formula stops
+        // caring long before 255 does.
+        $capped = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 255], $boosts, [0 => 10], [0 => 10.0]));
+        $beyond = $scorer->fieldedScore($idf, $scorer->fieldedFrequency([0 => 4000], $boosts, [0 => 10], [0 => 10.0]));
+
+        $this->assertLessThan(0.005, ($beyond - $capped) / $capped, 'clamping at 255 costs under half a percent');
+    }
+
+    #[Test]
+    public function a_closer_variant_counts_for_more_per_occurrence(): void
+    {
+        // Frequencies arrive weighted by how close the matching word is to what
+        // was typed, so `cuisne` occurring once in a product actually named
+        // that outweighs `cuisine` occurring once as a correction.
+        $scorer = new Scorer();
+        $boosts = [0 => 1.0];
+
+        $exact       = $scorer->fieldedFrequency([0 => 1.0], $boosts, [0 => 10], [0 => 10.0]);
+        $oneEditAway = $scorer->fieldedFrequency([0 => 1.0 - 1 / 6], $boosts, [0 => 10], [0 => 10.0]);
+
+        $this->assertGreaterThan($oneEditAway, $exact);
     }
 
     #[Test]

@@ -18,6 +18,8 @@ use Ols\PhpFts\Hit;
 use Ols\PhpFts\LockManager;
 use Ols\PhpFts\Query\CollectionStatistics;
 use Ols\PhpFts\Query\Highlighter;
+use Ols\PhpFts\Query\QueryPlan;
+use Ols\PhpFts\Query\Scorer;
 use Ols\PhpFts\Query\TopK;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchResult;
@@ -492,23 +494,27 @@ final class IndexDirectory
         // touched rather than by whichever segment happened to be read first.
         $filters   = Filter::normalise($filters) ?? Filter::all();
         $highlight = Highlight::normalise($highlight);
-        $terms     = [];
-
         if ($highlight !== null) {
             // Also checked here, and not only per segment, so that the answer
             // does not depend on which segments happen to hold the page — and
             // so that an index with no segments at all still reports a field
             // name the schema does not have.
             Highlighter::verify($highlight, $this->schema());
-
-            $terms = $this->segments === [] ? [] : reset($this->segments)->analyze($query);
         }
 
-        // Gathered before anything is scored: IDF describes how rare a term is
-        // in the index, so it cannot be answered segment by segment without the
-        // same document scoring differently depending on where it landed — and
-        // a merge then changing the ranking.
-        $statistics = $this->statisticsFor($query);
+        // Resolved before anything is scored, and once for the whole index.
+        //
+        // Both halves of this have to be index-wide for the same reason. IDF
+        // asks how rare a term is *in the index*, and expansion asks which
+        // words the index holds that the typed one might have meant — and
+        // segments hold different vocabularies. Answered per segment, either
+        // one would make the same document match, or score, according to which
+        // segment it happened to land in, and a merge would change the result.
+        [$plan, $statistics] = $this->planFor($query);
+
+        // What the documents say, not what was typed: a search for `stel`
+        // finds documents containing `steel`, so `steel` is what gets marked.
+        $terms = $highlight === null ? [] : $plan->terms();
 
         $wanted = Facet::normalise($facets);
 
@@ -536,7 +542,7 @@ final class IndexDirectory
             // then bit arithmetic over the same candidates — no posting list is
             // walked twice, which is what keeps disjunctive facets affordable.
             [$candidates, $scores] = $segment->candidates(
-                $query,
+                $plan,
                 $this->deletions[$position],
                 $statistics,
                 $boosts,
@@ -612,19 +618,70 @@ final class IndexDirectory
     }
 
     /**
-     * The index-wide numbers BM25 needs, summed over every segment.
+     * Resolves a query against the whole index: what its words could have
+     * meant, and how rare each of those readings is.
      *
+     * Two passes over the segments, and the order is forced: expansion
+     * discovers which terms exist to be counted, and only then can their
+     * document frequencies be summed. Both results travel together because
+     * every segment needs both, identically.
+     *
+     * @return array{0: QueryPlan, 1: CollectionStatistics}
      * @throws CorruptSegmentException
      */
-    private function statisticsFor(string $query): CollectionStatistics
+    private function planFor(string $query): array
     {
-        $statistics = CollectionStatistics::empty();
-
         if ($this->segments === []) {
-            return $statistics;
+            return [QueryPlan::matchAll(), CollectionStatistics::empty()];
         }
 
-        $terms = reset($this->segments)->analyze($query);
+        $typed = reset($this->segments)->analyze($query);
+
+        if ($typed === []) {
+            return [QueryPlan::matchAll(), $this->statisticsOver([])];
+        }
+
+        // First pass: what could each typed word have meant? Every segment
+        // offers the terms its own dictionary holds within the word's edit
+        // budget, and the union is what the index as a whole could have meant.
+        // A word present in one segment and absent from another therefore ends
+        // up a candidate for both, which is the point.
+        $candidates = [];
+        $terms      = [];
+
+        foreach ($this->segments as $segment) {
+            foreach ($segment->expandTerms($typed) as $position => $found) {
+                foreach ($found as $term => $distance) {
+                    $term = (string) $term;
+
+                    if (!isset($candidates[$position][$term])) {
+                        $candidates[$position][$term] = $distance;
+                        $terms[]                      = $term;
+                    }
+                }
+            }
+        }
+
+        // Second pass: how rare is each of those candidates across the index?
+        // It has to be a second pass, because the first one is what discovered
+        // which terms there were to count.
+        $statistics = $this->statisticsOver($terms);
+
+        return [
+            QueryPlan::build($typed, $candidates, $statistics, new Scorer()),
+            $statistics,
+        ];
+    }
+
+    /**
+     * The index-wide numbers BM25 needs, for a known set of terms.
+     *
+     * @param string[] $terms
+     * @throws CorruptSegmentException
+     */
+    private function statisticsOver(array $terms): CollectionStatistics
+    {
+        $statistics = CollectionStatistics::empty();
 
         foreach ($this->segments as $position => $segment) {
             // Live documents, not written ones: a term present only in deleted

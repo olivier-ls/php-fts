@@ -106,7 +106,7 @@ final class SegmentIndexWriter
      * A closure rather than a Generator, because it is handed over before the
      * documents are, and must not start running until write() asks for it.
      *
-     * @var (\Closure(): \Generator<string, array<int, int>>)|null
+     * @var (\Closure(): \Generator<string, array<int, string>>)|null
      */
     private ?\Closure $postingsStream = null;
 
@@ -128,7 +128,8 @@ final class SegmentIndexWriter
     /** @var array<int, int> bit => summed lengths */
     private array $fieldLengthSums = [];
 
-    private int $maskWidth = 1;
+    /** Bytes per posting in the `fieldfreq` section: one per searchable field. */
+    private int $frequencyWidth = 1;
 
     /**
      * @param Schema|null $schema declared field definitions, used instead of
@@ -271,7 +272,7 @@ final class SegmentIndexWriter
      * directly would start the merge before the ordinals it translates to are
      * known.
      *
-     * @param \Closure(): \Generator<string, array<int, int>> $stream yields
+     * @param \Closure(): \Generator<string, array<int, string>> $stream yields
      *        term => ordinal => field mask, terms in ascending byte order and
      *        ordinals already translated to this segment's
      *
@@ -325,7 +326,7 @@ final class SegmentIndexWriter
                 'schema'           => $schema->toArray(),
                 'searchableFields' => $this->searchableFields,
                 'fieldLengthSums'  => $this->fieldLengthSums,
-                'maskWidth'        => $this->maskWidth,
+                'frequencyWidth'   => $this->frequencyWidth,
             ]));
 
             $segment->commit();
@@ -501,7 +502,12 @@ final class SegmentIndexWriter
     private function writeTermsAndPostings(SegmentWriter $segment, int $documentCount, Schema $schema): void
     {
         $searchable = $schema->searchableFields();
-        $maskWidth  = max(1, (int) ceil(count($searchable) / 8));
+
+        // One byte per field, where the mask was one *bit* per field. Three
+        // searchable fields therefore cost three bytes a posting instead of
+        // one — on the reference catalogue, 2.2 MB becoming ~6.5 MB out of 61,
+        // which buys the term frequency BM25 had been missing.
+        $width = max(1, count($searchable));
 
         // The two ways a segment can come by its postings. Both hand over the
         // same thing — an ordered stream of (term, ordinal => mask) — so a
@@ -511,9 +517,21 @@ final class SegmentIndexWriter
             ? $this->carriedTerms($searchable)
             : $this->analysedTerms($searchable);
 
-        $dictionary = new BlockDictionaryWriter();
-        $masks      = '';
-        $written    = 0;
+        $dictionary   = new BlockDictionaryWriter();
+        $frequencies  = '';
+        $written      = 0;
+
+        // The second tier, built as the terms stream past. Two buffers per gram
+        // rather than a list of terms per gram: the terms arrive sorted, so
+        // each list can be front-coded the moment it grows and never held as
+        // an array. That bounds this by the vocabulary — around 25 000 grams
+        // and a few megabytes — instead of by the postings, which on this
+        // catalogue would have been 590 000 array slots. See TermGramIndex.
+        /** @var array<string, string> gram => front-coded payload so far */
+        $gramPayloads = [];
+
+        /** @var array<string, string> gram => the last term appended to it */
+        $gramPrevious = [];
 
         // Streamed, not concatenated. A posting list is written the moment its
         // term is complete and is not held afterwards, which is what lets a
@@ -537,15 +555,20 @@ final class SegmentIndexWriter
             $dictionary->add($term, Varint::encode(count($ordinals))
                 . Varint::encode($written)
                 . Varint::encode(strlen($encoded))
-                . Varint::encode(strlen($masks)));
+                . Varint::encode(strlen($frequencies)));
 
             $segment->write($encoded);
             $written += strlen($encoded);
 
-            foreach ($byOrdinal as $mask) {
-                for ($byte = 0; $byte < $maskWidth; $byte++) {
-                    $masks .= chr(($mask >> ($byte * 8)) & 0xFF);
-                }
+            foreach ($byOrdinal as $record) {
+                $frequencies .= $record;
+            }
+
+            foreach (TermGramIndex::of($term) as $gram) {
+                $gramPayloads[$gram] = ($gramPayloads[$gram] ?? '')
+                    . TermGramIndex::append($term, $gramPrevious[$gram] ?? '');
+
+                $gramPrevious[$gram] = $term;
             }
         }
 
@@ -559,14 +582,35 @@ final class SegmentIndexWriter
         // byte the segment a fresh commit would have written.
         $segment->addSection('terms', $dictionary->finish());
 
-        // With one searchable field every mask byte holds the same single bit,
-        // so it says nothing — and BM25F over one neutral field gives exactly
-        // the number plain BM25 gives. Measured on a 2 000-product catalogue
-        // with three fields the masks came to 23% of the segment, so a schema
-        // that does not need them should not carry them.
-        if (count($searchable) > 1) {
-            $segment->addSection('fieldmask', $masks);
+        // The gram lists have to be sorted before they can be a dictionary, and
+        // they arrive in the order the vocabulary happened to reach them. This
+        // is a sort of 25 000 short strings, not of the postings — the reason
+        // the payloads were front-coded on the way in rather than assembled
+        // here from arrays of terms.
+        //
+        // Absent entirely when nothing in the vocabulary is expandable: a
+        // wholly Japanese index writes no second tier, because its terms are
+        // n-grams and the query side never expands those.
+        if ($gramPayloads !== []) {
+            $grams = array_map('strval', array_keys($gramPayloads));
+            sort($grams, SORT_STRING);
+
+            $gramDictionary = new BlockDictionaryWriter();
+
+            foreach ($grams as $gram) {
+                $gramDictionary->add($gram, $gramPayloads[$gram]);
+            }
+
+            $segment->addSection('termgrams', $gramDictionary->finish());
         }
+
+        // Always written, unlike the field mask it replaces. That mask was
+        // skipped for a single-field schema because every byte held the same
+        // one bit and therefore said nothing. A *frequency* on a single field
+        // says how often the document uses the word, which is ranking signal
+        // whatever the schema looks like — so there is no case where this
+        // section is dead weight, and no branch deciding it.
+        $segment->addSection('fieldfreq', $frequencies);
 
         // Fixed width, addressed by document number then field — the same rule
         // as the doc-values columns. Clamped at 65 535 terms in one field, which
@@ -583,7 +627,7 @@ final class SegmentIndexWriter
 
         $this->searchableFields = $searchable;
         $this->fieldLengthSums  = $sums;
-        $this->maskWidth        = $maskWidth;
+        $this->frequencyWidth   = $width;
         $this->termLengthSum    = array_sum($sums);
     }
 
@@ -598,11 +642,11 @@ final class SegmentIndexWriter
      * why that path streams and this one does not.
      *
      * @param string[] $searchable bit => field name
-     * @return array{0: \Generator<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     * @return array{0: \Generator<string, array<int, string>>, 1: array<int, array<int, int>>, 2: array<int, int>}
      */
     private function analysedTerms(array $searchable): array
     {
-        /** @var array<string, array<int, int>> term => ordinal => field bitmap */
+        /** @var array<string, array<int, string>> term => ordinal => one byte per field */
         $postings = [];
 
         /** @var array<int, array<int, int>> ordinal => bit => terms in that field */
@@ -611,20 +655,44 @@ final class SegmentIndexWriter
         /** @var array<int, int> bit => summed lengths across the segment */
         $sums = array_fill(0, max(1, count($searchable)), 0);
 
+        $width = max(1, count($searchable));
+        $empty = str_repeat("\x00", $width);
+
         foreach ($this->documents as $ordinal => $document) {
             foreach ($searchable as $bit => $field) {
-                $terms = $this->analyzer->analyze($this->textOf($document[$field] ?? null));
+                $counts = $this->analyzer->frequencies($this->textOf($document[$field] ?? null));
+
+                // Tokens, not distinct terms. This is the |d| of BM25, and
+                // while terms were deduplicated trigrams the two were the same
+                // number — they are not once a document can say a word twice.
+                $length = (int) array_sum($counts);
 
                 // Recorded now because it cannot be recovered from the postings
                 // without walking every one of them, and BM25F needs a length
                 // per field, not per document.
-                $lengths[$ordinal][$bit] = count($terms);
-                $sums[$bit]             += count($terms);
+                $lengths[$ordinal][$bit] = $length;
+                $sums[$bit]             += $length;
 
-                foreach ($terms as $term) {
-                    // A term found in several fields keeps one posting with
-                    // several bits set, rather than one posting per field.
-                    $postings[$term][$ordinal] = ($postings[$term][$ordinal] ?? 0) | (1 << $bit);
+                foreach ($counts as $term => $count) {
+                    // Cast: PHP will have made an all-digit term an int key.
+                    $term = (string) $term;
+
+                    // A term found in several fields keeps one posting carrying
+                    // a frequency for each, rather than one posting per field.
+                    // The record is a byte per field and is written to disk
+                    // exactly as it stands here — the in-memory value *is* the
+                    // on-disk row, so nothing is re-encoded on the way out.
+                    //
+                    // Clamped at 255, which BM25 makes nearly free: with
+                    // k1 = 1.2 the saturated contribution of tf 255 and of
+                    // tf 4 000 differ by 0.4%. A byte is enough because the
+                    // formula stops caring long before the byte does — and a
+                    // field holding one word 255 times is already pathological.
+                    $record = $postings[$term][$ordinal] ?? $empty;
+
+                    $record[$bit] = chr(min(255, $count));
+
+                    $postings[$term][$ordinal] = $record;
                 }
             }
         }
@@ -639,8 +707,8 @@ final class SegmentIndexWriter
      * passed by value and the generator holds the only reference to it once the
      * caller lets go, so nothing is duplicated.
      *
-     * @param array<string, array<int, int>> $postings
-     * @return \Generator<string, array<int, int>>
+     * @param array<string, array<int, string>> $postings
+     * @return \Generator<string, array<int, string>>
      */
     private static function inTermOrder(array $postings): \Generator
     {
@@ -662,7 +730,7 @@ final class SegmentIndexWriter
      * along the way must not still be in the average BM25 normalises against.
      *
      * @param string[] $searchable bit => field name
-     * @return array{0: \Generator<string, array<int, int>>, 1: array<int, array<int, int>>, 2: array<int, int>}
+     * @return array{0: \Generator<string, array<int, string>>, 1: array<int, array<int, int>>, 2: array<int, int>}
      * @throws StorageException
      */
     private function carriedTerms(array $searchable): array

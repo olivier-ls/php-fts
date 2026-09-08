@@ -166,6 +166,21 @@ final class PostingsCursor
     }
 
     /**
+     * How far into the list the cursor sits, counting from zero.
+     *
+     * The parallel sections — the per-field term frequencies — are addressed by
+     * this number rather than by document, because they are stored in posting
+     * order and nothing else knows that order. It matters that this survives a
+     * jump: after `advance()` skipped four blocks, the frequency record still
+     * has to be found, and counting the documents that went past is exactly
+     * what the reader must not have to do.
+     */
+    public function index(): int
+    {
+        return $this->blockNumber * PostingsFormat::BLOCK_SIZE + $this->positionInBlock;
+    }
+
+    /**
      * @return int[]
      * @throws CorruptSegmentException
      */

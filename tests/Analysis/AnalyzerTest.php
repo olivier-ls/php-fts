@@ -42,24 +42,24 @@ class AnalyzerTest extends TestCase
     // =========================================================================
 
     #[Test]
-    public function a_latin_word_becomes_padded_trigrams(): void
+    public function a_latin_word_becomes_one_term(): void
     {
-        $this->assertSame(
-            ['#cu', 'cui', 'uir', 'ir#'],
-            $this->analyzer->analyze('cuir')
-        );
+        // One word, one term. It used to be `#cu cui uir ir#`, which put the
+        // cost of typo tolerance in the document postings and made a query
+        // unable to say which word a match came from.
+        $this->assertSame(['cuir'], $this->analyzer->analyze('cuir'));
     }
 
     #[Test]
     public function a_single_letter_still_produces_a_term(): void
     {
-        $this->assertSame(['#a#'], $this->analyzer->analyze('a'));
+        $this->assertSame(['a'], $this->analyzer->analyze('a'));
     }
 
     #[Test]
-    public function two_letters_produce_two_trigrams(): void
+    public function a_two_letter_word_is_one_term(): void
     {
-        $this->assertSame(['#en', 'en#'], $this->analyzer->analyze('en'));
+        $this->assertSame(['en'], $this->analyzer->analyze('en'));
     }
 
     #[Test]
@@ -78,15 +78,29 @@ class AnalyzerTest extends TestCase
         // "iphone12" is one word, as it was in 1.x — splitting on the digit
         // would make the precise query "iphone12" no better than "iphone".
         $this->assertSame(['Latin'], $this->scripts('iphone12'));
-        $this->assertContains('e12', $this->analyzer->analyze('iphone12'));
+        $this->assertSame(['iphone12'], $this->analyzer->analyze('iphone12'));
+    }
+
+    #[Test]
+    public function an_all_digit_word_comes_back_as_a_string(): void
+    {
+        // Deduplication goes through array keys, and PHP turns a key that looks
+        // like an integer into one — so a model number would come back as an
+        // int and be rejected by every string signature downstream. The `#`
+        // padding used to hide this, because `#21#` is not numeric.
+        $terms = $this->analyzer->analyze('opinel 12 2024');
+
+        $this->assertSame(['opinel', '12', '2024'], $terms);
+
+        foreach ($terms as $term) {
+            $this->assertIsString($term);
+        }
     }
 
     #[Test]
     public function terms_are_deduplicated(): void
     {
-        $terms = $this->analyzer->analyze('cuir cuir cuir');
-
-        $this->assertSame(['#cu', 'cui', 'uir', 'ir#'], $terms);
+        $this->assertSame(['cuir'], $this->analyzer->analyze('cuir cuir cuir'));
     }
 
     // =========================================================================
@@ -166,8 +180,8 @@ class AnalyzerTest extends TestCase
         // A stray Latin-1 byte in a description must not lose the words around it.
         $terms = $this->analyzer->analyze("cuir \xff marron");
 
-        $this->assertContains('#cu', $terms);
-        $this->assertContains('#ma', $terms);
+        $this->assertContains('cuir', $terms);
+        $this->assertContains('marron', $terms);
     }
 
     // =========================================================================
@@ -231,7 +245,7 @@ class AnalyzerTest extends TestCase
     #[Test]
     public function russian_is_indexed(): void
     {
-        $this->assertSame(['#ко', 'кож', 'ожа', 'жа#'], $this->analyzer->analyze('кожа'));
+        $this->assertSame(['кожа'], $this->analyzer->analyze('кожа'));
     }
 
     #[Test]
@@ -253,7 +267,7 @@ class AnalyzerTest extends TestCase
     public function arabic_is_indexed(): void
     {
         $this->assertSame(['Arabic'], $this->scripts('جلد'));
-        $this->assertCount(3, $this->analyzer->analyze('جلد'));   // #جل جلد لد#
+        $this->assertSame(['جلد'], $this->analyzer->analyze('جلد'));
     }
 
     #[Test]
@@ -362,9 +376,9 @@ class AnalyzerTest extends TestCase
         // them, which is the whole reason this exists next to analyze().
         $terms = $this->analyzer->occurrences('cuir cuir')['terms'];
 
-        $this->assertCount(8, $terms);
-        $this->assertSame(['#cu', 0, 2, true], $terms[0]);
-        $this->assertSame(['#cu', 5, 7, true], $terms[4]);
+        $this->assertCount(2, $terms);
+        $this->assertSame(['cuir', 0, 4, false], $terms[0]);
+        $this->assertSame(['cuir', 5, 9, false], $terms[1]);
     }
 
     #[Test]
@@ -385,7 +399,7 @@ class AnalyzerTest extends TestCase
         // `daim` begins at byte 10 of the plain text and at byte 21 of the
         // value the caller passed in. An offset means the former, which is why
         // the text it indexes into is handed back with it.
-        $this->assertSame(10, $starts['#da']);
+        $this->assertSame(10, $starts['daim']);
         $this->assertSame(21, strpos($raw, 'daim'));
     }
 
@@ -401,36 +415,19 @@ class AnalyzerTest extends TestCase
 
         $last = end($terms);
 
-        $this->assertSame('fe' . "\xcc\x81", substr($text, $last[1], $last[2] - $last[1]));
+        // The word is one term now, so its span is the whole word — accent
+        // included, which is the property that mattered all along.
+        $this->assertSame('cafe' . "\xcc\x81", substr($text, $last[1], $last[2] - $last[1]));
     }
 
     #[Test]
-    public function a_term_anchored_to_a_word_edge_says_so(): void
+    public function no_term_is_edge_anchored_now_that_a_word_is_a_term(): void
     {
-        $terms = [];
-
-        foreach ($this->analyzer->occurrences('over')['terms'] as [$term, , , $edge]) {
-            $terms[$term] = $edge;
-        }
-
-        // `er#` describes how the word ends, and spans only two of its
-        // characters; `ove` is about its content. Highlighting is the caller
-        // of this distinction — a shared word ending is not a match.
-        $this->assertTrue($terms['er#']);
-        $this->assertTrue($terms['#ov']);
-        $this->assertFalse($terms['ove']);
-    }
-
-    #[Test]
-    public function a_marker_is_not_an_edge_when_the_term_is_the_whole_word(): void
-    {
-        // Both trigrams of "en" carry a marker, and both span the entire word:
-        // there is no content left for them to be missing.
-        foreach ($this->analyzer->occurrences('en')['terms'] as [, , , $edge]) {
-            $this->assertFalse($edge);
-        }
-
-        foreach ($this->analyzer->occurrences('a')['terms'] as [, , , $edge]) {
+        // The flag distinguished `er#`, which said how `over` ended and nothing
+        // about what it meant, from `ove`, which was about its content. A word
+        // is its own term now, so nothing is edge-anchored and the flag is
+        // always false. It is the next thing to remove from occurrences().
+        foreach ($this->analyzer->occurrences('over cuir')['terms'] as [, , , $edge]) {
             $this->assertFalse($edge);
         }
     }

@@ -56,7 +56,18 @@ final class SegmentFormat
     public const MAGIC         = 'FTSG';
     public const TRAILER_MAGIC = 'GSTF';
 
-    public const VERSION = 1;
+    /**
+     * Bumped to 2 in the rewrite that made words the terms.
+     *
+     * A version-1 segment is not readable by a version-2 build and cannot be
+     * converted: its terms are the trigrams of documents, and this build looks
+     * up words. There is no migration, only reindexing from the application's
+     * own source. Opening one raises UnsupportedFormatException, which is
+     * deliberately outside the corrupt-segment hierarchy so that the rollback
+     * machinery does not mistake an old index for a torn commit and quietly
+     * present it as empty.
+     */
+    public const VERSION = 2;
 
     public const HEADER_SIZE  = 16;
     public const TRAILER_SIZE = 32;

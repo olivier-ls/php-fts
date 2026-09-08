@@ -6,6 +6,7 @@ namespace Ols\PhpFts\Storage;
 
 use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Exception\UnsupportedFormatException;
 use Ols\PhpFts\OpensIndexFile;
 
 /**
@@ -183,9 +184,11 @@ final class SegmentReader
         $version = unpack('v', substr($header, 4, 2))[1];
 
         if ($version !== SegmentFormat::VERSION) {
-            throw new CorruptSegmentException(
-                "Segment {$this->path} is format version $version, this build reads version " . SegmentFormat::VERSION
-            );
+            // Not a CorruptSegmentException, and the distinction is the whole
+            // point: that one means "fall back to the previous commit", which
+            // for a version mismatch would try every generation, fail at all
+            // of them, and open the index as empty. See the exception.
+            throw UnsupportedFormatException::segment($this->path, $version, SegmentFormat::VERSION);
         }
     }
 

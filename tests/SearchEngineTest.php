@@ -277,9 +277,51 @@ class SearchEngineTest extends TestCase
     #[Test]
     public function a_typo_still_finds_the_document(): void
     {
-        // The reason n-grams are indexed rather than words: a misspelling still
-        // shares most of them.
+        // Words are the terms, so this is no longer free: the planner compares
+        // what was typed against the words the index holds and accepts one
+        // within an edit budget. `lether` is one insertion from `leather`.
         $this->assertSame(2, $this->catalogue()->search('lether')->total);
+    }
+
+    #[Test]
+    public function a_word_still_being_typed_finds_what_it_completes(): void
+    {
+        // The other half of tolerance, and the half an edit budget cannot
+        // reach: `leath` is three insertions from `leather`, far outside the
+        // budget for a five-letter word, but it is a prefix of it. This is what
+        // makes search-as-you-type work and what covers the suffixing
+        // languages — Turkish, Finnish, French plurals — that no corpus in this
+        // repository can test.
+        $engine = $this->catalogue();
+
+        $this->assertSame(2, $engine->search('leath')->total);
+        $this->assertSame(2, $engine->search('leathe')->total);
+    }
+
+    #[Test]
+    public function a_completion_is_marked_as_the_whole_word_it_completes(): void
+    {
+        // Highlighting follows the expansion rather than the query: the
+        // document says `leather`, so `leather` is what gets marked, whole.
+        // Marking only the typed prefix would tell the reader the engine
+        // matched a fragment, which is not what happened.
+        $result = $this->catalogue()->search('leath', highlight: ['title']);
+
+        foreach ($result as $hit) {
+            $this->assertStringContainsString('<mark>leather</mark>', strtolower($hit->highlights['title']));
+        }
+
+        $this->assertGreaterThan(0, $result->total);
+    }
+
+    #[Test]
+    public function a_prefix_shorter_than_three_letters_completes_nothing(): void
+    {
+        // Two letters reach a fifth of a French vocabulary and say nothing
+        // about intent. They still match a word that *is* those two letters.
+        $engine = $this->catalogue();
+
+        $this->assertSame(0, $engine->search('le')->total, 'not every leather and lether');
     }
 
     #[Test]
