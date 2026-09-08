@@ -558,9 +558,14 @@ if ($phase === 'cold' || $phase === 'all') {
     $worker  = __DIR__ . '/cold.php';
     $samples = ['open' => [], 'search' => [], 'total' => []];
 
+    // A child process inherits the php.ini, not the `-d` flags that were given
+    // to *this* one — so `php -d xdebug.mode=off benchmark.php` measured a
+    // worker with Xdebug switched on, and reported 318 ms for a search that
+    // takes 68. Four and a half times, on the one phase whose whole purpose is
+    // to say what a visitor waits for. The flag has to be handed on explicitly.
     for ($i = 0; $i < min($runs, 20); $i++) {
         $output = shell_exec(sprintf(
-            '%s %s %s %s 2>&1',
+            '%s -d xdebug.mode=off %s %s %s 2>&1',
             escapeshellarg(PHP_BINARY),
             escapeshellarg($worker),
             escapeshellarg($dir),
