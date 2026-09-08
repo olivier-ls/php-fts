@@ -323,8 +323,10 @@ class MergePolicyTest extends TestCase
     #[Test]
     public function the_shorthand_a_shared_host_writes_is_understood(): void
     {
+        // No setAccessible() call: reflection has reached private members
+        // without one since PHP 8.1, which is this library's floor, and 8.5
+        // deprecates asking.
         $read = new \ReflectionMethod(MergePolicy::class, 'memoryLimit');
-        $read->setAccessible(true);
 
         $limit = ini_get('memory_limit');
 
