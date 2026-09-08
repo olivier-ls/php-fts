@@ -59,6 +59,57 @@ final class TermExpansion
     /** Shortest typed word that may complete to a longer one. */
     private const MIN_PREFIX = 3;
 
+    /**
+     * Characters that must be right before any edit is forgiven.
+     *
+     * Elasticsearch calls this `prefix_length` and ships it at 0, which is what
+     * this class had implicitly. At 0 an edit budget of two traverses a
+     * language: `pliant` reaches `point` (1 324 documents on the reference
+     * catalogue), `plat` (424) and `plan` (95); `couteau` reaches `nouveau`
+     * (470), `contenu` (383) and `bouleau` (207); `black` reaches `block`.
+     * Those are not misspellings of anything, and no amount of scoring
+     * discipline downstream undoes admitting them — a wrong word repeated is a
+     * large term frequency, and term frequency is unbounded.
+     *
+     * ── Why it is graduated rather than a number ───────────────────────────
+     *
+     * Because a fixed value has to lose one way or the other, and measurement
+     * said so. Over twelve corrections that must keep working and sixteen
+     * different words that must not:
+     *
+     *     prefix 2   keeps 12/12 corrections, excludes 12/16 wrong words
+     *     prefix 3   keeps 11/12 corrections, excludes 16/16 wrong words
+     *
+     * The one that 3 costs is `aceir` → `acier`, a transposition in the third
+     * position — which is among the commonest typing errors there is, so
+     * paying for precision with it is a bad trade. And the four that 2 lets
+     * through — `plat`, `plan`, `contenu`, `block` — all agree on two
+     * characters and diverge on the third.
+     *
+     * Graduating keeps both: **the further a word actually wandered, the more
+     * it has to have started in the same place.** One anchoring character per
+     * edit spent, plus one — so a single edit still demands two intact
+     * characters, and two edits demand three.
+     *
+     * It graduates on the distance **found**, not on the budget allowed, and
+     * the difference is not cosmetic. Budget is a function of length alone, so
+     * `lether` — six characters — would be allowed two edits and therefore
+     * anchored on three, and `lether` → `leather` is a single dropped letter in
+     * the third position. Anchoring it on the budget rejected a correction that
+     * only ever spent one edit, and `SearchEngineTest::a_typo_still_finds_the_document`
+     * said so immediately. What a candidate is charged for is what it used.
+     *
+     * The one that survives is `black` → `block`: one vowel substituted in the
+     * middle of a five-letter word. No prefix rule separates that from a real
+     * typo, because there is nothing to separate — it is genuinely ambiguous,
+     * and it is the scoring side's problem rather than the candidate side's.
+     *
+     * Counted in code points, not bytes, for the reason the distance is: two
+     * bytes are one Cyrillic character, and a prefix measured in bytes would
+     * mean a different thing in every script.
+     */
+    private const ANCHOR_BEYOND_DISTANCE = 1;
+
     /** @var int[] the typed term, decoded once */
     private readonly array $codepoints;
 
@@ -159,10 +210,19 @@ final class TermExpansion
                 || $bytes < $this->length - $this->budget;
 
             if (!$tooFar) {
-                $distance = $this->distance(Utf8::codepoints($candidate));
+                $other  = Utf8::codepoints($candidate);
+                $shared = $this->sharedPrefix($other);
 
-                if ($distance !== null) {
-                    return 1.0 - $distance / $this->length;
+                // Two characters is what even a single edit demands, so a
+                // candidate agreeing on fewer cannot be accepted at any
+                // distance — and skipping it here skips the whole dynamic
+                // programme, which is the expensive half of this class.
+                if ($shared >= 2) {
+                    $distance = $this->distance($other);
+
+                    if ($distance !== null && $shared >= $distance + self::ANCHOR_BEYOND_DISTANCE) {
+                        return 1.0 - $distance / $this->length;
+                    }
                 }
             }
         }
@@ -193,6 +253,27 @@ final class TermExpansion
         $missing = max(0, Utf8::length($candidate) - $this->length);
 
         return 1.0 - ($missing / max(1, Utf8::length($candidate))) / 2;
+    }
+
+    /**
+     * How many opening characters a candidate agrees with the typed word on.
+     *
+     * Bounded by both lengths, so a candidate shorter than the typed word
+     * simply agrees on fewer — there is no special case for it and nothing can
+     * read past either end.
+     *
+     * @param int[] $other
+     */
+    private function sharedPrefix(array $other): int
+    {
+        $limit  = min($this->length, count($other));
+        $shared = 0;
+
+        while ($shared < $limit && $this->codepoints[$shared] === $other[$shared]) {
+            $shared++;
+        }
+
+        return $shared;
     }
 
     /**

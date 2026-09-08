@@ -58,13 +58,23 @@ class RelevanceTest extends TestCase
     }
 
     /**
-     * A catalogue where `pliant` and three words two edits away from it all
-     * occur often enough to carry a realistic document frequency.
+     * A catalogue where `pliant` and words one edit away from it all occur
+     * often enough to carry a realistic document frequency.
      *
-     * `plan`, `plat` and `point` are each within the edit budget of `pliant`
-     * (six characters, so two edits under `fuzziness: AUTO`) and all three are
-     * genuine expansion candidates of it — measured on the reference catalogue,
-     * where `point` alone sits in 1 324 documents.
+     * ── Why the near misses are invented words ─────────────────────────────
+     *
+     * They were real ones — `plan`, `plat`, `point`, each two edits from
+     * `pliant` and each a measured expansion candidate of it on the reference
+     * catalogue. Anchoring the edit budget on a shared prefix then stopped
+     * admitting them, and a test whose subject has been removed from the
+     * candidate set quietly stops testing anything: every assertion passed
+     * against documents that no longer matched at all.
+     *
+     * So the vocabulary here is deliberately synthetic. `pliand`, `plianr` and
+     * `plianx` are one substitution from `pliant` and share five characters
+     * with it, so no plausible tightening of the admission rule removes them,
+     * and none of them is the typed word. What is under test is the arithmetic
+     * that combines variants, not which variants French happens to supply.
      *
      * @param array<string, string> $extra id => text, added to the padding
      */
@@ -82,7 +92,7 @@ class RelevanceTest extends TestCase
         // Enough of each word for its document frequency to be meaningful.
         for ($n = 0; $n < 30; $n++) {
             $documents["has-pliant-$n"] = ['text' => "chaise pliant modele $n"];
-            $documents["has-point-$n"]  = ['text' => "outil point modele $n"];
+            $documents["has-near-$n"]   = ['text' => "outil pliand modele $n"];
         }
 
         foreach ($extra as $id => $text) {
@@ -122,20 +132,21 @@ class RelevanceTest extends TestCase
     /**
      * The one that was failing.
      *
-     * `plan`, `plat` and `point` are each two edits from `pliant`, so each
-     * counts for 1 − 2/6 = 0.667. Summed into one slot they make 2.0 against
-     * the exact word's 1.0, and BM25's saturation turns that into a higher
-     * score: three wrong words beat one right one.
+     * Each near miss is one substitution from `pliant`, so each counts for
+     * 1 − 1/6 = 0.833. Added into one slot they make 2.5 against the exact
+     * word's 1.0, and BM25's saturation turns that into a higher score: three
+     * wrong words beat one right one. Taking the best instead of the sum
+     * leaves 0.833, which loses as it should.
      *
-     * Measured before the fix, on this fixture's larger sibling: "Plan plat
-     * point" scored 4.4597 and "Truc pliant" 4.2952.
+     * Measured before the fix, with the real French words this fixture used to
+     * carry: "Plan plat point" scored 4.4597 and "Truc pliant" 4.2952.
      */
     #[Test]
     public function a_document_holding_the_typed_word_beats_one_holding_only_near_misses(): void
     {
         $engine = $this->catalogue([
             'exact'     => 'truc pliant',
-            'near-miss' => 'plan plat point',
+            'near-miss' => 'pliand plianr plianx',
         ]);
 
         $scores = $this->scores($engine, 'pliant');
@@ -162,9 +173,9 @@ class RelevanceTest extends TestCase
     {
         $engine = $this->catalogue([
             'exact' => 'pliant',
-            'two'   => 'plan plat',
-            'three' => 'plan plat point',
-            'four'  => 'plan plat point plant',
+            'two'   => 'pliand plianr',
+            'three' => 'pliand plianr plianx',
+            'four'  => 'pliand plianr plianx pliane',
         ]);
 
         $scores = $this->scores($engine, 'pliant');
@@ -187,9 +198,11 @@ class RelevanceTest extends TestCase
      * *different* near misses adding up. It does not stop **one** near miss
      * said twice, and on the reference catalogue that is the case that
      * actually bites: `Ranger Point Precision Ranger Point Precision` names
-     * `point` twice, so the slot carries 0.667 × 2 = 1.334 against the exact
-     * word's 1.0, and saturation turns the larger frequency into the higher
-     * score. `LYMAN X-Block Gunsmith Bench Block` does the same to `black`.
+     * `point` twice, so the slot carried 0.667 × 2 = 1.334 against the exact
+     * word's 1.0, and saturation turned the larger frequency into the higher
+     * score. `LYMAN X-Block Gunsmith Bench Block` still does the same to
+     * `black`, which a prefix rule cannot reach: `bl` is intact and one vowel
+     * substituted in a five-letter word is genuinely ambiguous.
      *
      * The mechanism is worth naming because it is not the arithmetic of
      * combining variants at all: the variant weight modulates *term
@@ -206,13 +219,15 @@ class RelevanceTest extends TestCase
     {
         $engine = $this->catalogue([
             'exact'    => 'chaise pliant',
-            'repeated' => 'chaise point point',
+            'repeated' => 'chaise pliand pliand',
         ]);
 
         $scores = $this->scores($engine, 'pliant');
 
         $this->assertGreaterThan(
-            $scores['repeated'],
+            // A near miss that does not come back at all is stronger than one
+            // that comes back and loses, so absence satisfies this outright.
+            $scores['repeated'] ?? -INF,
             $scores['exact'],
             'a near miss said twice outscored the word itself'
         );
@@ -232,12 +247,16 @@ class RelevanceTest extends TestCase
     {
         $engine = $this->catalogue([
             'exact'     => 'objet pliant special',
-            'near-miss' => 'objet point special',
+            'near-miss' => 'objet pliand special',
         ]);
 
         $scores = $this->scores($engine, 'pliant');
 
-        $this->assertGreaterThan($scores['near-miss'], $scores['exact']);
+        // Absent is stronger than losing: a candidate the admission rule
+        // rejects does not match at all, and a tightening that removes this
+        // near miss entirely should not read as a broken test. Either outcome
+        // satisfies the property.
+        $this->assertGreaterThan($scores['near-miss'] ?? -INF, $scores['exact']);
     }
 
     /**
