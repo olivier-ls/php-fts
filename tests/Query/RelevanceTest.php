@@ -181,6 +181,44 @@ class RelevanceTest extends TestCase
     }
 
     /**
+     * The same property, defeated by repetition instead of by stacking.
+     *
+     * Taking the best variant per field instead of the sum stops three
+     * *different* near misses adding up. It does not stop **one** near miss
+     * said twice, and on the reference catalogue that is the case that
+     * actually bites: `Ranger Point Precision Ranger Point Precision` names
+     * `point` twice, so the slot carries 0.667 × 2 = 1.334 against the exact
+     * word's 1.0, and saturation turns the larger frequency into the higher
+     * score. `LYMAN X-Block Gunsmith Bench Block` does the same to `black`.
+     *
+     * The mechanism is worth naming because it is not the arithmetic of
+     * combining variants at all: the variant weight modulates *term
+     * frequency*, and term frequency is unbounded, so a lexical doubt ("this
+     * is probably a different word") is traded against repetition ("this
+     * document says it a lot"). Those are different axes and BM25 has one slot
+     * for them. Two ways out — apply the weight to the slot's IDF instead of
+     * to its frequency, or stop admitting `point` as a reading of `pliant` at
+     * all — and the second is what a prefix constraint on the edit budget
+     * does.
+     */
+    #[Test]
+    public function a_repeated_near_miss_does_not_overtake_the_word_itself(): void
+    {
+        $engine = $this->catalogue([
+            'exact'    => 'chaise pliant',
+            'repeated' => 'chaise point point',
+        ]);
+
+        $scores = $this->scores($engine, 'pliant');
+
+        $this->assertGreaterThan(
+            $scores['repeated'],
+            $scores['exact'],
+            'a near miss said twice outscored the word itself'
+        );
+    }
+
+    /**
      * A regression lock rather than a failing test: one near miss already loses
      * to one exact match, and must keep losing.
      *

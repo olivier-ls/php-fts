@@ -855,17 +855,32 @@ final class SegmentIndex
 
         foreach ($plan->slots as $slot) {
             // Gathered per slot rather than per term, because the variants of
-            // one typed word are one match and not several. A document holding
-            // `couteau` twice and `couteaux` once has said `couteau` three
-            // times as far as the query is concerned — but not equally: each
-            // occurrence counts for how close its variant is to what was
-            // actually typed, so the exact word outweighs the correction.
+            // one typed word are one match and not several — and kept as the
+            // **best** reading of the slot in each field, not the sum of them.
             //
-            // Weighting the *frequency* rather than the finished score is what
-            // makes that work through the saturation instead of around it. The
-            // first version multiplied the score afterwards, which let a
-            // distant variant occurring often beat the exact word occurring
-            // once — the opposite of the intent.
+            // Summing was the first rule and it inverted the ranking. `plan`,
+            // `plat` and `point` are each two edits from `pliant`, so each
+            // counts for 1 − 2/6 = 0.667; added together they make 2.0 against
+            // the exact word's 1.0, and BM25's saturation turns that into a
+            // higher score. Measured: a product named "Plan plat point" scored
+            // 4.4597 against 4.2952 for one named "Truc pliant", and on the
+            // reference catalogue the first result for `pliant` was
+            // "Ranger Point Precision" — three wrong words beating one right
+            // one. A maximum cannot do that, and needs no constant to say so:
+            // a slot counts once, for the closest thing to what was typed.
+            //
+            // What it costs, stated: a document saying `couteau` twice and
+            // `couteaux` once now carries 2.0 rather than 2.857. The plural
+            // stops adding on top of the singular. That is the honest price of
+            // the property, and `tests/Query/RelevanceTest.php` holds both ends
+            // of it — near misses may not stack, and the typed word's own
+            // repetition must still count.
+            //
+            // Weighting the *frequency* rather than the finished score is
+            // unchanged and still load-bearing: it makes the difference work
+            // through the saturation instead of around it. An earlier version
+            // multiplied the score afterwards, which let a distant variant
+            // occurring often beat the exact word occurring once.
             //
             // @var array<int, array<int, float>> ordinal => bit => weighted tf
             $reached = [];
@@ -888,8 +903,10 @@ final class SegmentIndex
                     $ordinal = $cursor->current();
 
                     foreach ($this->frequenciesAt($records, $index) as $bit => $frequency) {
-                        $reached[$ordinal][$bit] = ($reached[$ordinal][$bit] ?? 0.0)
-                            + $weight * $frequency;
+                        $reached[$ordinal][$bit] = max(
+                            $reached[$ordinal][$bit] ?? 0.0,
+                            $weight * $frequency
+                        );
                     }
 
                     $index++;
@@ -1179,9 +1196,15 @@ final class SegmentIndex
                         continue;
                     }
 
+                    // The best reading of this slot in this field, not the sum
+                    // of its variants — see matchQuery(), which explains why
+                    // and what it costs. The two walks have to agree, so the
+                    // rule lives in both.
                     foreach ($this->frequenciesAt($records, $cursor->index()) as $bit => $frequency) {
-                        $reached[$ordinal][$position][$bit] = ($reached[$ordinal][$position][$bit] ?? 0.0)
-                            + $weight * $frequency;
+                        $reached[$ordinal][$position][$bit] = max(
+                            $reached[$ordinal][$position][$bit] ?? 0.0,
+                            $weight * $frequency
+                        );
                     }
                 }
             }
@@ -1247,8 +1270,10 @@ final class SegmentIndex
             while ($cursor->current() !== PostingsFormat::END) {
                 $ordinal = $cursor->current();
 
+                // Same rule as the other two walks: the best variant, not the
+                // sum. See matchQuery().
                 foreach ($this->frequenciesAt($records, $index) as $bit => $frequency) {
-                    $found[$ordinal][$bit] = ($found[$ordinal][$bit] ?? 0.0) + $weight * $frequency;
+                    $found[$ordinal][$bit] = max($found[$ordinal][$bit] ?? 0.0, $weight * $frequency);
                 }
 
                 $index++;
