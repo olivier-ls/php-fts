@@ -125,6 +125,23 @@ final class SegmentIndex
     /** Bytes per posting in `fieldfreq`: one per searchable field. */
     private int $frequencyWidth = 1;
 
+    /**
+     * How many times smaller than the whole walk a driver has to be.
+     *
+     * Driving swaps a sequential decode of the other posting lists for one
+     * `advance()` per candidate per variant, and an advance is a binary search
+     * over the skip table plus a block decode. That is cheap against a long
+     * list and dear against a short one, so the saving is real only when the
+     * driver is a small fraction of the postings rather than merely smaller
+     * than all of them.
+     *
+     * A quarter, measured: at that ratio `couteau de cuisine inox` still drives
+     * from `cuisine` — 1 071 postings against about 25 000 — and
+     * `couteau pliant lame acier`, whose four slots are all common, stops
+     * trying. Ungated it tried, and took its posting walk from 119 ms to 216.
+     */
+    private const DRIVER_SHARE = 4;
+
     private int $termLengthSum = 0;
 
     private Scorer $scorer;
@@ -892,12 +909,16 @@ final class SegmentIndex
         $averages    = $this->fieldAverages($statistics);
         $bByBit      = $this->bByBit();
 
-        // The one slot every match must hold, if there is one, and the shortest
-        // such. See mandatorySlot(): it turns the walk from "read every list"
-        // into "read the shortest mandatory list, then jump through the others",
-        // which is what the skip tables were written for and what nothing had
-        // ever called them for.
-        $driver = $plan->driven ? $this->mandatorySlot($plan) : null;
+        // The slots no match can do without, if a cheap enough set of them
+        // exists. See driverSlots(): it turns the walk from "read every list"
+        // into "read the cheapest ones that cannot all be missed, then jump
+        // through the others", which is what the skip tables were written for.
+        $driver = $plan->driven ? $this->driverSlots($plan) : null;
+
+        if ($driver === []) {
+            // A slot mandatory on its own that this segment holds nothing for.
+            return [Bitset::empty($this->documentCount), []];
+        }
 
         if ($driver !== null) {
             return $this->matchDriven($plan, $driver, $statistics, $weightByBit, $averages, $bByBit);
@@ -1122,43 +1143,68 @@ final class SegmentIndex
     }
 
     /**
-     * The cheapest slot no matching document can do without, or null.
+     * The cheapest set of slots no matching document can do without.
      *
-     * The threshold is an amount of IDF, so a document is allowed to miss at
-     * most `slack()` of it. A slot worth more than that cannot be missed by
-     * anything that matches — it is mandatory, and every match is therefore
-     * somewhere in *its* posting lists. That makes it a starting point: read it
-     * once and jump through the rest.
+     * The threshold is an amount of IDF, so a document may miss at most
+     * `slack()` of it. **Any set of slots worth more than the slack therefore
+     * cannot be missed entirely** — a document holding none of them falls short
+     * by more than it is allowed to. Every match is somewhere in the union of
+     * that set's posting lists, which makes it a place to start from: read
+     * those, then jump the rest through with `advance()`.
      *
-     * Which mandatory slot to start from is decided by how many postings it
-     * costs in this segment, not by its IDF: the point is to drive the loop
-     * from the shortest list. On `couteau de cuisine inox` the slack is 3.36
-     * and `cuisine` is worth 4.40, so 1 071 postings drive the query instead of
-     * `couteau`'s 17 274 being read in full.
+     * ── A set was tried instead of one slot, and is worse ──────────────────
      *
-     * Returns null when no slot is mandatory — a query of several words of
-     * similar, low weight, where every combination can reach the bar and there
-     * is nothing to anchor on. The full walk handles that, correctly and no
-     * more slowly than before.
+     * The arithmetic generalises cleanly: any *set* of slots worth more than
+     * the slack cannot be missed entirely either, and where no single slot
+     * clears the bar two or three together do. That is exactly the case the
+     * driver never reaches — the slack is a fixed fraction of the total, so
+     * the more words a query has the smaller each one's share — and
+     * `couteau pliant lame acier` walks 119 ms of postings entirely unanchored
+     * because not one of its four slots clears a slack of 1.64.
      *
-     * @return array{0: QuerySlot, 1: int}|null the slot and its position
+     * Built, measured on nine runs against the reference catalogue, reverted:
+     *
+     *     couteau pliant                     84.0 -> 69.2 ms
+     *     couteau de cuisine inox            43.2 -> 45.9
+     *     couteau pliant lame acier         145.7 -> 147.3
+     *     five words                        152.8 -> 228.1
+     *     seven words                       168.5 -> 187.8
+     *
+     * The reason is what driving *costs*. It swaps a sequential decode of the
+     * other lists for one `advance()` per candidate per variant, and a set
+     * assembled from common words is a large union — twenty thousand
+     * candidates, each pushed through sixty-five variants. The cheapest set by
+     * information is not the cheapest set to drive from, and on this shape
+     * nothing is.
+     *
+     * **What the experiment did find is the gate below.** `couteau pliant`
+     * got 18% faster in the table above, and not from the set: from the driver
+     * being *disabled*. Driving it had been a loss all along — one common word
+     * anchoring another common word — and nothing measured it until something
+     * else made it measurable.
+     *
+     * Exact by construction rather than by measurement: nothing is pruned on
+     * an estimate, only on the fact that a document missing every slot of the
+     * set cannot reach the threshold. `tests/Index/DrivenWalkTest.php` asserts
+     * the driven and undriven walks agree hit for hit and score for score.
+     *
+     * @return int[]|null slot positions to drive from; an empty array when a
+     *         slot mandatory on its own has nothing here, so the segment
+     *         matches nothing at all; null when driving would read as much as
+     *         the full walk and cost more to arrange
+     *
      * @throws CorruptSegmentException
      */
-    private function mandatorySlot(QueryPlan $plan): ?array
+    private function driverSlots(QueryPlan $plan): ?array
     {
         if (count($plan->slots) < 2) {
             return null;
         }
 
-        $slack   = $plan->slack() + 1e-9;
-        $best    = null;
-        $cheapest = PHP_INT_MAX;
+        $slack = $plan->slack() + 1e-9;
+        $costs = [];
 
         foreach ($plan->slots as $position => $slot) {
-            if ($slot->idf <= $slack) {
-                continue;
-            }
-
             $postings = 0;
 
             foreach ($slot->candidates as [$term]) {
@@ -1169,20 +1215,33 @@ final class SegmentIndex
                 }
             }
 
-            // A mandatory slot this segment holds nothing for means no document
-            // here can match at all — reported as an empty driver rather than
-            // discovered by walking every other list first.
-            if ($postings === 0) {
-                return [$slot, $position];
+            // A slot mandatory *on its own* that this segment holds nothing for
+            // means no document here can match at all — worth answering before
+            // walking anything.
+            if ($postings === 0 && $slot->idf > $slack) {
+                return [];
             }
 
-            if ($postings < $cheapest) {
-                $cheapest = $postings;
-                $best     = [$slot, $position];
+            $costs[$position] = $postings;
+        }
+
+        $best     = null;
+        $cheapest = PHP_INT_MAX;
+
+        foreach ($plan->slots as $position => $slot) {
+            if ($slot->idf > $slack && $costs[$position] < $cheapest) {
+                $cheapest = $costs[$position];
+                $best     = $position;
             }
         }
 
-        return $best;
+        if ($best === null) {
+            return null;
+        }
+
+        // Being able to drive is not the same as it being worth doing, and this
+        // gate is the whole finding of the experiment above it.
+        return $cheapest * self::DRIVER_SHARE <= array_sum($costs) ? [$best] : null;
     }
 
     /**
@@ -1201,8 +1260,8 @@ final class SegmentIndex
      * arithmetic on the plan, not a heuristic — which is what lets `total` stay
      * exact while the walk gets cheaper.
      *
-     * @param array{0: QuerySlot, 1: int} $driver
-     * @param array<int, float>           $weightByBit
+     * @param int[]             $driver slot positions to seed the walk from
+     * @param array<int, float> $weightByBit
      * @param array<int, float>           $averages
      * @param array<int, float>           $bByBit
      *
@@ -1217,13 +1276,21 @@ final class SegmentIndex
         array $averages,
         array $bByBit,
     ): array {
-        [$driverSlot, $driverPosition] = $driver;
+        $driving = array_fill_keys($driver, true);
 
         /** @var array<int, array<int, float>> ordinal => slot => that slot's best variant score */
         $reached = [];
 
-        foreach ($this->slotScores($driverSlot, $weightByBit, $averages, $bByBit) as $ordinal => $score) {
-            $reached[$ordinal][$driverPosition] = $score;
+        // The union of the driving slots' postings. Every match is in it, by
+        // the arithmetic driverSlots() explains, so nothing outside it needs
+        // asking — and the slots are scored while they are read rather than
+        // revisited afterwards.
+        foreach ($driver as $position) {
+            $scores = $this->slotScores($plan->slots[$position], $weightByBit, $averages, $bByBit);
+
+            foreach ($scores as $ordinal => $score) {
+                $reached[$ordinal][$position] = $score;
+            }
         }
 
         if ($reached === []) {
@@ -1236,7 +1303,7 @@ final class SegmentIndex
         $candidates = array_keys($reached);
 
         foreach ($plan->slots as $position => $slot) {
-            if ($position === $driverPosition) {
+            if (isset($driving[$position])) {
                 continue;
             }
 
