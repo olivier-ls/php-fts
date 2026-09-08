@@ -50,6 +50,28 @@ final class QueryPlan
     public const MINIMUM_SHOULD_MATCH = 0.6;
 
     /**
+     * How many readings of one typed word are worth pursuing.
+     *
+     * Elasticsearch's `max_expansions`, at its value. Unbounded was fine while
+     * every candidate had to be within an edit budget — `manche` reached 66
+     * words and that was the worst of it — and stops being fine now that a
+     * single Chinese character reaches every bigram of the vocabulary holding
+     * it. `の` is a word, and it is in a great many of them.
+     *
+     * Applied **after the segments' candidate sets are unioned**, never inside
+     * one. A cap applied per segment would keep a different subset in each,
+     * because each holds a different vocabulary, so the same document would
+     * match or not according to where it happened to land — and merging would
+     * change the answer. That is the trap this whole class exists to avoid.
+     *
+     * Ordered by weight, then by the term itself, so the choice is the same on
+     * every machine and in every process: floats compared first, and a byte
+     * comparison to settle the ties, of which there are many — every bigram
+     * holding a queried character weighs exactly the same.
+     */
+    public const MAX_EXPANSIONS = 50;
+
+    /**
      * @param QuerySlot[] $slots    the query's words, in the order they were typed
      * @param float       $required IDF a document has to gather across slots
      * @param bool        $matchesEverything true when the query had no terms at
@@ -136,16 +158,25 @@ final class QueryPlan
                 continue;
             }
 
-            $frequency = 0;
-            $variants  = [];
+            $variants = [];
 
             foreach ($found as $term => $weight) {
                 // Cast because PHP will have turned a numeric term into an int
                 // key on the way in — see QuerySlot::$candidates.
-                $term      = (string) $term;
-                $frequency = max($frequency, $statistics->documentFrequency($term));
+                $variants[] = [(string) $term, $weight];
+            }
 
-                $variants[] = [$term, $weight];
+            // Best readings first, ties settled by the term, then cut. See
+            // MAX_EXPANSIONS: the order has to be a total one, or two machines
+            // could keep different halves of a tie.
+            usort($variants, static fn(array $a, array $b): int => $b[1] <=> $a[1] ?: strcmp($a[0], $b[0]));
+
+            $variants = array_slice($variants, 0, self::MAX_EXPANSIONS);
+
+            $frequency = 0;
+
+            foreach ($variants as [$term]) {
+                $frequency = max($frequency, $statistics->documentFrequency($term));
             }
 
             $idf       = $scorer->idf(max(1, $frequency), $statistics->documentCount);

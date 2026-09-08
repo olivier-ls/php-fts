@@ -83,8 +83,30 @@ final class TermGramIndex
      */
     public static function of(string $term): array
     {
-        if ($term === '' || !TermExpansion::tolerates($term)) {
+        if ($term === '') {
             return [];
+        }
+
+        // A term from a continuous script is indexed by its **characters**,
+        // not by trigrams over it. Different gram, different question: nothing
+        // here is ever expanded by edit distance — an n-gram one edit from
+        // another is a different word — and what this answers instead is
+        // "which of the vocabulary's bigrams hold this character".
+        //
+        // That is the query a single Chinese or Japanese character needs, and
+        // it had no answer. 茶 is a word; a document saying 緑茶 produces the
+        // bigram 緑茶 and nothing else, so searching 茶 found only the
+        // documents where it happened to stand alone. Single-character words
+        // are ordinary in Chinese — 茶, 水, 书, 车 — so that is a large hole in
+        // the middle of the market this analyzer exists to reach.
+        if (!TermExpansion::tolerates($term)) {
+            $characters = [];
+
+            foreach (Utf8::codepoints($term) as $codepoint) {
+                $characters[Utf8::chr($codepoint)] = true;
+            }
+
+            return array_map('strval', array_keys($characters));
         }
 
         $characters = [self::PAD];

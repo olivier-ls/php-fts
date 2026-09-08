@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Index;
 
 use Ols\PhpFts\Analysis\Analyzer;
+use Ols\PhpFts\Analysis\Utf8;
 use Ols\PhpFts\Exception\CorruptSegmentException;
 use Ols\PhpFts\Exception\FieldTypeException;
 use Ols\PhpFts\Exception\FilterException;
@@ -640,6 +641,7 @@ final class SegmentIndex
     {
         $found      = [];
         $expansions = [];
+        $characters = [];
 
         foreach (array_values($typed) as $position => $word) {
             $word             = (string) $word;
@@ -650,6 +652,19 @@ final class SegmentIndex
             $found[$position] = $this->entryFor($word) === null ? [] : [$word => 1.0];
 
             if (!TermExpansion::tolerates($word)) {
+                // A single character of a continuous script is a word — 茶,
+                // 水, 书 are ordinary Chinese — and it was the one query shape
+                // this analyzer could not answer. A document saying 緑茶
+                // produces the bigram 緑茶 and nothing else, so 茶 found only
+                // the documents where it happened to stand alone.
+                //
+                // Two characters or more need none of this: they *are* the
+                // bigrams the documents produced, and the exact lookup above
+                // finds them.
+                if (Utf8::length($word) === 1) {
+                    $characters[$position] = $word;
+                }
+
                 continue;
             }
 
@@ -660,12 +675,40 @@ final class SegmentIndex
             }
         }
 
-        if ($expansions === []) {
+        if ($expansions === [] && $characters === []) {
             return $found;
         }
 
         if (!$this->segment->has('termgrams')) {
+            // No second tier, so no character index either — a segment written
+            // before this cannot answer the single-character question at all,
+            // and scanning the dictionary for a substring is not a fallback,
+            // it is a different order of cost. Reindexing is the answer.
             return $this->expandByScan($found, $expansions);
+        }
+
+        foreach ($characters as $position => $character) {
+            $payload = $this->termGrams()->get($character);
+
+            if ($payload === null) {
+                continue;
+            }
+
+            foreach (TermGramIndex::decode($payload) as $candidate) {
+                if (isset($found[$position][$candidate])) {
+                    continue;
+                }
+
+                // The share of the candidate the query accounts for. A bigram
+                // holding the character asked for is half about it, which is
+                // the most defensible thing to say without a corpus to measure
+                // against — and it is deliberately a partial match, so a
+                // document using the character as a word of its own still
+                // outranks one that merely contains it.
+                $length = Utf8::length($candidate);
+
+                $found[$position][$candidate] = $length > 0 ? 1.0 / $length : 1.0;
+            }
         }
 
         foreach ($expansions as $position => $expansion) {

@@ -103,6 +103,50 @@ class SegmentIndexTest extends TestCase
     }
 
     #[Test]
+    public function a_single_character_finds_the_words_that_contain_it(): void
+    {
+        // The one query shape a continuous script could not answer. 茶, 水, 书
+        // and 車 are ordinary words, and a document saying 緑茶 produces the
+        // bigram 緑茶 and nothing else — so searching 茶 used to find only the
+        // documents where it happened to stand on its own, which on a real
+        // catalogue is almost none of them.
+        //
+        // `§ termgrams` indexes a continuous term by its characters now, which
+        // is the same second tier a Latin typo goes through and a different
+        // question asked of it: not "which words resemble this one" but "which
+        // of the vocabulary's bigrams hold this character".
+        $writer = new SegmentIndexWriter();
+
+        foreach ([
+            'a' => '緑茶',
+            'b' => '烏龍茶',
+            'c' => '茶',
+            'd' => '革靴',
+        ] as $id => $title) {
+            $writer->put($id, ['title' => $title]);
+        }
+
+        $writer->write($this->path);
+        $index = SegmentIndex::open($this->path);
+
+        $tea = $index->search('茶');
+
+        $this->assertSame(3, $tea->total, '緑茶, 烏龍茶 and 茶 itself');
+        $this->assertSame(
+            'c',
+            $tea->hits[0]->id,
+            'the document using it as a word of its own still ranks first'
+        );
+
+        // Two characters or more need none of this: they *are* the bigrams the
+        // documents produced, so the exact lookup finds them.
+        $this->assertSame(1, $index->search('緑茶')->total);
+
+        // And it does not leak across scripts or into unrelated words.
+        $this->assertSame(1, $index->search('靴')->total);
+    }
+
+    #[Test]
     public function a_query_matching_nothing_returns_an_empty_result(): void
     {
         $result = $this->catalogue()->search('bicycle');
