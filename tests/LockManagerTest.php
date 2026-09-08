@@ -7,8 +7,8 @@ namespace Ols\PhpFts\Tests;
 use Ols\PhpFts\LockManager;
 use PHPUnit\Framework\Attributes\Test;
 use Ols\PhpFts\Exception\LockException;
+use PHPUnit\Framework\Attributes\RequiresFunction;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystemFamily;
-use PHPUnit\Framework\Attributes\RequiresPhpExtension;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -54,6 +54,24 @@ class LockManagerTest extends TestCase
     {
         mkdir($this->lockDir(), 0755);
         file_put_contents($this->pidFile(), $pid);
+    }
+
+    /**
+     * A lock nobody can be asked about: the directory exists and there is no
+     * pid file, which is what a writer killed between `mkdir()` and the write
+     * that follows it leaves behind.
+     *
+     * Every age-rule test below uses this rather than a foreign pid, and that
+     * is not a detail. With a pid, a host that has `posix_kill()` answers from
+     * liveness and never consults the clock — so a test that wrote a *live* pid
+     * and expected an age-based reclaim asserted the age rule on Windows and
+     * asserted its opposite on Linux. Two of them did, and passed here and
+     * failed there. With no pid the clock decides on every platform, which is
+     * the rule these tests are about.
+     */
+    private function simulateAbandonedLock(): void
+    {
+        mkdir($this->lockDir(), 0755);
     }
 
     private function removeDir(string $path): void
@@ -150,11 +168,19 @@ class LockManagerTest extends TestCase
 
     // =========================================================================
     // acquire() — détection de lock orphelin (Linux uniquement)
+    //
+    // Gated on the *function* rather than on the extension, because that is
+    // what LockManager asks about. Shared hosting routinely ships ext-posix and
+    // puts `posix_kill` in `disable_functions`, and on such a host these two
+    // tests were neither skipped nor able to pass: the extension was there, so
+    // PHPUnit ran them, and the function was not, so the clock decided and a
+    // freshly abandoned lock was not reclaimed. `RequiresFunction` reads the
+    // same `function_exists()` the code does.
     // =========================================================================
 
     #[Test]
     #[RequiresOperatingSystemFamily('Linux')]
-    #[RequiresPhpExtension('posix')]
+    #[RequiresFunction('posix_kill')]
     public function acquire_detects_stale_lock_and_recovers(): void
     {
         // PID 999999 : très vraisemblablement inexistant sur Linux
@@ -171,7 +197,7 @@ class LockManagerTest extends TestCase
 
     #[Test]
     #[RequiresOperatingSystemFamily('Linux')]
-    #[RequiresPhpExtension('posix')]
+    #[RequiresFunction('posix_kill')]
     public function acquire_after_stale_recovery_writes_correct_pid(): void
     {
         $this->simulateForeignLock(999999);
@@ -186,20 +212,19 @@ class LockManagerTest extends TestCase
 
     /**
      * The age-based path is the only recovery available on Windows and on any
-     * host without ext-posix, so it must work with a PID that is very much alive.
+     * host without ext-posix, and it is the only one available anywhere for a
+     * lock whose holder never got as far as naming itself.
      */
     #[Test]
     public function acquire_reclaims_a_lock_older_than_the_maximum_age(): void
     {
-        $this->simulateForeignLock(getmypid());
+        $this->simulateAbandonedLock();
 
-        // Both, because the timestamp that decides this is the pid file's now.
-        // A directory's cannot be refreshed portably — `touch()` on one is not
-        // — and the age rule needs something a living holder can keep moving,
-        // or a long import on a host without ext-posix declares itself dead.
-        // An abandoned lock has both of these old anyway.
+        // The directory's timestamp, because there is no pid file to carry one.
+        // A holder that is alive keeps the *pid file* moving — see heartbeat()
+        // — and one that never wrote it has nothing to keep moving, which is
+        // the case this covers.
         touch($this->lockDir(), time() - 600);
-        touch($this->pidFile(), time() - 600);
         clearstatcache();
 
         $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
@@ -243,7 +268,7 @@ class LockManagerTest extends TestCase
     #[Test]
     public function acquire_does_not_reclaim_a_lock_within_the_maximum_age(): void
     {
-        $this->simulateForeignLock(getmypid());
+        $this->simulateAbandonedLock();
 
         $lm = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 300);
 
@@ -254,7 +279,7 @@ class LockManagerTest extends TestCase
     #[Test]
     public function maximum_age_can_be_disabled(): void
     {
-        $this->simulateForeignLock(getmypid());
+        $this->simulateAbandonedLock();
         touch($this->lockDir(), time() - 100_000);
         clearstatcache(true, $this->lockDir());
 
@@ -264,17 +289,42 @@ class LockManagerTest extends TestCase
         $lm->acquire();
     }
 
+    /**
+     * A pid of 0 is not a process, and this used to read it as a licence to
+     * steal — `isStale()` returned true on the spot.
+     *
+     * It is not a licence, and the reason is a race no test here can see. A
+     * perfectly healthy writer is, for the few microseconds between its
+     * `mkdir()` and the write that names it, exactly this lock: held, and with
+     * no readable pid. Stealing from it puts two writers in the critical
+     * section together, which is the failure the whole class exists to prevent.
+     * So an unaskable holder is left to the clock, like any other.
+     */
     #[Test]
-    #[RequiresOperatingSystemFamily('Linux')]
-    public function acquire_treats_pid_zero_as_stale(): void
+    public function a_lock_naming_an_impossible_pid_is_not_stolen_while_fresh(): void
     {
-        // PID 0 invalide → isStale() doit retourner true
         $this->simulateForeignLock(0);
 
-        $lm = new LockManager($this->tempDir, timeoutSeconds: 2);
-        $lm->acquire(); // doit se débloquer tout seul
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 300);
 
-        $this->assertDirectoryExists($this->lockDir());
+        $this->expectException(LockException::class);
+        $lm->acquire();
+    }
+
+    /** And the other half: the clock does eventually answer. */
+    #[Test]
+    public function a_lock_naming_an_impossible_pid_is_reclaimed_once_it_is_old(): void
+    {
+        $this->simulateForeignLock(0);
+
+        touch($this->pidFile(), time() - 600);
+        touch($this->lockDir(), time() - 600);
+        clearstatcache();
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
+        $lm->acquire();
+
+        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
 
         $lm->release();
     }
