@@ -15,7 +15,7 @@
 # php-fts
 
 A self-contained full-text search engine in pure PHP.
-**No extensions. No services. No Composer dependencies. Any language.**
+**No extensions. No services. No Composer dependencies. Twenty-six scripts.**
 
 ---
 
@@ -145,6 +145,34 @@ documents. That is the change that made a four-word search cost 319 ms instead
 of 2.3 seconds, and made it return 1 140 documents instead of 10 877.
 
 Nothing to configure. The analyzer detects the script per field and adapts.
+
+### The scripts, named
+
+Vague was not good enough here: "any language" is a claim someone tests on their
+first day, so this is the list, and `tests/Analysis/FoldingClosureTest.php`
+keeps it honest by asserting — over every code point in it — that upper and
+lower case fold alike and that no punctuation is being indexed as a letter.
+
+| | |
+|---|---|
+| **A word is a term** | Latin (including Vietnamese and the extended blocks), Greek, Cyrillic, Hebrew, Arabic, Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Armenian, Georgian, Ethiopic |
+| **Bigrams over the run** | Han, Hiragana, Katakana, Hangul, Thai, Lao, Khmer, Myanmar |
+
+Anything outside that list is a separator: it breaks a run and is never
+indexed. That is a real limit rather than a soft one — Tibetan, Mongolian,
+Cherokee and the rest are *not* supported, and a language written in them will
+find nothing rather than find it badly.
+
+Handled inside the list without asking: case across every cased script, full-width
+forms folded to ASCII, diacritics folded to their base where the script's own
+convention does that, Arabic harakat and Hebrew niqqud dropped so a vocalised
+spelling meets the ordinary one, the tatweel dropped as the typographic stretch
+it is, and digits folded across writing systems so ٢٠٢٤ meets 2024.
+
+A script's own punctuation ends a word, which sounds obvious and was not: a
+Unicode block holds its script's punctuation alongside its letters, so the
+Arabic comma used to ride on the word beside it and `كتاب،` was a term no query
+for `كتاب` ever produced.
 
 ```php
 $engine->put('jp-1', ['title' => '革靴 ブラウン', 'brand' => 'アディダス']);

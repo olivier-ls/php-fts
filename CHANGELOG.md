@@ -101,12 +101,118 @@ and `Sencut Braxx` in its top five and now returns `POIGNARD PLIANT MUELA INOX`.
 - `suggest: ext-intl` claimed a normalisation capability nothing in the library
   had used for some time. Removed.
 
+### Fixed — three ways a wrong word could outrank a right one
+
+Found by giving the query path its first **property** test. Everything that
+tested it before asked an equivalence question — does the driven walk agree with
+the undriven one, does a merged segment agree with a fresh one — and a ranking
+that is wrong the same way twice satisfies all of them. It was: 797 tests were
+green while a search for `pliant` on the reference catalogue returned
+`Ranger Point Precision` first, a product holding no form of the word.
+
+- **A slot added its variants together.** `plan`, `plat` and `point` are each
+  two edits from `pliant`, so each counted 1 − 2/6 = 0.667; added they made 2.0
+  against the exact word's 1.0, and BM25's saturation turned that into a higher
+  score. A slot now counts once, for the closest reading of what was typed.
+  The price, stated: `couteau` twice plus `couteaux` once carries 2.0 rather
+  than 2.857 — the plural stops adding on top of the singular.
+- **The edit budget had no prefix.** At `prefix_length` 0, which is
+  Elasticsearch's default and is not meant to be used alone, two edits traverse
+  a language: `couteau` reached `nouveau`, `contenu` and `bouleau`. An edit is
+  forgiven only where the word started the same way — **one anchoring character
+  per edit spent, plus one**, graduated on the distance found rather than the
+  budget allowed. Measured over twelve corrections that must keep working and
+  sixteen different words that must not: a fixed prefix of 2 keeps 12/12 and
+  excludes 12/16, a fixed 3 keeps 11/12 and excludes 16/16, graduating keeps
+  12/12 and excludes 15/16.
+- **The variant weight was multiplied into term frequency**, so "how sure am I
+  that this is the word" and "how much does this document talk about it" were
+  expressed in the same units — and term frequency is unbounded, so the doubt
+  always lost. A near miss said twice beat the exact word said once, which is
+  what `Ranger Point Precision` was doing. Each variant is scored whole now and
+  the weight multiplies the finished number.
+
+Every single-word query on the catalogue returns nothing in its first hundred
+results that does not hold the word:
+
+| query | first junk hit | junk in top 100 |
+|---|---|---|
+| `pliant` | #1 → none | 12% → 0% |
+| `black` | #7 → none | 20% → 0% |
+| `bois` | #53 → none | 6% → 0% |
+| `steel` `cold` `inox` | #50 #4 #69 → none | → 0% |
+
+### Added — every script named, and the tables generated
+
+The analyzer's folding and classification tables were written by hand against
+French and were incomplete everywhere else, silently. Measured over every code
+point the engine claims: **916 folded differently in upper and lower case** —
+Vietnamese `VIỆT` became `viỆt` and never met `việt` — and **79 were punctuation
+being indexed as letters**, because a Unicode block holds its script's own
+punctuation and the Arabic comma therefore rode on the word beside it.
+
+Both are zero. `tools/generate-folding.php` derives the tables from Unicode's
+own case mappings, decompositions and general categories, using ext-intl and
+ext-mbstring *at generation time only*; `tests/Analysis/FoldingClosureTest.php`
+asserts the result is closed over ranges it reads back out of `Script` rather
+than repeating.
+
+**Twelve scripts that were being deleted outright** now index: Bengali,
+Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Armenian,
+Georgian, Ethiopic. Twenty-six in total.
+
+Arabic harakat, Hebrew niqqud and the tatweel are dropped, so a vocalised
+spelling meets the ordinary one — `كِتَاب`, `كــتاب` and `كتاب` are one term.
+Digits fold across writing systems: ٢٠٢٤ and 2024 are one term, and so are ۱۲۳,
+१२३ and 123.
+
+### Added — `§ keyfwd`, and an import that fits in the host
+
+- **`ordinal → key` is written down rather than derived.** `keyOf()` inverted
+  the whole key dictionary on the first hit of every request: **60.7 ms and
+  5.4 MB on a 45 000-document segment**, to serve the twenty ids of one page,
+  and growing with the index rather than with the page. It was there because
+  `SEGMENT-FORMAT.md` said the direction was free, which it had not been since
+  `DocumentStoreWriter` existed. Now 0.13 ms and 0.17 MB, for 0.56% of a
+  segment. A segment written before the section falls back, so old indexes keep
+  answering.
+- **`putMany()` holds a segment, not the batch.** It promised bounded memory
+  and delivered ~8 KB a document, so the documented example — yielding rows out
+  of a PDO cursor — died at about fifteen thousand of them on a 128 MB host. The
+  writer spills to a segment when its growth crosses a share of what
+  `memory_limit` leaves; nothing is published until the end, so the batch still
+  lands whole or not at all. The whole 45 000-product catalogue now imports in
+  one call at **64 MB peak**, flat in the size of the input.
+
+Cold request, fresh process, one segment — the only figure a shared host ever
+sees:
+
+| query | before | after |
+|---|---|---|
+| `couteau` | 150.4 ms | **68.1 ms** |
+| empty query, category page | 87.5 ms | **22.8 ms** |
+| `couteau de cuisine inox` | 138.7 ms | **51.7 ms** |
+
+### Upgrading from an earlier 2.0 build
+
+**Reindex.** The segment format is unchanged and old segments open, but the
+analyzer folds differently — `×` is no longer a letter, ligatures fold, Arabic
+and Hebrew lose their optional marks — so a document indexed by the earlier
+rules and a query analysed by these ones can disagree. Nothing enforces it,
+because there is no released 2.0 to be compatible with; it is the last moment
+where that is free.
+
 ### Known limits
 
-- **Validated in French only.** The reference catalogue is a French production
-  catalogue; the relevance work was measured against it and against nothing
-  else. Latin, Cyrillic and Greek share its mechanics exactly. Continuous
-  scripts keep their own, unchanged.
+- **The relevance work is validated in French only.** The reference catalogue
+  is a French production catalogue, and the ranking was measured against it and
+  against nothing else. The *analyzer* is no longer in that position — its
+  tables are derived from Unicode and asserted closed over every script — but
+  what a good result looks like has been checked in one language.
+- **Twenty-six scripts, and the rest are separators.** Tibetan, Mongolian,
+  Cherokee and everything else outside the list in the README are not indexed
+  at all: a language written in them finds nothing rather than finding it
+  badly. That is a real limit and stated as one.
 - **A language that inflects by prefix is not bridged.** Arabic and Hebrew
   attach the definite article at the front, so `مطبخ` is a *suffix* of `المطبخ`
   and neither the edit budget nor prefix completion reaches it. The mirror rule
