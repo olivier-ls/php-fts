@@ -1345,9 +1345,6 @@ final class SegmentIndex
         $k1      = $this->scorer->k1;
         $k1Plus1 = $k1 + 1.0;
         $width   = $this->frequencyWidth;
-        $lengths = $this->lengths();
-        $known   = strlen($lengths);
-        $row     = $width * 2;
 
         foreach ($plan->slots as $position => $slot) {
             if (isset($driving[$position])) {
@@ -1388,8 +1385,7 @@ final class SegmentIndex
                     // DrivenWalkTest is what says they still agree.
                     $combined = 0.0;
                     $at       = $cursor->index() * $width;
-                    $base     = $ordinal * $row;
-                    $sized    = $base >= 0 && $base + $row <= $known;
+                    $lengths  = $this->fieldLengthsOf($ordinal);
 
                     for ($bit = 0; $bit < $width; $bit++) {
                         $position2 = $at + $bit;
@@ -1407,11 +1403,10 @@ final class SegmentIndex
                         $average = $averages[$bit];
 
                         if ($average > 0.0) {
-                            $offset = $base + $bit * 2;
-                            $length = $sized ? ord($lengths[$offset]) | (ord($lengths[$offset + 1]) << 8) : 0;
-                            $b      = $bByBit[$bit];
+                            $b = $bByBit[$bit];
 
-                            $combined += $weightByBit[$bit] * $frequency / (1.0 - $b + $b * ($length / $average));
+                            $combined += $weightByBit[$bit] * $frequency
+                                / (1.0 - $b + $b * ($lengths[$bit] / $average));
 
                             continue;
                         }
@@ -1521,9 +1516,6 @@ final class SegmentIndex
         $k1      = $this->scorer->k1;
         $k1Plus1 = $k1 + 1.0;
         $width   = $this->frequencyWidth;
-        $lengths = $this->lengths();
-        $known   = strlen($lengths);
-        $row     = $width * 2;
 
         foreach ($slot->candidates as [$term, $weight]) {
             $entry = $this->entryFor($term);
@@ -1537,68 +1529,78 @@ final class SegmentIndex
             );
 
             $records = $this->frequenciesFor($entry);
-            $bytes   = strlen($records);
-            $index   = 0;
 
-            while ($cursor->current() !== PostingsFormat::END) {
-                $ordinal = $cursor->current();
+            // A block at a time, so that the frequency section is read with one
+            // `unpack()` per 128 postings rather than one `ord()` per field per
+            // posting, and so that draining the list costs no method calls at
+            // all. See PostingsCursor::blocks(), which carries the numbers.
+            foreach ($cursor->blocks() as $first => $documents) {
+                $wanted = count($documents) * $width;
+                $slice  = substr($records, $first * $width, $wanted);
 
-                $combined = 0.0;
-                $at       = $index * $width;
-
-                // A document whose length row is short or missing counts as
-                // zero in every field, which is what fieldLengthsOf() did with
-                // its all-or-nothing check on the row.
-                $base  = $ordinal * $row;
-                $sized = $base >= 0 && $base + $row <= $known;
-
-                for ($bit = 0; $bit < $width; $bit++) {
-                    $position = $at + $bit;
-
-                    if ($position >= $bytes) {
-                        break;
-                    }
-
-                    $frequency = ord($records[$position]);
-
-                    if ($frequency === 0) {
-                        continue;
-                    }
-
-                    $average = $averages[$bit];
-
-                    if ($average > 0.0) {
-                        $offset = $base + $bit * 2;
-                        $length = $sized ? ord($lengths[$offset]) | (ord($lengths[$offset + 1]) << 8) : 0;
-                        $b      = $bByBit[$bit];
-
-                        $combined += $weightByBit[$bit] * $frequency / (1.0 - $b + $b * ($length / $average));
-
-                        continue;
-                    }
-
-                    // Scorer uses a normalisation of exactly 1.0 when a field
-                    // has no average, and dividing by 1.0 is exact.
-                    $combined += $weightByBit[$bit] * $frequency;
+                // A truncated section is padded rather than guarded against
+                // per field: zero is what an absent frequency means, and this
+                // way the inner loop holds no bounds check.
+                if (strlen($slice) !== $wanted) {
+                    $slice = str_pad($slice, $wanted, "\x00");
                 }
 
-                // Same rule as the driven walk: each variant scored whole, the
-                // slot keeping the best. See matchQuery().
-                //
-                // `isset` rather than `max(… ?? 0.0, …)` because a score of
-                // zero still has to *set* the ordinal: it says the document
-                // holds the slot, which is what the threshold counts, even when
-                // the slot came to nothing.
-                $score = $combined > 0.0
-                    ? $weight * $idf * $combined * $k1Plus1 / ($k1 + $combined)
-                    : 0.0;
+                /** @var int[] $frequencies 1-indexed, as unpack() returns */
+                $frequencies = unpack('C*', $slice);
+                $k           = 1;
 
-                if (!isset($found[$ordinal]) || $score > $found[$ordinal]) {
-                    $found[$ordinal] = $score;
+                foreach ($documents as $ordinal) {
+                    $combined = 0.0;
+
+                    // Cached per document, because a walk revisits the same
+                    // ordinal across variants and slots. Reading the two bytes
+                    // with `ord()` instead was tried and is 2.6x slower over a
+                    // realistic access pattern — 176.6 ms against 68.5 for
+                    // 65 689 reads — because it is four operations a field
+                    // where this is one, and the cache is paid once per
+                    // document rather than once per posting.
+                    $lengths = $this->fieldLengthsOf($ordinal);
+
+                    for ($bit = 0; $bit < $width; $bit++) {
+                        $frequency = $frequencies[$k + $bit];
+
+                        if ($frequency === 0) {
+                            continue;
+                        }
+
+                        $average = $averages[$bit];
+
+                        if ($average > 0.0) {
+                            $b = $bByBit[$bit];
+
+                            $combined += $weightByBit[$bit] * $frequency
+                                / (1.0 - $b + $b * ($lengths[$bit] / $average));
+
+                            continue;
+                        }
+
+                        // Scorer uses a normalisation of exactly 1.0 when a
+                        // field has no average, and dividing by 1.0 is exact.
+                        $combined += $weightByBit[$bit] * $frequency;
+                    }
+
+                    $k += $width;
+
+                    // Same rule as the driven walk: each variant scored whole,
+                    // the slot keeping the best. See matchQuery().
+                    //
+                    // `isset` rather than `max(… ?? 0.0, …)` because a score of
+                    // zero still has to *set* the ordinal: it says the document
+                    // holds the slot, which is what the threshold counts, even
+                    // when the slot came to nothing.
+                    $score = $combined > 0.0
+                        ? $weight * $idf * $combined * $k1Plus1 / ($k1 + $combined)
+                        : 0.0;
+
+                    if (!isset($found[$ordinal]) || $score > $found[$ordinal]) {
+                        $found[$ordinal] = $score;
+                    }
                 }
-
-                $index++;
-                $cursor->next();
             }
         }
 
@@ -1617,13 +1619,8 @@ final class SegmentIndex
             return $this->fieldLengthCache[$ordinal];
         }
 
-        $count = max(1, count($this->searchableFields));
-
-        $this->lengths ??= $this->segment->has('lengths')
-            ? $this->segment->read('lengths')
-            : '';
-
-        $packed = substr($this->lengths, $ordinal * $count * 2, $count * 2);
+        $count  = max(1, count($this->searchableFields));
+        $packed = substr($this->lengths(), $ordinal * $count * 2, $count * 2);
         $values = strlen($packed) === $count * 2
             ? array_values(unpack('v' . $count, $packed))
             : array_fill(0, $count, 0);
