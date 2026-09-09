@@ -83,6 +83,56 @@ and `Sencut Braxx` in its top five and now returns `POIGNARD PLIANT MUELA INOX`.
   by construction rather than by measurement (`tests/Index/DrivenWalkTest.php`
   asserts the driven and undriven walks agree hit for hit and score for score).
 
+### Added — a search says which of its words it could not use
+
+`SearchResult::$unknown` lists the typed words the index holds nothing
+resembling, in the order they were typed. Empty for a query the index
+understood, which is the common case, so `if ($result->unknown)` is the whole
+test.
+
+They were already being dropped, and have to be: keeping one would put its IDF
+in the budget with no way to ever gather it, so a single stray keystroke — or a
+brand you do not stock — would empty the result instead of narrowing it. But
+dropping it *silently* is how `couteau zwilling` becomes `couteau` and hands the
+shopper the whole knife aisle with no hint that half their query was ignored.
+The plan knew all along; now it says so, and an application can answer the way
+every search engine answers: no results for *zwilling*, showing results for
+*couteau*.
+
+### Performance — work that was being done more than once
+
+Measured claims are marked as such; the rest are reductions in work whose
+effect on wall-clock has not been measured and is not claimed.
+
+- **A filter leaf is compiled once per search rather than once per facet.** A
+  facet excluding its own clause is counted over the candidates narrowed by
+  every *other* clause, so each segment was asked to narrow the same candidates
+  once per excluded tag — and `narrow()` rebuilt every leaf of the tree from its
+  column. That is not cheap the way set arithmetic over bits is cheap:
+  `KeywordColumn::equals()`, `TagColumn::contains()` and `NumericColumn::range()`
+  each scan the whole column, in chunks of 4 096 documents. The variants differ
+  only in the clause they lifted out, so the remaining passes rebuilt
+  bit-for-bit identical sets — around 720 000 PHP loop iterations on the
+  reference catalogue, three quarters of them redundant. **Verified rather than
+  assumed:** three clauses across two filter views is five compilations
+  requested and three column scans performed. Safe to hold for the object's life
+  because a segment file never changes and a `Bitset` is mutated only by
+  `set()`, which nothing calls on a set that came back from `compile()`.
+- **`TopK::offer()` no longer allocates two arrays to reject a candidate.** Both
+  sides of its comparison were built with the spread operator, for every
+  candidate offered — including the overwhelming majority that lose on their
+  first number. That is the shape of the empty-query page, where every document
+  the filter keeps is offered: on the reference catalogue the heap was asked
+  forty-five thousand times to return twenty rows. A rank is compared left to
+  right, so the first number settles it unless it ties, and sorting by relevance
+  alone — the default — is now a float against a float.
+- **Four hoists out of loops that run per document, per posting or per
+  candidate.** `array_keys()` rebuilt inside `SegmentIndexWriter`'s per-document
+  loop, in both the analysed and the carried path; `Utf8::codepoints()` decoding
+  the same candidate twice in `TermExpansion::accepts()`; `strlen()` re-measured
+  on every turn of `frequenciesAt()`'s inner loop, which is the innermost thing
+  in the whole search. No result changes.
+
 ### Fixed — four silent answers at the seams between correct pieces
 
 Found by a second read-only audit. None of these was a bug *inside* a component,
