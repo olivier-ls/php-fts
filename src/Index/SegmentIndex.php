@@ -1023,41 +1023,13 @@ final class SegmentIndex
             // out of reach of anything but refusing the candidate — which is
             // what the prefix anchor in TermExpansion does.
             //
+            // The same walk slotScores() performs for a driving slot, and it
+            // used to be written out again here — the two loops were identical
+            // line for line, which is a thing DrivenWalkTest existed to police
+            // rather than a thing the code prevented. One copy now.
+            //
             // @var array<int, float> ordinal => this slot's best variant score
-            $reached = [];
-
-            foreach ($slot->candidates as [$term, $weight]) {
-                $entry = $this->entryFor($term);
-
-                if ($entry === null) {
-                    continue;
-                }
-
-                $cursor = PostingsCursor::open(
-                    $this->segment->read('postings', $entry['offset'], $entry['length'])
-                );
-
-                $records = $this->frequenciesFor($entry);
-                $index   = 0;
-
-                while ($cursor->current() !== PostingsFormat::END) {
-                    $ordinal = $cursor->current();
-
-                    $reached[$ordinal] = max(
-                        $reached[$ordinal] ?? 0.0,
-                        $weight * $this->scorer->fieldedScore($slot->idf, $this->scorer->fieldedFrequency(
-                            $this->frequenciesAt($records, $index),
-                            $weightByBit,
-                            $this->fieldLengthsOf($ordinal),
-                            $averages,
-                            $bByBit,
-                        ))
-                    );
-
-                    $index++;
-                    $cursor->next();
-                }
-            }
+            $reached = $this->slotScores($slot, $weightByBit, $averages, $bByBit);
 
             foreach ($reached as $ordinal => $slotScore) {
                 $gathered[$ordinal] = ($gathered[$ordinal] ?? 0.0) + $slot->idf;
@@ -1136,8 +1108,12 @@ final class SegmentIndex
     /**
      * Per-field length normalisation, by mask bit.
      *
-     * Only fields the schema gave an explicit `b` appear; the rest fall back to
-     * the scorer's default inside fieldedFrequency().
+     * Every searchable bit appears, the scorer's own `b` standing in for a
+     * field the schema gave none. It used to hold only the fields with an
+     * explicit `b` and let the fallback happen per posting, inside
+     * `Scorer::fieldedFrequency()` — a `??` on the innermost loop of the whole
+     * search, resolved to the same value every time. Resolving it once here
+     * costs nothing and is what lets the scoring loop hold no `??` at all.
      *
      * @return array<int, float>
      */
@@ -1147,14 +1123,25 @@ final class SegmentIndex
         $byBit       = [];
 
         foreach ($this->searchableFields as $bit => $field) {
-            $b = $definitions[$field]['b'] ?? null;
-
-            if ($b !== null) {
-                $byBit[$bit] = $b;
-            }
+            $byBit[$bit] = (float) ($definitions[$field]['b'] ?? $this->scorer->b);
         }
 
         return $byBit;
+    }
+
+    /**
+     * The packed per-field lengths, read once.
+     *
+     * One `u16` per field per document, addressed by document then field. The
+     * scoring loop reads it with `ord()` rather than through
+     * `fieldLengthsOf()`, which builds an array per document and caches it —
+     * see slotScores() for why that stopped being worth it.
+     */
+    private function lengths(): string
+    {
+        return $this->lengths ??= $this->segment->has('lengths')
+            ? $this->segment->read('lengths')
+            : '';
     }
 
     /**
@@ -1355,10 +1342,19 @@ final class SegmentIndex
         ksort($reached);
         $candidates = array_keys($reached);
 
+        $k1      = $this->scorer->k1;
+        $k1Plus1 = $k1 + 1.0;
+        $width   = $this->frequencyWidth;
+        $lengths = $this->lengths();
+        $known   = strlen($lengths);
+        $row     = $width * 2;
+
         foreach ($plan->slots as $position => $slot) {
             if (isset($driving[$position])) {
                 continue;
             }
+
+            $idf = $slot->idf;
 
             foreach ($slot->candidates as [$term, $weight]) {
                 $entry = $this->entryFor($term);
@@ -1372,6 +1368,7 @@ final class SegmentIndex
                 );
 
                 $records = $this->frequenciesFor($entry);
+                $bytes   = strlen($records);
 
                 foreach ($candidates as $ordinal) {
                     if ($cursor->advance($ordinal) === PostingsFormat::END) {
@@ -1386,17 +1383,49 @@ final class SegmentIndex
                     // see matchQuery(), which explains why the weight belongs
                     // on the score rather than on the frequency. The two walks
                     // have to agree hit for hit *and score for score*, so the
-                    // rule lives in both and DrivenWalkTest says so.
-                    $reached[$ordinal][$position] = max(
-                        $reached[$ordinal][$position] ?? 0.0,
-                        $weight * $this->scorer->fieldedScore($slot->idf, $this->scorer->fieldedFrequency(
-                            $this->frequenciesAt($records, $cursor->index()),
-                            $weightByBit,
-                            $this->fieldLengthsOf($ordinal),
-                            $averages,
-                            $bByBit,
-                        ))
-                    );
+                    // arithmetic here is the arithmetic in slotScores(),
+                    // written out for the same reason and in the same order.
+                    // DrivenWalkTest is what says they still agree.
+                    $combined = 0.0;
+                    $at       = $cursor->index() * $width;
+                    $base     = $ordinal * $row;
+                    $sized    = $base >= 0 && $base + $row <= $known;
+
+                    for ($bit = 0; $bit < $width; $bit++) {
+                        $position2 = $at + $bit;
+
+                        if ($position2 >= $bytes) {
+                            break;
+                        }
+
+                        $frequency = ord($records[$position2]);
+
+                        if ($frequency === 0) {
+                            continue;
+                        }
+
+                        $average = $averages[$bit];
+
+                        if ($average > 0.0) {
+                            $offset = $base + $bit * 2;
+                            $length = $sized ? ord($lengths[$offset]) | (ord($lengths[$offset + 1]) << 8) : 0;
+                            $b      = $bByBit[$bit];
+
+                            $combined += $weightByBit[$bit] * $frequency / (1.0 - $b + $b * ($length / $average));
+
+                            continue;
+                        }
+
+                        $combined += $weightByBit[$bit] * $frequency;
+                    }
+
+                    $score = $combined > 0.0
+                        ? $weight * $idf * $combined * $k1Plus1 / ($k1 + $combined)
+                        : 0.0;
+
+                    if (!isset($reached[$ordinal][$position]) || $score > $reached[$ordinal][$position]) {
+                        $reached[$ordinal][$position] = $score;
+                    }
                 }
             }
         }
@@ -1449,6 +1478,53 @@ final class SegmentIndex
     {
         $found = [];
 
+        // ── Why the formula is spelled out here instead of called ──────────
+        //
+        // Because this loop runs once per posting, and measurement said that
+        // is where the time goes. Profiled on the reference catalogue,
+        // `acier lame longueur` — three words each sitting in about 46% of
+        // 45 000 products, which is what someone shopping for a knife types:
+        //
+        //     whole search                583.5 ms
+        //     of which plan building       37.7
+        //     of which matching           473.4
+        //     of which posting decode      128.0   (measured separately)
+        //
+        // So decoding 65 689 postings cost 128 ms and *scoring* them cost
+        // around 345 — **5.3 µs a posting**, for four floating-point
+        // operations. The cost was not the arithmetic. It was the shape:
+        // `frequenciesAt()` allocated an array per posting, `fieldedFrequency()`
+        // walked that array back with a `??` on four separate maps, and
+        // `fieldLengthsOf()` returned another array from a cache that grew with
+        // every document touched. Three allocations and a dozen hash lookups
+        // to multiply five numbers.
+        //
+        // Spelled out, the loop allocates nothing per posting and reads both
+        // the frequencies and the lengths straight out of their sections with
+        // `ord()`.
+        //
+        // ── What this owes Scorer ──────────────────────────────────────────
+        //
+        // The arithmetic below is BM25F exactly as {@see Scorer::fieldedFrequency()}
+        // and {@see Scorer::fieldedScore()} define it, in the same order, so
+        // that the two agree to the last bit rather than to a tolerance. That
+        // ordering is deliberate and fragile: `1 - b + b * (len / avg)` is not
+        // the same float as `(1 - b) + (b / avg) * len`, and hoisting `b / avg`
+        // out of the loop — which is tempting, and would save a division —
+        // would shift scores in their last places. Scorer stays the definition
+        // of the formula; this is the same formula written for the innermost
+        // loop, and `Scorer` is what a reader should consult to understand it.
+        //
+        // Do not simplify the expression. Change Scorer and this together, or
+        // neither.
+        $idf     = $slot->idf;
+        $k1      = $this->scorer->k1;
+        $k1Plus1 = $k1 + 1.0;
+        $width   = $this->frequencyWidth;
+        $lengths = $this->lengths();
+        $known   = strlen($lengths);
+        $row     = $width * 2;
+
         foreach ($slot->candidates as [$term, $weight]) {
             $entry = $this->entryFor($term);
 
@@ -1461,63 +1537,68 @@ final class SegmentIndex
             );
 
             $records = $this->frequenciesFor($entry);
+            $bytes   = strlen($records);
             $index   = 0;
 
             while ($cursor->current() !== PostingsFormat::END) {
                 $ordinal = $cursor->current();
 
-                // Same rule as the other two walks: each variant scored whole,
-                // the slot keeping the best. See matchQuery().
-                $found[$ordinal] = max(
-                    $found[$ordinal] ?? 0.0,
-                    $weight * $this->scorer->fieldedScore($slot->idf, $this->scorer->fieldedFrequency(
-                        $this->frequenciesAt($records, $index),
-                        $weightByBit,
-                        $this->fieldLengthsOf($ordinal),
-                        $averages,
-                        $bByBit,
-                    ))
-                );
+                $combined = 0.0;
+                $at       = $index * $width;
+
+                // A document whose length row is short or missing counts as
+                // zero in every field, which is what fieldLengthsOf() did with
+                // its all-or-nothing check on the row.
+                $base  = $ordinal * $row;
+                $sized = $base >= 0 && $base + $row <= $known;
+
+                for ($bit = 0; $bit < $width; $bit++) {
+                    $position = $at + $bit;
+
+                    if ($position >= $bytes) {
+                        break;
+                    }
+
+                    $frequency = ord($records[$position]);
+
+                    if ($frequency === 0) {
+                        continue;
+                    }
+
+                    $average = $averages[$bit];
+
+                    if ($average > 0.0) {
+                        $offset = $base + $bit * 2;
+                        $length = $sized ? ord($lengths[$offset]) | (ord($lengths[$offset + 1]) << 8) : 0;
+                        $b      = $bByBit[$bit];
+
+                        $combined += $weightByBit[$bit] * $frequency / (1.0 - $b + $b * ($length / $average));
+
+                        continue;
+                    }
+
+                    // Scorer uses a normalisation of exactly 1.0 when a field
+                    // has no average, and dividing by 1.0 is exact.
+                    $combined += $weightByBit[$bit] * $frequency;
+                }
+
+                // Same rule as the driven walk: each variant scored whole, the
+                // slot keeping the best. See matchQuery().
+                //
+                // `isset` rather than `max(… ?? 0.0, …)` because a score of
+                // zero still has to *set* the ordinal: it says the document
+                // holds the slot, which is what the threshold counts, even when
+                // the slot came to nothing.
+                $score = $combined > 0.0
+                    ? $weight * $idf * $combined * $k1Plus1 / ($k1 + $combined)
+                    : 0.0;
+
+                if (!isset($found[$ordinal]) || $score > $found[$ordinal]) {
+                    $found[$ordinal] = $score;
+                }
 
                 $index++;
                 $cursor->next();
-            }
-        }
-
-        return $found;
-    }
-
-    /**
-     * One posting's term frequencies, by field bit.
-     *
-     * Zero-frequency fields are left out rather than reported as zero: the
-     * caller adds these up per query slot and then iterates what is there, so
-     * a field the term is absent from should not cost a loop iteration. On a
-     * three-field schema most postings name one field.
-     *
-     * @return array<int, int> bit => occurrences in that field
-     */
-    private function frequenciesAt(string $records, int $index): array
-    {
-        $at    = $index * $this->frequencyWidth;
-        $found = [];
-
-        // Hoisted out of the loop, where it was re-measuring a string that
-        // cannot change. This function runs once per posting, so it is the
-        // innermost thing in the whole search.
-        $length = strlen($records);
-
-        for ($bit = 0; $bit < $this->frequencyWidth; $bit++) {
-            $position = $at + $bit;
-
-            if ($position >= $length) {
-                break;
-            }
-
-            $frequency = ord($records[$position]);
-
-            if ($frequency > 0) {
-                $found[$bit] = $frequency;
             }
         }
 
