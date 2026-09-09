@@ -124,6 +124,33 @@ All of it inside the 150 ms a results page is budgeted, including the shape
 that is hardest for this design: several words that are each in half the
 catalogue, on a mono-thematic one where that really happens.
 
+#### And the same thing on real shared hosting
+
+Those figures come from a development machine, which is not what this library is
+for. Measured on an **OVH mutualisé** — `cluster105`, PHP 8.3, 45 000 products,
+100 fresh interpreters, `acier lame longueur`, the worst shape there is:
+
+| step | p50 | p95 | min | max |
+|---|---|---|---|---|
+| `open()` the index | 8.7 ms | 13.3 | 7.7 | 21.8 |
+| one search | 118.6 ms | 156.0 | 110.8 | 179.6 |
+| **both** | **127.4 ms** | **165.7** | 118.5 | 201.4 |
+
+**The typical request is inside the budget and the tail is about 10% over it**,
+on the hardest query shape this design has. A one- or two-word search — which
+is what most people type — is a fraction of that.
+
+Two things in this table are worth more than the headline. `open()` costs
+**8.7 ms**, *faster* than on the development machine: an index that is only
+files, with no daemon to reach and no connection to make, opens as quickly on a
+shared host as anywhere. And the floor is flat — a minimum of 118.5 against a
+p50 of 127.4 — so the spread above it is the platform rather than the engine;
+`open()` alone swings from 7.7 ms to 21.8 with no code involved. Chasing the
+last 10% of that tail would be chasing a neighbour's disk.
+
+So the figure to quote is a pair, and both halves of it are given here rather
+than the flattering one.
+
 Nothing architectural changed. The engine already refuses to iterate in PHP what
 it can do in C by the block — `Bitset` uses the string operators, `count_chars`
 and `strspn` for exactly that reason — and the scoring loop was the one place
