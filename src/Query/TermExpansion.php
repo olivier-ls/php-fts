@@ -117,13 +117,69 @@ final class TermExpansion
 
     private readonly int $budget;
 
+    /** Bytes of the typed word's first two characters. See mayMatch(). */
+    private readonly int $anchor;
+
     public function __construct(public readonly string $typed)
     {
-        $this->codepoints = Utf8::codepoints($typed);
+        $offsets          = [];
+        $this->codepoints = Utf8::codepoints($typed, $offsets);
         $this->length     = count($this->codepoints);
 
         // Elasticsearch's `fuzziness: AUTO`.
         $this->budget = $this->length <= 2 ? 0 : ($this->length <= 5 ? 1 : 2);
+
+        // Where the second character ends, in bytes. See mayMatch().
+        $this->anchor = $offsets[2] ?? strlen($typed);
+    }
+
+    /**
+     * Whether a candidate is worth measuring at all, in one C comparison.
+     *
+     *     $expansion->mayMatch('couteaux');   // true
+     *     $expansion->mayMatch('nouveau');    // false, before any decoding
+     *
+     * ── Why this is exact and not a heuristic ──────────────────────────────
+     *
+     * Both routes in {@see accepts()} already require the first two characters
+     * to be right. The edit route demands `$shared >= 2`, because two is what
+     * even a single edit demands once the anchor rule is applied; the prefix
+     * route demands the typed word be a prefix of the candidate, which implies
+     * it. So a candidate disagreeing on either of the first two characters
+     * cannot be accepted at any distance, and this rejects exactly the set
+     * `accepts()` would have rejected — not a superset.
+     *
+     * The comparison runs on **bytes**, and is still exact: the anchor is
+     * measured to where the typed word's second character *ends*, so it is a
+     * whole number of UTF-8 sequences. Byte equality over a span ending on a
+     * character boundary is character equality over the same span.
+     *
+     * ── What it is worth ──────────────────────────────────────────────────
+     *
+     * It is the difference between measuring a candidate and materialising a
+     * dynamic programme for it. Counted on the reference catalogue's 87 000
+     * words, for the four words of `couteau de cuisine inox`:
+     *
+     *     word       gram candidates   accepted
+     *     couteau            2 289           12
+     *     cuisine            1 485           14
+     *     inox                 905           22
+     *
+     * `shareRequired()` is what was supposed to narrow that, and for these
+     * words it cannot: it is `grams - 3 * budget`, and `couteau` has seven
+     * grams against a budget of two, so the bound is `max(1, 1)` — every
+     * candidate sharing a single gram survives it. That is the bound being
+     * *sound*, which is what it is for; it is simply not selective at this
+     * word length.
+     *
+     * The gate `accepts()` had before this was a byte-length one, and it is
+     * sound for any UTF-8 — a string of b bytes holds between ceil(b/4) and b
+     * code points — which is why it is nearly useless on Latin text: for
+     * `couteau` it excludes nothing under 37 bytes.
+     */
+    public function mayMatch(string $candidate): bool
+    {
+        return strncmp($candidate, $this->typed, $this->anchor) === 0;
     }
 
     /**
@@ -200,6 +256,14 @@ final class TermExpansion
             return 1.0;
         }
 
+        // The two-character agreement both routes below require, tested on
+        // bytes and before anything is decoded. See mayMatch(): it rejects
+        // exactly what they would have rejected, and it is where most of this
+        // class's work used to go.
+        if (!$this->mayMatch($candidate)) {
+            return null;
+        }
+
         if ($this->budget > 0) {
             // A cheap gate before decoding, and a sound one: a UTF-8 string of
             // b bytes holds between ceil(b / 4) and b code points. If even the
@@ -215,8 +279,9 @@ final class TermExpansion
 
                 // Two characters is what even a single edit demands, so a
                 // candidate agreeing on fewer cannot be accepted at any
-                // distance — and skipping it here skips the whole dynamic
-                // programme, which is the expensive half of this class.
+                // distance. mayMatch() has already guaranteed it above; this
+                // still computes $shared, because the anchor rule below needs
+                // to know how far the agreement actually runs.
                 if ($shared >= 2) {
                     $distance = $this->distance($other);
 

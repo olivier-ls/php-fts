@@ -777,7 +777,22 @@ final class SegmentIndex
                 }
 
                 foreach (TermGramIndex::decode($payload) as $candidate) {
-                    $shared[$candidate] = ($shared[$candidate] ?? 0) + 1;
+                    // Counted only for a candidate that could still be
+                    // accepted. A gram list is alphabetically scattered — the
+                    // words sharing `out` run from `couteau` to `route` — so
+                    // most of what comes back disagrees with the typed word on
+                    // its first two characters and can never be accepted at
+                    // any distance. Weeding those out here rather than in
+                    // accepts() keeps them out of the map as well as out of
+                    // the dynamic programme: on `couteau`, 2 289 candidates
+                    // survived shareRequired() and 12 were accepted.
+                    //
+                    // Exact rather than approximate — see
+                    // TermExpansion::mayMatch(), which rejects precisely what
+                    // accepts() rejects.
+                    if ($expansion->mayMatch($candidate)) {
+                        $shared[$candidate] = ($shared[$candidate] ?? 0) + 1;
+                    }
                 }
             }
 
