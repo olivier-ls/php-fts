@@ -348,10 +348,56 @@ if ($phase === 'search' || $phase === 'all') {
     $frequencies = [];
     $brands      = [];
 
+    // ── And, separately, the words with the longest posting lists ─────────
+    //
+    // Counted once per product across the whole document rather than once per
+    // occurrence in its name, because that is document frequency, and document
+    // frequency is what a posting list's length *is*.
+    //
+    // The two are not the same question and the difference is the point. The
+    // frequent words of a product *name* are brands — `steel`, `cold`,
+    // `maxpedition` — and a brand is discriminating, so a query made of them
+    // has a rare slot to anchor on and the driver does its job: four of them
+    // return 26 matches in 98 ms. The pathological shape is the opposite,
+    // several words each sitting in a large share of the catalogue, where
+    // slack() is a fixed fraction of a total that grows with every word and no
+    // single slot ever clears it. The walk is then fully unanchored, and that
+    // is the case the CHANGELOG records at 318.6 ms for three words and 432.0
+    // for four — measured with hand-picked French words, which is why nothing
+    // derived here reproduced it.
+    $documentFrequencies = [];
+    $analyzer            = new Analyzer();
+
     foreach (corpus($corpus, min($scale, 5000)) as $product) {
         foreach (preg_split('/[^\p{L}\p{N}]+/u', mb_strtolower($product['name']), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
             if (mb_strlen($word) >= 4) {
                 $frequencies[$word] = ($frequencies[$word] ?? 0) + 1;
+            }
+        }
+
+        // Through the engine's own analyzer, and not a regex of my own.
+        //
+        // A regex over strip_tags() was tried first and measured nothing: the
+        // descriptions are 99% HTML and `strip_tags()` does not decode
+        // entities, so the widest "words" came back as `eacute` (70% of
+        // products), `nbsp` (56%) and `agrave` (48%). Those are not terms —
+        // Analyzer::plain() decodes entities before it looks at anything, so
+        // `&eacute;` reaches the index as `é` and `eacute` reaches it never.
+        // The queries built from them matched zero documents and timed an
+        // empty walk.
+        //
+        // The words with the longest posting lists are by definition the words
+        // the *analyzer* produces most often, so the analyzer is the only
+        // honest way to ask. It costs a few seconds over the sample and
+        // removes a whole class of way to be wrong.
+        foreach (array_keys($analyzer->frequencies(
+            $product['name'] . ' ' . (string) ($product['description'] ?? '')
+        )) as $term) {
+            // Four characters or more, so the edit budget is 1 rather than 0
+            // and the query really does expand — a two-letter word matches
+            // exactly and would measure something else.
+            if (mb_strlen((string) $term) >= 4) {
+                $documentFrequencies[(string) $term] = ($documentFrequencies[(string) $term] ?? 0) + 1;
             }
         }
 
@@ -362,6 +408,10 @@ if ($phase === 'search' || $phase === 'all') {
 
     arsort($frequencies);
     arsort($brands);
+    arsort($documentFrequencies);
+
+    $widest = array_keys($documentFrequencies);
+    $sample = min($scale, 5000);
 
     // The commonest brand, so the disjunctive case measures a facet that has
     // something to count rather than an empty intersection.
@@ -370,6 +420,8 @@ if ($phase === 'search' || $phase === 'all') {
     $words   = array_keys($frequencies);
     $common  = $words[0] ?? 'couteau';
     $second  = $words[1] ?? 'lame';
+    $third   = $words[2] ?? 'inox';
+    $fourth  = $words[3] ?? 'acier';
     $rare    = $words[count($words) - 1] ?? 'zz';
     $typo    = mb_substr($common, 0, -2) . mb_substr($common, -1);   // a letter dropped
 
@@ -378,6 +430,28 @@ if ($phase === 'search' || $phase === 'all') {
     $cases = [
         "one common word ($common)"   => fn() => $engine->search($common),
         "two words ($common $second)" => fn() => $engine->search($common . ' ' . $second),
+
+        // ── Three and four words, which is where the budget is missed ─────
+        //
+        // This phase measured one and two words only, and the CHANGELOG's own
+        // table names the three- and four-word cases as the ones above the
+        // 150 ms a results page is budgeted — `couteau de cuisine inox` at
+        // 318.6 ms and one word more at 432.0. So the shape that needed
+        // watching was the one shape nothing here watched.
+        //
+        // They are also the cases the mandatory-slot driver cannot help:
+        // slack() is a fixed fraction of the total, so the more words a query
+        // has the smaller each one's share, and past three common words no
+        // single slot clears the bar. The walk is then fully unanchored, which
+        // is what makes these the reference point for anything done to it.
+        "three words (+$third)"       => fn() => $engine->search("$common $second $third"),
+        "four words (+$fourth)"       => fn() => $engine->search("$common $second $third $fourth"),
+
+        // The unanchored walk, which is the worst case this engine has.
+        'three widest words'          => fn() => $engine->search(implode(' ', array_slice($widest, 0, 3))),
+        'four widest words'           => fn() => $engine->search(implode(' ', array_slice($widest, 0, 4))),
+        'six widest words'            => fn() => $engine->search(implode(' ', array_slice($widest, 0, 6))),
+
         "a typo ($typo)"              => fn() => $engine->search($typo),
         "a rare word ($rare)"         => fn() => $engine->search($rare),
         'no match at all'             => fn() => $engine->search('zzzzqqqq'),
@@ -401,6 +475,16 @@ if ($phase === 'search' || $phase === 'all') {
             highlight: Highlight::fields(['name', 'description'])->excerpt(120)),
         'page 20 (offset 380)'        => fn() => $engine->search($common, limit: 20, offset: 380),
     ];
+
+    // Printed so the widest-word cases can be read at all: which words they
+    // picked, and in what share of the sample each one sits.
+    printf("widest words in the sample of %s: ", number_format($sample));
+
+    foreach (array_slice($widest, 0, 6) as $word) {
+        printf('%s (%.0f%%) ', $word, 100 * $documentFrequencies[$word] / max(1, $sample));
+    }
+
+    printf("\n\n");
 
     printf("%-30s  %7s  %7s  %7s  %7s  %9s\n", 'query', 'p50 ms', 'p95 ms', 'min', 'max', 'matches');
 
