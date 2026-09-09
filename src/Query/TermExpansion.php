@@ -250,9 +250,14 @@ final class TermExpansion
         //
         // So a long completion of a short stem still gives way to a plausible
         // correction, and a nearly-finished word does not.
-        $missing = max(0, Utf8::length($candidate) - $this->length);
+        // Decoded once. It was decoded twice — the whole candidate, through
+        // Utf8::codepoints(), for the numerator and again for the denominator
+        // — and this sits in the loop that measures every candidate a gram
+        // lookup returned.
+        $length  = Utf8::length($candidate);
+        $missing = max(0, $length - $this->length);
 
-        return 1.0 - ($missing / max(1, Utf8::length($candidate))) / 2;
+        return 1.0 - ($missing / max(1, $length)) / 2;
     }
 
     /**

@@ -692,8 +692,14 @@ final class SegmentIndexWriter
         // a value would have to be about ten thousand words long to reach.
         $packed = '';
 
+        // Hoisted: this was rebuilding the same list of bits inside the loop,
+        // once per document — forty-five thousand allocations of a five-element
+        // array, on the reference catalogue, to iterate a value that cannot
+        // change while the loop runs.
+        $bits = array_keys($sums);
+
         for ($ordinal = 0; $ordinal < $documentCount; $ordinal++) {
-            foreach (array_keys($sums) as $bit) {
+            foreach ($bits as $bit) {
                 $packed .= pack('v', min(0xFFFF, $lengths[$ordinal][$bit] ?? 0));
             }
         }
@@ -817,8 +823,12 @@ final class SegmentIndexWriter
         $sums    = array_fill(0, max(1, count($searchable)), 0);
         $lengths = [];
 
+        // Hoisted, for the reason the other one is: this runs once per carried
+        // document, and a merge carries every document in the index.
+        $bits = array_keys($sums);
+
         foreach ($this->carriedLengths as $ordinal => $byBit) {
-            foreach (array_keys($sums) as $bit) {
+            foreach ($bits as $bit) {
                 $length = $byBit[$bit] ?? 0;
 
                 $lengths[$ordinal][$bit] = $length;

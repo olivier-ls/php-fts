@@ -114,7 +114,33 @@ final class TopK
         // Only worth keeping if it beats the worst one held.
         $worst = $this->heap->top();
 
-        if ([...$rank, -$segment, -$ordinal] <= [...$worst[0], -$worst[1], -$worst[2]]) {
+        // ── The first number decides almost every candidate ───────────────
+        //
+        // Both sides of the full comparison below are built with the spread
+        // operator, so asking the question at all allocated two arrays — for
+        // every candidate offered, including the overwhelming majority that
+        // lose on their very first number and are then discarded.
+        //
+        // That is the shape of the "empty query plus filters" page: a category
+        // listing, an admin table, faceted browsing with no search box. Every
+        // document the filter keeps is offered here, so on the reference
+        // catalogue the heap was asked forty-five thousand times to return
+        // twenty rows, and paid two allocations each time to say no.
+        //
+        // A rank is compared left to right, so the first number settles it
+        // outright unless it ties — and ties are rare except where a sort
+        // leaves them deliberately. Sorting by relevance alone, which is the
+        // default, makes the whole comparison a float against a float.
+        $first = $rank[0] ?? 0.0;
+        $bar   = $worst[0][0] ?? 0.0;
+
+        if ($first < $bar) {
+            return;
+        }
+
+        if ($first === $bar
+            && [...$rank, -$segment, -$ordinal] <= [...$worst[0], -$worst[1], -$worst[2]]
+        ) {
             return;
         }
 
