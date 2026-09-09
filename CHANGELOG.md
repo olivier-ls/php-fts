@@ -101,11 +101,28 @@ every search engine answers: no results for *zwilling*, showing results for
 
 ### Performance — the scoring loop, measured
 
-The worst case is **1.9× faster**. `acier lame longueur` — three words each in
+The worst case is **1.55× faster**. `acier lame longueur` — three words each in
 about 46% of 45 000 products, which is what someone shopping for a knife types —
-went from around 736 ms to around 288, and four such words from 992 to 389.
-Light queries gained too: one word 29 → 17 ms, two words 66 → 42. Relevance is
+went from 110 ms to 67 warm, and four such words from 140 to 89. Light queries
+gained too: one word 4.9 → 3.8 ms, two words 10.2 → 8.3. Relevance is
 byte-for-byte identical across all twelve benchmark queries.
+
+**What a request actually costs**, cold — a fresh interpreter, `open()`
+included, which is the only shape a visitor ever meets — at 45 000 products:
+
+| query | matches | cold total |
+|---|---|---|
+| `steel` | 1 412 | **23 ms** |
+| `stel` (a typo) | 1 379 | **25 ms** |
+| `steel cold` | 746 | **29 ms** |
+| `couteau de cuisine inox` | 1 013 | **61 ms** |
+| `couteau` (38% of the catalogue) | 18 750 | **70 ms** |
+| `acier lame longueur` | 20 109 | **109 ms** |
+| `acier lame longueur couteau` | 18 276 | **139 ms** |
+
+All of it inside the 150 ms a results page is budgeted, including the shape
+that is hardest for this design: several words that are each in half the
+catalogue, on a mono-thematic one where that really happens.
 
 Nothing architectural changed. The engine already refuses to iterate in PHP what
 it can do in C by the block — `Bitset` uses the string operators, `count_chars`
@@ -128,19 +145,26 @@ that had not followed the rule. It now does:
   2 289 dynamic programmes into about a hundred for `couteau`. No measurable
   effect on a warm search, and the entry says so.
 
-**On the numbers.** Every figure above is A/B'd in a single session against the
-other version of the code, because this development machine drifts by up to 27%
-between sessions — the *unchanged* code measured 578 ms one hour and 736 the
-next, which made a real 16% gain look like a 20% regression. A stored baseline
-is not a comparison.
+**On the numbers, and on two ways they were wrong first.** Every figure above is
+A/B'd in a single session against the other version of the code, with Xdebug
+disabled. Both of those conditions were learned by getting them wrong.
 
-**What is still over budget.** A results page is budgeted at 150 ms. A cold
-request — a fresh process, `open()` included, which is the only shape that
-describes a real request — answers `couteau` in **67.5 ms** at 45 000 products.
-One and two word searches are 17 and 42 ms warm. Three or more words that are
-*all* very common remain over: around 288 ms for three, 389 for four. That case
-is amplified by a mono-thematic catalogue, where half the products really do
-mention `acier` and `lame`, and it is stated rather than hidden.
+A stored baseline is not a comparison: this development machine drifts by up to
+27% between sessions, and the *unchanged* code measured 578 ms one hour and 736
+the next — which made a real gain look like a regression.
+
+And **Xdebug inflates these numbers by 6.6×, unevenly.** It charges per function
+call, which is what a hot loop is made of, so it flatters every change that
+removes one: the improvement above measured as 1.9× under Xdebug and is 1.55×
+without it. `benchmark.php` now refuses to run while Xdebug is active rather
+than printing a number nobody can trust — `--phase=cold` had guarded its own
+worker all along, which is why the cold figures were right while every other
+phase was quietly not.
+
+`benchmark/cold.php` also answers over HTTP now, because on shared hosting every
+request is already a cold one and `shell_exec()` is commonly disabled there —
+so the one measurement that describes a real request can be taken on the kind
+of machine this library is for.
 
 ### Performance — work that was being done more than once
 

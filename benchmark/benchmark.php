@@ -58,7 +58,62 @@ $root   = rtrim($options['dir'] ?? __DIR__, '/\\');
 
 $scales = array_map('intval', explode(',', (string) ($options['scales'] ?? '1000,5000,10000,45000')));
 
-if (!is_file($corpus)) {
+// ── Refuse to measure anything through Xdebug ──────────────────────────────
+//
+// Because it does not slow things down by a little. Measured here, on this
+// index: `acier lame longueur` reports 736 ms with Xdebug loaded in the
+// php.ini and 110 ms without it — **6.6 times**, and a whole afternoon was
+// spent optimising against the inflated figure before the discrepancy showed
+// up. Worse, it does not inflate evenly: Xdebug's cost is per *function call*,
+// which is precisely what a hot loop is made of, so it flatters every change
+// that removes calls and reports gains that are not there. A 1.55x improvement
+// measured as 1.9x is not a rounding error, it is the wrong conclusion.
+//
+// The `--phase=cold` worker already guards itself, and the comment there
+// records the same lesson from the other direction: a child process inherits
+// the php.ini rather than the parent's `-d` flags. That guard is why the cold
+// numbers were right all along while every other phase was wrong, which is a
+// bad place for a benchmark to be — one phase honest and five silently not.
+//
+// So this refuses rather than warns. A benchmark that prints a number nobody
+// can trust is worse than one that prints nothing.
+// Two spellings mean off, and only one of them is `off`: setting
+// `xdebug.mode=off` leaves `ini_get()` returning the empty string, because the
+// mode is a *list* and off is the empty list. Comparing against 'off' alone
+// refused to run under the very flag it was telling people to pass.
+$xdebugMode = trim((string) ini_get('xdebug.mode'));
+
+if (extension_loaded('xdebug') && $xdebugMode !== '' && $xdebugMode !== 'off') {
+    fwrite(STDERR, sprintf(
+        "Xdebug is active (xdebug.mode=%s) and inflates these numbers by up to 6.6x,\n"
+        . "unevenly — it charges per function call, so it flatters anything that removes one.\n\n"
+        . "    %s -d xdebug.mode=off %s %s\n\n",
+        $xdebugMode,
+        basename(PHP_BINARY),
+        implode(' ', array_slice($argv, 0, 1)),
+        implode(' ', array_slice($argv, 1)),
+    ));
+
+    exit(1);
+}
+
+// ── `--phase=cold` needs no corpus, and asking for one blocks the one place
+//    it is worth running ────────────────────────────────────────────────────
+//
+// The cold phase reads an index that already exists; every other phase either
+// builds one from the corpus or picks its query words out of it. Demanding the
+// corpus regardless meant that measuring a shared host — which is the whole
+// point of a cold number, and the machine this library is *for* — required
+// uploading 53 MB of JSONL that nothing would open.
+//
+// Upload `src/`, `benchmark/autoload.php`, `benchmark/benchmark.php`,
+// `benchmark/cold.php` and the index directory, and this runs:
+//
+//     php -d xdebug.mode=off benchmark/benchmark.php --phase=cold
+//
+// Or, where `shell_exec()` is disabled, call `cold.php` directly in a loop —
+// each call is its own cold sample, which is what the phase is orchestrating.
+if ($phase !== 'cold' && !is_file($corpus)) {
     fwrite(STDERR, "No corpus at $corpus — run benchmark/extract.php first.\n");
     exit(1);
 }
