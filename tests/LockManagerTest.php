@@ -47,13 +47,49 @@ class LockManagerTest extends TestCase
     }
 
     /**
-     * Simule un lock posé par un autre processus en créant manuellement
-     * le répertoire de lock et en y écrivant le PID donné.
+     * Simule un lock posé par un autre processus **de cette machine**, en
+     * créant manuellement le répertoire de lock et en y écrivant le PID donné.
+     *
+     * The host is written beside the pid because that is what the lock file
+     * holds, and because it is what makes the pid answerable: `isStale()` only
+     * consults `posix_kill()` for a lock its own machine took. A helper writing
+     * a bare pid would simulate a lock from *somewhere else*, and every test
+     * below that expects a liveness answer would silently get a clock answer
+     * instead — see simulateRemoteLock(), which is that case on purpose.
      */
     private function simulateForeignLock(int $pid): void
     {
         mkdir($this->lockDir(), 0755);
-        file_put_contents($this->pidFile(), $pid);
+        file_put_contents($this->pidFile(), (gethostname() ?: 'unknown-host') . "\n" . $pid);
+    }
+
+    /**
+     * A lock held by a process on **another machine**.
+     *
+     * The case an index on NFS makes real: several frontends reach the same
+     * directory and number their processes independently, so a pid from one of
+     * them means nothing on another. Asking the local kernel about it answers
+     * about whatever unrelated local process wears that number.
+     */
+    private function simulateRemoteLock(int $pid): void
+    {
+        mkdir($this->lockDir(), 0755);
+        file_put_contents($this->pidFile(), "some-other-frontend\n" . $pid);
+    }
+
+    /** A lock file written before the host was recorded beside the pid. */
+    private function simulateLegacyLock(int $pid): void
+    {
+        mkdir($this->lockDir(), 0755);
+        file_put_contents($this->pidFile(), (string) $pid);
+    }
+
+    /** The pid the lock file names, however many lines it carries. */
+    private function heldPid(): int
+    {
+        $lines = explode("\n", trim((string) @file_get_contents($this->pidFile())));
+
+        return (int) end($lines);
     }
 
     /**
@@ -116,7 +152,7 @@ class LockManagerTest extends TestCase
         $lm->acquire();
 
         $this->assertFileExists($this->pidFile());
-        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
+        $this->assertSame(getmypid(), $this->heldPid());
 
         $lm->release();
     }
@@ -190,7 +226,7 @@ class LockManagerTest extends TestCase
         $lm->acquire(); // ne doit pas lever d'exception
 
         $this->assertDirectoryExists($this->lockDir());
-        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
+        $this->assertSame(getmypid(), $this->heldPid());
 
         $lm->release();
     }
@@ -205,7 +241,7 @@ class LockManagerTest extends TestCase
         $lm = new LockManager($this->tempDir, timeoutSeconds: 2);
         $lm->acquire();
 
-        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
+        $this->assertSame(getmypid(), $this->heldPid());
 
         $lm->release();
     }
@@ -230,7 +266,7 @@ class LockManagerTest extends TestCase
         $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
         $lm->acquire();
 
-        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
+        $this->assertSame(getmypid(), $this->heldPid());
 
         $lm->release();
     }
@@ -311,6 +347,61 @@ class LockManagerTest extends TestCase
         $lm->acquire();
     }
 
+    #[Test]
+    public function a_lock_from_another_machine_is_judged_by_the_clock_and_not_by_a_local_pid(): void
+    {
+        // The pid is this very process, so it is unambiguously alive here —
+        // and it names another frontend, so its liveness says nothing about
+        // the lock. Believing it would time every writer out forever; the
+        // clock is the only thing with standing, and the lock is fresh.
+        $this->simulateRemoteLock(getmypid());
+
+        touch($this->pidFile(), time() - 600);
+        touch($this->lockDir(), time() - 600);
+        clearstatcache();
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
+        $lm->acquire();
+
+        // Reclaimed on age, which is the answer available for a remote holder,
+        // rather than protected by a pid that happens to exist locally.
+        $this->assertSame(getmypid(), $this->heldPid());
+
+        $lm->release();
+    }
+
+    #[Test]
+    public function a_fresh_lock_from_another_machine_is_left_alone(): void
+    {
+        // The other half, and the one that matters most: a *live* remote
+        // writer must not have its lock stolen. Under a bare pid this is where
+        // two processes ended up inside the critical section together and one
+        // commit was silently overwritten.
+        $this->simulateRemoteLock(999999);
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 300);
+
+        $this->expectException(LockException::class);
+
+        $lm->acquire();
+    }
+
+    #[Test]
+    public function a_lock_file_written_before_the_host_was_recorded_is_not_vouched_for(): void
+    {
+        // An index in flight across an upgrade. The pid is live and local, but
+        // the file does not say where it came from, and guessing "here" is the
+        // guess that steals live locks — so it falls to the clock, which this
+        // one is too young for.
+        $this->simulateLegacyLock(getmypid());
+
+        $lm = new LockManager($this->tempDir, timeoutSeconds: 1, maxAgeSeconds: 300);
+
+        $this->expectException(LockException::class);
+
+        $lm->acquire();
+    }
+
     /** And the other half: the clock does eventually answer. */
     #[Test]
     public function a_lock_naming_an_impossible_pid_is_reclaimed_once_it_is_old(): void
@@ -324,7 +415,7 @@ class LockManagerTest extends TestCase
         $lm = new LockManager($this->tempDir, timeoutSeconds: 2, maxAgeSeconds: 300);
         $lm->acquire();
 
-        $this->assertSame(getmypid(), (int) file_get_contents($this->pidFile()));
+        $this->assertSame(getmypid(), $this->heldPid());
 
         $lm->release();
     }

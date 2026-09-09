@@ -53,8 +53,9 @@ class LockManager
         while (true) {
             // Atomic acquisition attempt via mkdir
             if (@mkdir($this->lockDir, 0755)) {
-                // Store our PID for orphaned lock detection
-                file_put_contents($this->pidFile, (string) getmypid());
+                // Host and PID, in that order, for orphaned lock detection.
+                // See isStale() for why the host has to be there.
+                file_put_contents($this->pidFile, self::host() . "\n" . getmypid());
                 $this->held = true;
                 return;
             }
@@ -165,27 +166,104 @@ class LockManager
 
         // posix_kill() with signal 0 does not kill anything — it only reports
         // whether the process exists.
-        if ($pid !== null && PHP_OS_FAMILY !== 'Windows' && function_exists('posix_kill')) {
+        //
+        // ── Only ever asked about a process on this machine ───────────────
+        //
+        // A pid is meaningful on the host that issued it and nowhere else, and
+        // this lock is designed for exactly the case where that matters: the
+        // directory-and-mkdir scheme was chosen over flock() because the index
+        // sits on NFS, and an index on NFS is an index several machines can
+        // reach. Two frontends behind a load balancer share the directory and
+        // number their processes independently.
+        //
+        // Asking the local kernel about a remote pid answers about whichever
+        // unrelated local process happens to wear that number, and it answers
+        // confidently. Both ways of being wrong are bad: a live remote writer
+        // whose number matches nothing local is declared dead and has its lock
+        // stolen, so two processes end up inside the critical section and one
+        // commit is silently overwritten — which is precisely the failure the
+        // age rule was corrected to avoid. The other way round, a dead remote
+        // writer whose number matches something local is believed alive
+        // forever, and every writer times out.
+        //
+        // So the host is recorded beside the pid, and the kernel is asked only
+        // when the lock is ours to ask about. A lock from another machine falls
+        // through to the clock, which is what heartbeat() keeps honest, and
+        // which is the same answer this gives on Windows and wherever
+        // posix_kill() is disabled.
+        if ($pid !== null
+            && $this->holderIsLocal()
+            && PHP_OS_FAMILY !== 'Windows'
+            && function_exists('posix_kill')
+        ) {
             return !posix_kill($pid, 0);
         }
 
         // No pid to ask about — a writer that died between mkdir and writing
-        // one — or no way to ask. The clock is what is left.
+        // one — or no way to ask, or no standing to. The clock is what is left.
         return $this->isExpired();
     }
 
     /**
      * The process that holds the lock, or null when there is no saying.
+     *
+     * The pid is the **last** line, which is the same answer for the two-line
+     * file this writes and for the single-line one a previous version wrote —
+     * and would stay the same answer if a third line were ever added above it.
+     * Whether that pid may be asked about is a separate question, and
+     * holderIsLocal() is the one that answers it.
      */
     private function holder(): ?int
     {
-        if (!is_file($this->pidFile)) {
-            return null;
-        }
-
-        $pid = (int) @file_get_contents($this->pidFile);
+        $lines = $this->pidLines();
+        $pid   = (int) (end($lines) ?: '');
 
         return $pid > 0 ? $pid : null;
+    }
+
+    /**
+     * Whether the lock was taken by a process on this machine.
+     *
+     * False when the file names another host, and false when it names none —
+     * a lock written before this existed says nothing about where it came
+     * from, and guessing "here" is the guess that steals live locks.
+     */
+    private function holderIsLocal(): bool
+    {
+        $host = $this->pidLines()[0] ?? null;
+
+        return $host !== null && $host === self::host();
+    }
+
+    /**
+     * @return string[] the pid file's lines, or an empty list when unreadable
+     */
+    private function pidLines(): array
+    {
+        if (!is_file($this->pidFile)) {
+            return [];
+        }
+
+        $contents = @file_get_contents($this->pidFile);
+
+        if ($contents === false) {
+            return [];
+        }
+
+        return explode("\n", trim($contents));
+    }
+
+    /**
+     * This machine, as well as it can be named.
+     *
+     * `gethostname()` can fail, and on a container it can also be the
+     * container id rather than the host — which is fine and even better here:
+     * what has to match is the namespace the pid belongs to, and that is the
+     * container, not the metal.
+     */
+    private static function host(): string
+    {
+        return gethostname() ?: 'unknown-host';
     }
 
     /**
