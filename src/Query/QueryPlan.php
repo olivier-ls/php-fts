@@ -166,10 +166,38 @@ final class QueryPlan
                 $variants[] = [(string) $term, $weight];
             }
 
-            // Best readings first, ties settled by the term, then cut. See
-            // MAX_EXPANSIONS: the order has to be a total one, or two machines
-            // could keep different halves of a tie.
-            usort($variants, static fn(array $a, array $b): int => $b[1] <=> $a[1] ?: strcmp($a[0], $b[0]));
+            // Best readings first, then the commonest, then the term itself,
+            // and only then cut. See MAX_EXPANSIONS: the order has to be a
+            // total one, or two machines could keep different halves of a tie.
+            //
+            // ── Why document frequency sits in the middle ──────────────────
+            //
+            // Because for one query shape the weights are *all equal*, and
+            // `strcmp` was therefore deciding the answer on its own. A single
+            // character of a continuous script reaches every bigram of the
+            // vocabulary holding it, and each one is weighed 1/2 by
+            // SegmentIndex::expandTerms() — it is half about the character
+            // asked for, whichever bigram it is. So the fifty kept were the
+            // fifty smallest in UTF-8 byte order, which is to say the fifty
+            // whose *first* character had the lowest code point: a criterion
+            // with no relation to anything. On a Chinese catalogue where a
+            // common character sits in several hundred bigrams, recall became
+            // an arbitrary fraction, silently.
+            //
+            // Frequency is the right tie-break for the same reason "did you
+            // mean" offers the commoner word: where two readings are equally
+            // close to what was typed, the one more of the corpus uses is the
+            // likelier thing meant, and it reaches more documents. It applies
+            // to the Latin case too — two corrections at the same distance
+            // from a word of the same length — where it was previously also
+            // settled by byte order.
+            //
+            // `strcmp` stays as the final settle, so the choice is still the
+            // same on every machine and in every process.
+            usort($variants, static fn(array $a, array $b): int
+                => $b[1] <=> $a[1]
+                ?: $statistics->documentFrequency($b[0]) <=> $statistics->documentFrequency($a[0])
+                ?: strcmp($a[0], $b[0]));
 
             $variants = array_slice($variants, 0, self::MAX_EXPANSIONS);
 
