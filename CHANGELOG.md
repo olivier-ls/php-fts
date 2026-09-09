@@ -83,6 +83,68 @@ and `Sencut Braxx` in its top five and now returns `POIGNARD PLIANT MUELA INOX`.
   by construction rather than by measurement (`tests/Index/DrivenWalkTest.php`
   asserts the driven and undriven walks agree hit for hit and score for score).
 
+### Fixed — four silent answers at the seams between correct pieces
+
+Found by a second read-only audit. None of these was a bug *inside* a component,
+which is why every component's own tests passed over all four; each was in the
+seam where two of them met, and each was silent — no exception, no warning, a
+plausible-looking answer. Two of them could not be observed at the scale the
+suite ran at, so the suite gained the scale rather than only the fix.
+
+- **A document frequency could run past the document count it was weighed
+  against.** `statisticsOver()` counted *live* documents while the three figures
+  beside it — document frequencies, summed term lengths, summed field lengths —
+  are all measured over every document a segment holds, tombstones included,
+  because that is what is on disk. `df` could then exceed `N`; `Scorer::idf()`
+  clamps it, which turns a common term's IDF into `ln(1 + 0.5/(N + 0.5))` —
+  zero, to three decimals. An index rewritten in place is where that bit: a
+  thousand documents put ten times is ten thousand written against a thousand
+  live, so every IDF collapsed, the minimum-should-match threshold collapsed
+  with it, and the ranking became arbitrary. `averageLength` was inflated by the
+  same ratio. Counting the deleted documents on **both** sides is what Lucene
+  does and for the same reason — it keeps `df <= N` true, so the approximation
+  stays an approximation instead of becoming a discontinuity. A merge still
+  recomputes every sum over the documents it carried.
+- **A single-character CJK query kept fifty readings chosen by byte order.** One
+  character of a continuous script reaches every bigram of the vocabulary
+  holding it, and each is weighed `1/2` — a bigram is half about the character
+  asked for, whichever bigram it is. With every weight equal, the sort's final
+  settle decided alone, and that settle was `strcmp`: the fifty kept were the
+  fifty whose *first* character had the lowest code point. On a Chinese
+  catalogue where a common character sits in several hundred bigrams, recall
+  became a function of the code chart. Document frequency now breaks the tie, so
+  the readings kept are the ones that reach documents; `strcmp` remains the
+  final settle, so the choice is still identical on every machine. It applies to
+  the Latin case too, where two corrections at the same distance from a word of
+  the same length were also being settled by byte order.
+- **A field an inferred schema had never seen was stored and never indexed.** An
+  index that declares nothing infers its schema from the first batch and freezes
+  it like any other, so a field appearing later was never analysed, produced no
+  postings and got no column — while `isStored()` kept it in the docstore.
+  `$hit->document['colour']` came back and `search('rouge')` found nothing, with
+  nothing anywhere saying so. It happened *inside a single import* too:
+  `putMany()` freezes the inference of its first spilled segment, so a generator
+  whose first five thousand rows lacked an optional field condemned that field
+  for the whole import. Now refused, naming the document, the field and the
+  remedy. A **declared** schema is untouched: a field it does not mention is
+  stored-only on purpose.
+- **A term facet could be read as a numeric one.** Merging a facet across
+  segments told statistics from term counts by looking for the keys `count` and
+  `sum` — which are what `NumericColumn::stats()` returns and also two
+  perfectly ordinary tags. A facet holding both went down the statistics branch,
+  `min` was not there, and the facet came back as an undefined-key warning over
+  nonsense. The answer was never in the shape: the frozen schema knows the
+  field's type, index-wide, before any segment is read.
+
+Also: per-field statistics now cross a segment boundary keyed by **field name**
+rather than by mask bit. Bits are handed out by `Schema::searchableFields()` in
+name order, so the mapping is stable for one schema — and `CollectionStatistics`
+adds up the contributions of *segments*, which is exactly where that stopped
+being a guarantee. Nothing produces disagreeing segments today, because the
+schema is frozen; the invariant held, it was simply never stated and was
+load-bearing three files from where it was decided. And `matchDriven()` no
+longer takes a `CollectionStatistics` it never read.
+
 ### Fixed
 
 - **A stray `<` no longer eats the rest of the text.** `strip_tags()` treats
@@ -223,6 +285,17 @@ where that is free.
 - **Continuous scripts are not cheaper than before.** Their terms are n-grams,
   so they keep the longer posting lists, and they are never expanded: an n-gram
   one edit from another is a different word, not a misspelling of it.
+- **Korean gets no typo tolerance, and that is a choice.** Hangul is classed as
+  a continuous script, so a Korean word is cut into bigrams and never expanded
+  — which means neither the edit budget nor prefix completion applies to it.
+  This is what Lucene's `CJKBigramFilter` does, with its hangul flag on by
+  default, and bigrams handle Korean's agglutination well: the particles attach
+  (서울 + 에서), so a bigram index reaches the stem where a whole-word one would
+  not. But Korean *does* put spaces between its words, unlike the other scripts
+  in that group, so it is the one case where the classification is a trade
+  rather than a necessity. Stated because a Korean user would otherwise find
+  the tolerance this release advertises simply absent, with no way to know it
+  was deliberate.
 
 ---
 

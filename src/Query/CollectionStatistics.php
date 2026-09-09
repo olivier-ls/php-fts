@@ -35,12 +35,31 @@ final class CollectionStatistics
         public readonly array $documentFrequencies = [],
 
         /**
-         * Mean terms per field, by mask bit — what BM25F normalises each field
-         * against. A title averages a handful of terms and a description
+         * Mean terms per field, by field **name** — what BM25F normalises each
+         * field against. A title averages a handful of terms and a description
          * hundreds, so normalising both against one figure would make every
          * title look short and every description look long.
          *
-         * @var array<int, float>
+         * ── Why the name, and not the mask bit ────────────────────────────
+         *
+         * Because a bit means something only inside the segment that wrote it.
+         * Schema::searchableFields() sorts by name and hands out bit 0 to the
+         * first, so the mapping is stable *for one schema* — and this class
+         * adds up the contributions of segments, which is precisely where that
+         * stops being a guarantee. Two segments written to schemas differing by
+         * one field would attribute their sums to the same bits and mean
+         * different fields by them, so a title's lengths would be averaged
+         * together with a brand's, and BM25F would normalise both against the
+         * result.
+         *
+         * Nothing produces such segments today: the schema is frozen at the
+         * first commit and every writer and every merge is handed that one.
+         * The invariant held; it was simply never stated, and it was load-
+         * bearing three files away from where it was decided. Keyed by name,
+         * nothing above the segment depends on it at all — each segment maps
+         * its own bits, which is the only place that knows them.
+         *
+         * @var array<string, float>
          */
         public readonly array $fieldAverages = [],
     ) {
@@ -51,9 +70,9 @@ final class CollectionStatistics
         return $this->documentFrequencies[$term] ?? 0;
     }
 
-    public function fieldAverage(int $bit): float
+    public function fieldAverage(string $field): float
     {
-        return $this->fieldAverages[$bit] ?? 0.0;
+        return $this->fieldAverages[$field] ?? 0.0;
     }
 
     /**
@@ -64,7 +83,7 @@ final class CollectionStatistics
      * unless both sides hold the same number of documents.
      *
      * @param array<string, int> $documentFrequencies
-     * @param array<int, int>    $fieldLengthSums bit => summed lengths
+     * @param array<string, int> $fieldLengthSums field name => summed lengths
      */
     public function plus(
         int $documents,
@@ -83,18 +102,18 @@ final class CollectionStatistics
 
         $fieldTotals = [];
 
-        foreach ($this->fieldAverages as $bit => $average) {
-            $fieldTotals[$bit] = (int) round($average * $this->documentCount);
+        foreach ($this->fieldAverages as $field => $average) {
+            $fieldTotals[$field] = (int) round($average * $this->documentCount);
         }
 
-        foreach ($fieldLengthSums as $bit => $sum) {
-            $fieldTotals[$bit] = ($fieldTotals[$bit] ?? 0) + $sum;
+        foreach ($fieldLengthSums as $field => $sum) {
+            $fieldTotals[$field] = ($fieldTotals[$field] ?? 0) + $sum;
         }
 
         $fieldAverages = [];
 
-        foreach ($fieldTotals as $bit => $fieldTotal) {
-            $fieldAverages[$bit] = $count > 0 ? $fieldTotal / $count : 0.0;
+        foreach ($fieldTotals as $field => $fieldTotal) {
+            $fieldAverages[$field] = $count > 0 ? $fieldTotal / $count : 0.0;
         }
 
         return new self(

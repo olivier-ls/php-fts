@@ -855,15 +855,26 @@ final class SegmentIndex
     }
 
     /**
-     * Summed field lengths, by mask bit, so per-field averages can be taken
-     * across segments.
+     * Summed field lengths, by field **name**, so per-field averages can be
+     * taken across segments.
      *
-     * @return array<int, int>
+     * Translated out of mask bits here, because this is the last place that
+     * knows what this segment's bits mean — `§ meta` records the mapping per
+     * segment, and nothing above cares to. See CollectionStatistics, which
+     * explains why a bit cannot cross a segment boundary.
+     *
+     * @return array<string, int>
      * @internal
      */
     public function fieldLengthSums(): array
     {
-        return $this->fieldLengthSums;
+        $sums = [];
+
+        foreach ($this->searchableFields as $bit => $field) {
+            $sums[$field] = $this->fieldLengthSums[$bit] ?? 0;
+        }
+
+        return $sums;
     }
 
     /**
@@ -921,7 +932,7 @@ final class SegmentIndex
         }
 
         if ($driver !== null) {
-            return $this->matchDriven($plan, $driver, $statistics, $weightByBit, $averages, $bByBit);
+            return $this->matchDriven($plan, $driver, $weightByBit, $averages, $bByBit);
         }
 
         foreach ($plan->slots as $slot) {
@@ -1110,6 +1121,12 @@ final class SegmentIndex
     }
 
     /**
+     * The index-wide mean length of each field, in this segment's own bits.
+     *
+     * The statistics answer by name; the scorer works in bits, because a
+     * posting's frequency record is one byte per bit. This is the translation,
+     * and it is the only place it belongs.
+     *
      * @return array<int, float>
      */
     private function fieldAverages(CollectionStatistics $statistics): array
@@ -1117,7 +1134,7 @@ final class SegmentIndex
         $averages = [];
 
         foreach ($this->searchableFields as $bit => $field) {
-            $averages[$bit] = $statistics->fieldAverage($bit)
+            $averages[$bit] = $statistics->fieldAverage($field)
                 ?: ($this->documentCount > 0 ? ($this->fieldLengthSums[$bit] ?? 0) / $this->documentCount : 0.0);
         }
 
@@ -1271,7 +1288,6 @@ final class SegmentIndex
     private function matchDriven(
         QueryPlan $plan,
         array $driver,
-        CollectionStatistics $statistics,
         array $weightByBit,
         array $averages,
         array $bByBit,

@@ -180,10 +180,83 @@ final class SegmentIndexWriter
         // Normalising here also means the term index, the columns and the
         // document store all read one already-agreed value, instead of each
         // making up its own mind about what `['Puma']` was supposed to be.
+        $this->refuseUnknownFields($id, $document);
+
         $this->seen[$id]   = true;
         $this->keys[]      = $id;
         $this->documents[] = $this->schema?->coerce($document, $id) ?? $document;
         $this->count++;
+    }
+
+    /**
+     * Refuses a field an inferred schema never saw.
+     *
+     * ── The silence this replaces ──────────────────────────────────────────
+     *
+     * An index that declared nothing infers its schema from the first batch
+     * and freezes it, like any other. `searchableFields()` then comes from
+     * that frozen schema — so a field appearing for the first time in a later
+     * batch was never analysed, produced no postings and got no column, while
+     * `Schema::isStored()` returns true for a field the schema does not
+     * mention and kept it in the docstore.
+     *
+     * The result read as working. `$hit->document['colour']` came back;
+     * `search('red')` found nothing, with no exception and no warning, for the
+     * life of the index. A filter on it did at least raise — the search, which
+     * is the point of the library, did not.
+     *
+     * It also happened *inside a single import*: putMany() freezes the
+     * inference of its first spilled segment and hands it to every writer
+     * after, so a generator whose first five thousand rows lack an optional
+     * field condemned that field for the whole import.
+     *
+     * ── Why refusing, rather than extending the schema ────────────────────
+     *
+     * Extending it is the better answer and it is not a small one. A segment
+     * written to a wider schema has a different bit for the same field, and a
+     * merge carries frequency records across *as the bytes they are* — one
+     * byte per bit, in bit order — and field lengths indexed by bit. Both
+     * would have to be permuted per posting, in the middle of the merge's hot
+     * path, against a design whose whole point is that it copies rather than
+     * reinterprets. That is a considered change, not a bug fix, and pretending
+     * otherwise is how a fix becomes three.
+     *
+     * So this refuses, and says what to do instead. Loud rather than silent is
+     * the rule this library already applies to a schema that contradicts the
+     * frozen one; the same reasoning applies to a document that does.
+     *
+     * ── Note what is *not* refused ────────────────────────────────────────
+     *
+     * A **declared** schema is left alone. A field it does not mention is
+     * stored-only on purpose — that is a documented feature, and the reason
+     * this asks `isInferred()` rather than `has()` alone. A null value is not
+     * refused either: a missing field and an explicit null are always legal,
+     * and neither would have produced a term.
+     *
+     * @param array<string, mixed> $document
+     * @throws StorageException
+     */
+    private function refuseUnknownFields(string $id, array $document): void
+    {
+        if ($this->schema === null || !$this->schema->isInferred()) {
+            return;
+        }
+
+        foreach ($document as $field => $value) {
+            $field = (string) $field;
+
+            if ($value === null || $this->schema->has($field)) {
+                continue;
+            }
+
+            throw new StorageException(
+                "Document '$id' has a field '$field' this index cannot index. Its schema was inferred"
+                . ' from the first batch committed, which had no such field, and an inferred schema is'
+                . ' frozen like a declared one — so the field would be stored and then findable by'
+                . ' nothing. Declare a schema at open() to fix the fields up front, or reindex into a'
+                . ' new directory.'
+            );
+        }
     }
 
     public function count(): int

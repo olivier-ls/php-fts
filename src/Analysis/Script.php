@@ -52,6 +52,21 @@ enum Script
     case Han;
     case Hiragana;
     case Katakana;
+
+    /**
+     * Korean, and the one entry in this group that is a trade rather than a
+     * fact: it *does* put spaces between its words.
+     *
+     * Bigrammed anyway, which is what Lucene's CJKBigramFilter does with its
+     * hangul flag on by default, and for a reason that holds here too — Korean
+     * agglutinates, so its particles attach to the stem (서울 + 에서) and a
+     * whole-word term would miss what a bigram reaches.
+     *
+     * What it costs is stated in the CHANGELOG's known limits, because it is
+     * not visible from here: {@see isContinuous()} is also what
+     * TermExpansion::tolerates() reads, so classing Hangul here means Korean
+     * gets **no typo tolerance and no prefix completion at all**.
+     */
     case Hangul;
     case Thai;
     case Lao;

@@ -649,6 +649,9 @@ final class IndexDirectory
         $total  = 0;
         $merged = [];
 
+        /** @var array<string, bool> facet name => counts numbers rather than terms */
+        $statistical = [];
+
         // One bounded heap for the whole search rather than a ranked list per
         // segment: the best twenty overall are somewhere among the segments, and
         // there is no need to materialise more than twenty to find them.
@@ -682,7 +685,8 @@ final class IndexDirectory
 
                 $merged[$name] = $this->mergeFacet(
                     $merged[$name] ?? null,
-                    $segment->facet($facet, $name, $over)
+                    $segment->facet($facet, $name, $over),
+                    $statistical[$name] ??= $this->isStatistical($facet->fieldFor($name)),
                 );
             }
 
@@ -801,12 +805,33 @@ final class IndexDirectory
         $statistics = CollectionStatistics::empty();
 
         foreach ($this->segments as $position => $segment) {
-            // Live documents, not written ones: a term present only in deleted
-            // documents should not look common.
-            $live = $segment->count() - $this->deletions[$position]->count();
-
+            // ── Written documents, not live ones ──────────────────────────
+            //
+            // This counted live documents, which reads like the careful
+            // choice and is the one thing that must not be done here: the
+            // three figures beside it — the document frequencies, the summed
+            // term lengths, the summed field lengths — are all measured over
+            // every document the segment holds, tombstones included, because
+            // that is what is recorded on disk. Mixing a live count with
+            // written sums broke both of BM25's inputs at once.
+            //
+            // `df` could then exceed `N`. Scorer::idf() clamps it, which
+            // turns the IDF of a common term into ln(1 + 0.5/(N + 0.5)) —
+            // effectively zero. An index rewritten in place is where that
+            // bites: a thousand documents put ten times is ten thousand
+            // written against a thousand live, so every term looked present
+            // in more documents than existed, every IDF collapsed, the
+            // threshold collapsed with it, and the ranking became arbitrary.
+            // `averageLength` was inflated by the same ratio.
+            //
+            // Counting the deleted documents on both sides is what Lucene
+            // does, and for the same reason: it keeps `df <= N` true, so the
+            // approximation stays an approximation instead of becoming a
+            // discontinuity. What corrects it is a merge, which recomputes
+            // every sum over the documents it carried — see MergePolicy's
+            // `deletedRatioThreshold`, which exists to make that happen.
             $statistics = $statistics->plus(
-                max(0, $live),
+                $segment->count(),
                 $segment->termLengthSum(),
                 $terms === [] ? [] : $segment->documentFrequencies($terms),
                 $segment->fieldLengthSums(),
@@ -1097,17 +1122,33 @@ final class IndexDirectory
      * than summed: the minimum of the whole is the smallest of the minima, and
      * the mean has to be worked out again from the totals.
      *
+     * ── Which of the two it is, is told rather than guessed ────────────────
+     *
+     * It used to be read off the shape: a result carrying `count` and `sum`
+     * was taken for statistics. Those are the keys NumericColumn::stats()
+     * returns, and they are also two perfectly ordinary *values* of a keyword
+     * or tags column — a user-tagged field, a technical category. A facet
+     * holding both was then read as statistics, `$running['min']` was not
+     * there, and the facet came back as an undefined-key warning and nonsense.
+     * Two segments were needed for it, which is why nothing noticed.
+     *
+     * The answer was never in the shape. The frozen schema knows the field's
+     * type, index-wide and before any segment is read, so the caller works it
+     * out once per facet and says so.
+     *
      * @param array<string|int, mixed>|null $running
      * @param array<string|int, mixed>      $addition
+     * @param bool $statistical whether this facet counts numbers rather than
+     *        terms, from the schema's type for its field
      * @return array<string|int, mixed>
      */
-    private function mergeFacet(?array $running, array $addition): array
+    private function mergeFacet(?array $running, array $addition, bool $statistical): array
     {
         if ($running === null) {
             return $addition;
         }
 
-        if (array_key_exists('count', $running) && array_key_exists('sum', $running)) {
+        if ($statistical) {
             $count = $running['count'] + $addition['count'];
             $sum   = $running['sum'] + $addition['sum'];
 
@@ -1125,6 +1166,21 @@ final class IndexDirectory
         }
 
         return Facet::rank($running);
+    }
+
+    /**
+     * Whether a facet on this field counts numbers rather than terms.
+     *
+     * The same question SegmentIndex::facet() answers from the column it
+     * opened — a NumericColumn gives statistics, a keyword or tag column gives
+     * term counts — asked of the schema instead, because the schema is frozen
+     * and index-wide where a column belongs to one segment. A field the schema
+     * does not name has no column either, and the segment raises that; here it
+     * is simply not statistical.
+     */
+    private function isStatistical(string $field): bool
+    {
+        return in_array($this->schema()->typeOf($field), ['number', 'boolean'], true);
     }
 
     private function smaller(?float $a, ?float $b): ?float
