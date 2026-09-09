@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Ols\PhpFts\Tests\Index;
 
 use Ols\PhpFts\Exception\StorageException;
+use Ols\PhpFts\Facet;
+use Ols\PhpFts\Filter;
 use Ols\PhpFts\Index\IndexDirectory;
 use Ols\PhpFts\Schema;
 use Ols\PhpFts\SearchEngine;
@@ -252,6 +254,107 @@ class SeamsTest extends TestCase
         $this->assertSame(100.0, $stats['max']);
         $this->assertSame(160.0, $stats['sum']);
         $this->assertSame(40.0, $stats['avg'], 'the mean of two means is not the mean');
+    }
+
+    // -------------------------------------------------------------------------
+    // What the caller was not told
+    // -------------------------------------------------------------------------
+
+    #[Test]
+    public function a_word_the_index_does_not_know_is_reported_rather_than_only_dropped(): void
+    {
+        // Dropping it is right — keeping it would empty the result instead of
+        // narrowing it, since no document could ever satisfy it. Not saying so
+        // is what left the shopper holding the whole knife aisle with no hint
+        // that half their query had been ignored.
+        $engine = SearchEngine::open($this->dir);
+
+        $engine->putMany([
+            'a' => ['title' => 'Couteau de cuisine'],
+            'b' => ['title' => 'Couteau pliant'],
+        ]);
+
+        $result = $engine->search('couteau zwilling');
+
+        $this->assertSame(['zwilling'], $result->unknown);
+        $this->assertGreaterThan(0, $result->total, 'the known word still searches');
+    }
+
+    #[Test]
+    public function a_query_the_index_understands_reports_nothing(): void
+    {
+        $engine = SearchEngine::open($this->dir);
+        $engine->put('a', ['title' => 'Couteau de cuisine']);
+
+        // The common case, so `if ($result->unknown)` has to be the whole test.
+        $this->assertSame([], $engine->search('couteau')->unknown);
+        $this->assertSame([], $engine->search('')->unknown, 'an empty query asked for nothing');
+    }
+
+    #[Test]
+    public function a_query_of_nothing_but_unknown_words_names_all_of_them(): void
+    {
+        $engine = SearchEngine::open($this->dir);
+        $engine->put('a', ['title' => 'Couteau de cuisine']);
+
+        $result = $engine->search('zwilling wusthof');
+
+        $this->assertSame(0, $result->total);
+        $this->assertSame(['zwilling', 'wusthof'], $result->unknown);
+    }
+
+    // -------------------------------------------------------------------------
+    // The filter compiled more than once
+    // -------------------------------------------------------------------------
+
+    #[Test]
+    public function disjunctive_facets_still_count_what_they_did_before_the_leaf_cache(): void
+    {
+        // A compiled leaf is now held for the life of the segment, because a
+        // facet excluding its own clause asks for the same clause again. The
+        // property to keep is simply that nothing changed: a cached Bitset must
+        // not have been mutated by whoever borrowed it first.
+        $engine = SearchEngine::open($this->dir);
+
+        $engine->putMany([
+            'a' => ['title' => 'Couteau', 'brand' => 'Opinel', 'price' => 20.0],
+            'b' => ['title' => 'Couteau', 'brand' => 'Opinel', 'price' => 30.0],
+            'c' => ['title' => 'Couteau', 'brand' => 'Laguiole', 'price' => 40.0],
+            'd' => ['title' => 'Couteau', 'brand' => 'Laguiole', 'price' => 50.0],
+        ]);
+
+        $filters = Filter::all(
+            Filter::eq('brand', 'Opinel')->tag('brand'),
+            Filter::gte('price', 30.0),
+        );
+
+        $result = $engine->search(
+            'couteau',
+            filters: $filters,
+            facets: [
+                'brand' => Facet::terms(exclude: 'brand'),
+                'price' => Facet::stats(),
+            ],
+        );
+
+        // The narrowed set: Opinel and price >= 30 is `b` alone.
+        $this->assertSame(1, $result->total);
+
+        // The brand facet ignores its own clause, so it counts over price >= 30
+        // — one Opinel and two Laguiole.
+        $this->assertSame(2, $result->facets['brand']['Laguiole'] ?? null);
+        $this->assertSame(1, $result->facets['brand']['Opinel'] ?? null);
+
+        // And the stats facet, which keeps every clause, sees only `b`.
+        $this->assertSame(1, $result->facets['price']['count']);
+        $this->assertSame(30.0, $result->facets['price']['min']);
+
+        // Asking twice in one request must give the same answer, which is the
+        // thing a shared mutable Bitset would break.
+        $again = $engine->search('couteau', filters: $filters, facets: ['brand' => Facet::terms(exclude: 'brand')]);
+
+        $this->assertSame(1, $again->total);
+        $this->assertSame(2, $again->facets['brand']['Laguiole'] ?? null);
     }
 
     // -------------------------------------------------------------------------

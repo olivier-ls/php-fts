@@ -150,6 +150,43 @@ final class SegmentIndex
     /** @var array<string, NumericColumn|KeywordColumn|TagColumn|null> */
     private array $columns = [];
 
+    /**
+     * Compiled filter leaves, by clause.
+     *
+     * ── Why one search compiles the same clause several times ─────────────
+     *
+     * Disjunctive facets. A facet that excludes its own clause has to be
+     * counted over the candidates narrowed by *every other* clause, so the
+     * multi-segment layer asks this segment to narrow the same candidates once
+     * per excluded tag — and `narrow()` calls `compile()`, which rebuilds every
+     * leaf of the tree from its column.
+     *
+     * That is not cheap the way set arithmetic over bits is cheap.
+     * `KeywordColumn::equals()`, `TagColumn::contains()` and
+     * `NumericColumn::range()` each **scan the whole column**, in chunks of
+     * 4 096 documents. A search with four clauses and three excluding facets
+     * therefore scanned every column four times over — and the variants differ
+     * only in the one clause they lifted out, so three of those four passes
+     * rebuilt bit-for-bit identical sets. On the reference catalogue that is
+     * around 720 000 PHP loop iterations of which three quarters were
+     * redundant.
+     *
+     * ── Why holding them for the object's life is safe ────────────────────
+     *
+     * A segment file never changes, and neither does a compiled leaf. Every
+     * combining operation — `and`, `or`, `not`, `andNot` — returns a *new*
+     * Bitset rather than mutating; the only mutator is `set()`, and nothing
+     * calls it on a set that came back from here. So a cached leaf cannot be
+     * altered by whoever borrowed it, and a SegmentIndex lives for one request.
+     *
+     * Keyed on the clause rather than on the tree, because that is the part
+     * two variants share. `exists` and `missing` carry no value and encode as
+     * themselves.
+     *
+     * @var array<string, Bitset>
+     */
+    private array $leaves = [];
+
     private function __construct(SegmentReader $segment, ?Analyzer $analyzer)
     {
         $this->segment  = $segment;
@@ -300,7 +337,7 @@ final class SegmentIndex
             );
         }
 
-        return new SearchResult($hits, $total, $counted, (hrtime(true) - $started) / 1e6);
+        return new SearchResult($hits, $total, $counted, (hrtime(true) - $started) / 1e6, $plan->unknown);
     }
 
     /**
@@ -1465,10 +1502,15 @@ final class SegmentIndex
         $at    = $index * $this->frequencyWidth;
         $found = [];
 
+        // Hoisted out of the loop, where it was re-measuring a string that
+        // cannot change. This function runs once per posting, so it is the
+        // innermost thing in the whole search.
+        $length = strlen($records);
+
         for ($bit = 0; $bit < $this->frequencyWidth; $bit++) {
             $position = $at + $bit;
 
-            if ($position >= strlen($records)) {
+            if ($position >= $length) {
                 break;
             }
 
@@ -1598,7 +1640,22 @@ final class SegmentIndex
             };
         }
 
-        $field  = (string) $filter->field;
+        $field = (string) $filter->field;
+
+        // The same clause, met again in another facet's view of the tree. See
+        // $leaves: this is a whole column scan, and the variants of one search
+        // differ by a single clause.
+        //
+        // json_encode rather than serialize: the value is a scalar or a list of
+        // them — Filter::normalise() and the schema's coercion have already had
+        // it — so this is short, and it distinguishes 1 from '1' and from true,
+        // which the compilation below deliberately does too.
+        $key = $filter->operator . '|' . $field . '|' . json_encode($filter->value);
+
+        if (isset($this->leaves[$key])) {
+            return $this->leaves[$key];
+        }
+
         $column = $this->column($field);
 
         if ($column === null) {
@@ -1632,14 +1689,14 @@ final class SegmentIndex
         }
 
         if ($column instanceof KeywordColumn) {
-            return $this->compileKeyword($column, $filter->operator, $field, $value);
+            return $this->leaves[$key] = $this->compileKeyword($column, $filter->operator, $field, $value);
         }
 
         if ($column instanceof TagColumn) {
-            return $this->compileTags($column, $filter->operator, $field, $value);
+            return $this->leaves[$key] = $this->compileTags($column, $filter->operator, $field, $value);
         }
 
-        return $this->compileNumeric($column, $filter->operator, $field, $value);
+        return $this->leaves[$key] = $this->compileNumeric($column, $filter->operator, $field, $value);
     }
 
     /**

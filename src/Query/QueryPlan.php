@@ -82,6 +82,25 @@ final class QueryPlan
         public readonly float $required,
         public readonly bool $matchesEverything,
 
+        /**
+         * Typed words the index holds nothing resembling, in the order they
+         * were typed.
+         *
+         * Dropped from the plan — see build(), which explains why keeping them
+         * would empty the result rather than narrow it — and reported rather
+         * than merely discarded, because the caller is the only one who can
+         * say something useful about them.
+         *
+         * `couteau zwilling`, in a catalogue with no Zwilling, becomes
+         * `couteau`: the shopper is handed the whole knife aisle with no hint
+         * that half of what they asked for was ignored. Every search engine
+         * answers that with "no results for *zwilling*, showing results for
+         * *couteau*", and the plan knew it all along.
+         *
+         * @var string[]
+         */
+        public readonly array $unknown = [],
+
         /** Every slot's IDF added up: what a document holding all of them gathers. */
         public readonly float $total = 0.0,
 
@@ -101,7 +120,14 @@ final class QueryPlan
     /** The same plan, walked the slow and obvious way. @internal for tests */
     public function withoutDriver(): self
     {
-        return new self($this->slots, $this->required, $this->matchesEverything, $this->total, false);
+        return new self(
+            $this->slots,
+            $this->required,
+            $this->matchesEverything,
+            $this->unknown,
+            $this->total,
+            false,
+        );
     }
 
     /** Every document, because nothing was asked for. */
@@ -144,6 +170,7 @@ final class QueryPlan
         }
 
         $slots    = [];
+        $unknown  = [];
         $totalIdf = 0.0;
 
         foreach (array_values($typed) as $position => $word) {
@@ -155,6 +182,9 @@ final class QueryPlan
             // keystroke, a brand nobody stocks — would empty the whole result
             // instead of narrowing it. Dropped, it simply asks for nothing.
             if ($found === []) {
+                // Kept on the plan so the caller can say so. See $unknown.
+                $unknown[] = $word;
+
                 continue;
             }
 
@@ -214,10 +244,13 @@ final class QueryPlan
         }
 
         if ($slots === []) {
-            return new self([], 0.0, false);
+            // Every word was unknown: the query asked for something the index
+            // cannot answer at all, and naming all of them is the only useful
+            // thing left to return.
+            return new self([], 0.0, false, $unknown);
         }
 
-        return new self($slots, $minimumShouldMatch * $totalIdf, false, $totalIdf);
+        return new self($slots, $minimumShouldMatch * $totalIdf, false, $unknown, $totalIdf);
     }
 
     /** True when the query asked for something the index cannot answer at all. */

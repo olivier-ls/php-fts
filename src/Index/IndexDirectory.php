@@ -735,7 +735,7 @@ final class IndexDirectory
             $hits[] = new Hit($this->segments[$position]->keyAt($ordinal), $score, $document, $highlights);
         }
 
-        return new SearchResult($hits, $total, $merged, (hrtime(true) - $started) / 1e6);
+        return new SearchResult($hits, $total, $merged, (hrtime(true) - $started) / 1e6, $plan->unknown);
     }
 
     /**
