@@ -99,6 +99,49 @@ The plan knew all along; now it says so, and an application can answer the way
 every search engine answers: no results for *zwilling*, showing results for
 *couteau*.
 
+### Performance — the scoring loop, measured
+
+The worst case is **1.9× faster**. `acier lame longueur` — three words each in
+about 46% of 45 000 products, which is what someone shopping for a knife types —
+went from around 736 ms to around 288, and four such words from 992 to 389.
+Light queries gained too: one word 29 → 17 ms, two words 66 → 42. Relevance is
+byte-for-byte identical across all twelve benchmark queries.
+
+Nothing architectural changed. The engine already refuses to iterate in PHP what
+it can do in C by the block — `Bitset` uses the string operators, `count_chars`
+and `strspn` for exactly that reason — and the scoring loop was the one place
+that had not followed the rule. It now does:
+
+- **Frequencies by the block.** 328 000 `ord()` calls for 65 689 postings on a
+  five-field schema cost 87.7 ms; the same bytes through one `unpack('C*')` per
+  128-posting block cost 18.2. `PostingsCursor::blocks()` hands over the block
+  it had already decoded rather than serving it one element at a time, which
+  also removes `current()`/`next()` — two method calls a posting, 34.6 ms across
+  the same list. A posting is not enough work to pay for two method calls.
+- **No allocation per posting.** `frequenciesAt()` built an array for every
+  posting, `fieldedFrequency()` walked it back with a `??` on four separate
+  maps, and `fieldLengthsOf()` returned another. Three allocations and a dozen
+  hash lookups to multiply five numbers. The arithmetic is `Scorer`'s, in
+  `Scorer`'s order, so the two agree to the last bit rather than to a tolerance.
+- **A candidate rejected in one `strncmp`.** `accepts()` already required the
+  first two characters to be right; testing that on bytes before decoding turns
+  2 289 dynamic programmes into about a hundred for `couteau`. No measurable
+  effect on a warm search, and the entry says so.
+
+**On the numbers.** Every figure above is A/B'd in a single session against the
+other version of the code, because this development machine drifts by up to 27%
+between sessions — the *unchanged* code measured 578 ms one hour and 736 the
+next, which made a real 16% gain look like a 20% regression. A stored baseline
+is not a comparison.
+
+**What is still over budget.** A results page is budgeted at 150 ms. A cold
+request — a fresh process, `open()` included, which is the only shape that
+describes a real request — answers `couteau` in **67.5 ms** at 45 000 products.
+One and two word searches are 17 and 42 ms warm. Three or more words that are
+*all* very common remain over: around 288 ms for three, 389 for four. That case
+is amplified by a mono-thematic catalogue, where half the products really do
+mention `acier` and `lame`, and it is stated rather than hidden.
+
 ### Performance — work that was being done more than once
 
 Measured claims are marked as such; the rest are reductions in work whose
