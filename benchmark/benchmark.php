@@ -48,7 +48,7 @@ use Ols\PhpFts\Sort;
 //  Options
 // ---------------------------------------------------------------------------
 
-$options = getopt('', ['phase::', 'corpus::', 'scales::', 'batch::', 'runs::', 'dir::']);
+$options = getopt('', ['phase::', 'corpus::', 'scales::', 'batch::', 'runs::', 'dir::', 'query::']);
 
 $phase  = $options['phase']  ?? 'all';
 $corpus = $options['corpus'] ?? __DIR__ . '/corpus.jsonl';
@@ -684,7 +684,12 @@ if ($phase === 'cold' || $phase === 'all') {
     $scale = max($scales);
     $dir   = $root . '/bench_search';
 
-    heading('A cold request — ' . number_format($scale) . ' products, fresh PHP process each time');
+    heading(sprintf(
+        'A cold request — %s products, %d fresh PHP processes, query %s',
+        number_format($scale),
+        $runs,
+        var_export((string) ($options['query'] ?? 'couteau'), true),
+    ));
 
     if (!is_dir($dir) || size_mb($dir) === 0.0) {
         printf("building the index first…\n");
@@ -702,13 +707,31 @@ if ($phase === 'cold' || $phase === 'all') {
     // worker with Xdebug switched on, and reported 318 ms for a search that
     // takes 68. Four and a half times, on the one phase whose whole purpose is
     // to say what a visitor waits for. The flag has to be handed on explicitly.
-    for ($i = 0; $i < min($runs, 20); $i++) {
+    // ── The cap is gone, and the reason is what shared hosting looks like ──
+    //
+    // This ran `min($runs, 20)` samples however many were asked for, which was
+    // reasonable when the phase only had to show an order of magnitude: each
+    // sample is a whole interpreter, so twenty is already a second or two.
+    //
+    // It stops being reasonable the moment the number is taken on a real
+    // mutualisé, which is the only place it means anything. Measured on one:
+    // p50 75.3 ms, min 70.1, **p95 164.0 — and max also 164.0**. With twenty
+    // samples the p95 *is* the second-worst one, so a single blip from a noisy
+    // neighbour becomes the reported tail and there is no way to tell it from
+    // a real one. The tail is exactly what a shared host is asked about, and
+    // it was the one thing the sample size could not describe.
+    //
+    // A hundred samples of a 75 ms request is under eight seconds. There is no
+    // reason to ration them.
+    $cold  = (string) ($options['query'] ?? 'couteau');
+
+    for ($i = 0; $i < $runs; $i++) {
         $output = shell_exec(sprintf(
             '%s -d xdebug.mode=off %s %s %s 2>&1',
             escapeshellarg(PHP_BINARY),
             escapeshellarg($worker),
             escapeshellarg($dir),
-            escapeshellarg('couteau'),
+            escapeshellarg($cold),
         ));
 
         $measured = json_decode((string) $output, true);
