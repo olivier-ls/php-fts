@@ -406,6 +406,7 @@ class FilterTest extends TestCase
         ];
     }
 
+    /** @param array<mixed> $data */
     #[Test]
     #[DataProvider('malformed')]
     public function malformed_input_is_refused_and_says_why(array $data, string $expected): void

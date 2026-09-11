@@ -30,9 +30,7 @@ class HighlighterTest extends TestCase
         $this->highlighter = new Highlighter($this->analyzer);
     }
 
-    /**
-     * @param string[] $fields
-     */
+    /** @return string|array{text: string, spans: array<int, array{0: int, 1: int}>}|null */
     private function mark(string $query, string $text, ?Highlight $options = null): string|array|null
     {
         return $this->highlighter->field(

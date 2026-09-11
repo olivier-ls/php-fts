@@ -118,11 +118,10 @@ class AnalyzerTest extends TestCase
         // padding used to hide this, because `#21#` is not numeric.
         $terms = $this->analyzer->analyze('opinel 12 2024');
 
+        // assertSame is what enforces the type here: it compares strictly, so a
+        // term that came back as int 12 rather than string '12' fails on this
+        // line. A separate assertIsString() loop only restated it.
         $this->assertSame(['opinel', '12', '2024'], $terms);
-
-        foreach ($terms as $term) {
-            $this->assertIsString($term);
-        }
     }
 
     #[Test]

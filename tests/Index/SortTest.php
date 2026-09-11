@@ -73,7 +73,8 @@ class SortTest extends TestCase
     }
 
     /**
-     * @param Sort|array<mixed> $sort
+     * @param Sort|array<mixed>   $sort
+     * @param Filter|array<mixed> $filters
      * @return string[]
      */
     private function order(

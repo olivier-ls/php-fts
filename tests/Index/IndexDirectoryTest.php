@@ -504,8 +504,9 @@ class IndexDirectoryTest extends TestCase
     {
         $result = $this->catalogue()->search('brown');
 
+        // Hit::$score is a readonly float, so only its sign is worth asserting;
+        // the type is the constructor's job and PHP's.
         foreach ($result as $hit) {
-            $this->assertIsFloat($hit->score);
             $this->assertGreaterThan(0.0, $hit->score);
         }
     }

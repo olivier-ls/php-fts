@@ -44,6 +44,7 @@ class Utf8Test extends TestCase
         ];
     }
 
+    /** @param list<int> $expected */
     #[Test]
     #[DataProvider('validSequences')]
     public function it_decodes_valid_sequences(string $text, array $expected): void
@@ -51,6 +52,7 @@ class Utf8Test extends TestCase
         $this->assertSame($expected, Utf8::codepoints($text));
     }
 
+    /** @param list<int> $codepoints */
     #[Test]
     #[DataProvider('validSequences')]
     public function encoding_reverses_decoding(string $text, array $codepoints): void

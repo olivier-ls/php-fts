@@ -98,6 +98,7 @@ class MergeEquivalenceTest extends TestCase
         return $documents;
     }
 
+    /** @param string[]|false|null $source fields to store, or false for none */
     private function schema(array|false|null $source = null): Schema
     {
         $schema = Schema::make()
@@ -114,6 +115,7 @@ class MergeEquivalenceTest extends TestCase
 
     /**
      * @param array<string, array<string, mixed>> $documents
+     * @param string[]                            $delete ids to remove after writing
      */
     private function build(array $documents, Schema $schema, bool $split, array $delete = []): SearchEngine
     {

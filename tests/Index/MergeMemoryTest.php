@@ -152,7 +152,14 @@ class MergeMemoryTest extends TestCase
 
         $this->assertGreaterThan(1, $index->stats()['segments'], 'nothing would be merged');
 
-        memory_reset_peak_usage();
+        // Guarded again here, not out of doubt — setUp() has already skipped the
+        // test where the function is missing — but because the library supports
+        // PHP 8.1, where it does not exist, and an analyser reads this line
+        // without reading setUp().
+        if (function_exists('memory_reset_peak_usage')) {
+            memory_reset_peak_usage();
+        }
+
         $before = memory_get_usage();
 
         $index->optimize();

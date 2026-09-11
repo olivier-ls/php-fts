@@ -137,11 +137,12 @@ class LockManagerTest extends TestCase
         $lm = new LockManager($this->tempDir);
 
         $lm->acquire();
-        $lm->release();
 
-        // Le répertoire doit exister pendant le lock — on le vérifie juste après
-        // acquire en inspectant (release l'a supprimé, donc on teste le cycle)
-        $this->assertTrue(true); // Si on est ici, pas d'exception
+        // Checked while the lock is held: release() removes the directory, so
+        // asserting after the full cycle could only ever assert its absence.
+        $this->assertDirectoryExists($this->lockDir());
+
+        $lm->release();
     }
 
     #[Test]
@@ -451,11 +452,11 @@ class LockManagerTest extends TestCase
     {
         $lm = new LockManager($this->tempDir);
 
-        // Jamais acquis — ne doit pas exploser
+        // Never acquired — must not blow up, and must not leave a lock behind.
         $lm->release();
         $lm->release();
 
-        $this->assertTrue(true);
+        $this->assertDirectoryDoesNotExist($this->lockDir());
     }
 
     #[Test]
@@ -465,10 +466,10 @@ class LockManagerTest extends TestCase
         $lm->acquire();
         $lm->release();
 
-        // Second appel — ne doit pas exploser
+        // Second call — must not blow up, and must leave the lock released.
         $lm->release();
 
-        $this->assertTrue(true);
+        $this->assertDirectoryDoesNotExist($this->lockDir());
     }
 
     #[Test]
