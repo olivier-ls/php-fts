@@ -59,7 +59,14 @@ foreach (['intl', 'mbstring'] as $extension) {
     }
 }
 
-/** Beyond this there is nothing but unassigned planes and private use. */
+/**
+ * Beyond this there is nothing but unassigned planes and private use.
+ *
+ * Keep it at or below 0x10FFFF. Every code point up to here is handed to
+ * mb_chr(), which returns false outside Unicode's range, and the two calls
+ * below rely on this bound rather than testing each result — a test that, at
+ * this value, can never fire.
+ */
 const LAST_CODEPOINT = 0x2FA1F;
 
 /**
@@ -128,11 +135,13 @@ function applySupplement(string $text): string
 {
     $result = '';
 
+    // PREG_SPLIT_NO_EMPTY guarantees a non-empty piece, and on an empty string
+    // mb_ord() throws rather than returning false — so there is no false here
+    // to test for, and testing for one suggested a failure mode that does not
+    // exist.
     foreach (preg_split('//u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $piece) {
         $codepoint = mb_ord($piece, 'UTF-8');
-        $result   .= ($codepoint !== false && isset(SUPPLEMENT[$codepoint]))
-            ? SUPPLEMENT[$codepoint]
-            : $piece;
+        $result   .= SUPPLEMENT[$codepoint] ?? $piece;
     }
 
     return $result;
@@ -143,11 +152,9 @@ function applySupplement(string $text): string
  */
 function foldOf(int $codepoint, Script $script): ?string
 {
+    // Encodable by construction: the only caller walks 0x80..LAST_CODEPOINT
+    // with the surrogates skipped, and the constant is range-checked above.
     $character = mb_chr($codepoint, 'UTF-8');
-
-    if ($character === false) {
-        return null;
-    }
 
     // Case *folding*, not lowercasing. They are different operations and only
     // one of them is defined for caseless matching: lowercasing is for display
@@ -210,11 +217,8 @@ for ($codepoint = 0x80; $codepoint <= LAST_CODEPOINT; $codepoint++) {
         continue;
     }
 
+    // Encodable: surrogates are skipped above and the constant is range-checked.
     $character = mb_chr($codepoint, 'UTF-8');
-
-    if ($character === false) {
-        continue;
-    }
 
     // Punctuation and symbols inside a script's own block. Unassigned code
     // points are deliberately not listed: they cannot appear in real text, and
