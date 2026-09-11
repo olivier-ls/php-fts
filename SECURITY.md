@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.1.x   | ✅ security fixes |
+| 2.0.x   | ✅ fixes and security fixes |
+| 1.1.x   | ✅ security fixes only |
 | < 1.1   | ❌ |
 
 ## Reporting a vulnerability
@@ -48,7 +49,9 @@ application chooses. That shapes what counts as a vulnerability:
 - Put the index directory **outside the web root**. It contains your documents
   in readable form.
 - Never build filters directly from unvalidated request input. Cast and
-  whitelist values first — `1.1.4` makes comparisons strict, which stops type
-  confusion, but it cannot know which fields a given user may filter on.
-- Highlights are HTML-escaped by default. Only pass `'escape' => false` if you
-  escape downstream yourself.
+  whitelist values first. Comparisons are strict, which stops type confusion,
+  and `Filter::fromArray()` validates the structure before any of it reaches the
+  code that reads files — but neither can know which fields a given user may
+  filter on.
+- Highlights are HTML-escaped by default. Only call `Highlight::fields([...])
+  ->raw()` if you escape downstream yourself.
