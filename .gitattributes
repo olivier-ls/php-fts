@@ -1,0 +1,33 @@
+# What ends up in the Composer package.
+#
+# `export-ignore` removes a path from `git archive`, which is what Packagist
+# builds the dist archive from — so it is what `composer require` downloads by
+# default. It does not touch the repository: the files below stay in git, stay
+# on GitHub, and `composer install --prefer-source` still clones all of them.
+# In particular the demo gif keeps rendering in the README on GitHub, because
+# that page is served from the repository and not from the archive.
+#
+# The point is weight, and the weight is one file. The whole tree is 4.7 MB,
+# `src/` is 619 KB of it, and `docs/demo.gif` alone is 3.4 MB. A library whose
+# selling point is that it runs on shared hosting should not make every install
+# pay for a screen recording.
+#
+# `demo/` is deliberately **not** excluded. It costs 54 KB — less than a tenth
+# of `src/` — and it is self-contained: `seed.php` generates its own catalogue
+# and the only thing it reaches for is `../src/autoload.php`, which is in the
+# archive. Two commands from inside `vendor/ols/php-fts` and there is a working
+# search page to click on, which is worth a great deal more than 54 KB.
+#
+# Kept: src/, demo/, composer.json, LICENSE, and the three markdown files a
+# reader might want from inside vendor/.
+
+/tests/         export-ignore
+/docs/          export-ignore
+/benchmark/     export-ignore
+/tools/         export-ignore
+/.github/       export-ignore
+
+/phpunit.xml    export-ignore
+/phpstan.neon   export-ignore
+/.gitignore     export-ignore
+/.gitattributes export-ignore
