@@ -1,6 +1,7 @@
-> **v2.0 — on-disk format specification.** Implemented on the `2.x` branch,
-> except where a section says otherwise. Written before the code, and kept as
-> the record of what was decided and why.
+> **v2.0 — on-disk format specification.** Describes the format as it is
+> implemented, section names and byte layouts included. `SegmentFormat`,
+> `BlockDictionaryFormat` and `DocumentStore` carry the same layouts in their
+> class docblocks; if the two ever disagree, the code is right.
 
 # Segment format
 
@@ -24,27 +25,43 @@ One segment = one file, `seg_<id>.fts`.
 
 ```
 ┌─────────────────────────────────────────────────┐
-│ HEADER            32 B                          │
-│   "FTSG" | formatVersion u16 | flags u16        │
-│   segmentId u64  | docCount u32 | reserved      │
+│ HEADER            16 B                          │
+│   "FTSG" | formatVersion u16 | reserved         │
 ├─────────────────────────────────────────────────┤
-│ § postings       posting lists + skip lists     │
-│ § terms          term dictionary                │
+│ § postings       posting lists + skip tables    │
+│ § terms          term dictionary (words)        │
 │ § termgrams      n-grams of the vocabulary      │
 │ § fieldfreq      per-posting field frequencies  │
 │ § lengths        per-document field lengths     │
-│ § docvalues      columnar values                │
+│ § dv.<field>     one column per field           │
+│ § dv.<field>.values  its value dictionary       │
 │ § keys           user key → local ordinal       │
-│ § docstore       the documents themselves       │
+│ § keyfwd         local ordinal → user key       │
+│ § docs           the documents themselves       │
 │ § meta           schema, statistics             │
 ├─────────────────────────────────────────────────┤
-│ DIRECTORY        one (offset u64, length u64)   │
-│                  per section                    │
-│ TRAILER          32 B                           │
-│   dirOffset u64 | fileLength u64                │
-│   crc32 u32 | "GSTF"                            │
+│ DIRECTORY                                       │
+│   count u32                                     │
+│   per entry: nameLen u8 | name                  │
+│              offset u64 | length u64            │
+│              crc32 u32                          │
+│ TRAILER           32 B                          │
+│   "GSTF" | dirOffset u64 | dirCrc32 u32         │
+│   fileLength u64 | formatVersion u16 | pad      │
 └─────────────────────────────────────────────────┘
 ```
+
+**Sections are named, not positional.** The directory carries each name, so a
+section that a given schema does not need is simply absent — `§ termgrams` on a
+wholly continuous-script vocabulary, `§ dv.*` on a schema with nothing
+filterable, `§ docs` under `source(false)` — and a reader asks for a section by
+name rather than counting. It is also what makes a section additive: `§ keyfwd`
+was added to an already-working format, and a segment written before it still
+opens — see §6.
+
+**There is one section per doc-values field**, named `dv.` plus the field name,
+and keyword and tag columns add a second one suffixed `.values` for their value
+dictionary. So the count of sections in a segment depends on the schema.
 
 **The directory sits at the end**, because offsets are only known once the
 sections are written — a segment is produced in a single forward pass, never
@@ -67,6 +84,14 @@ happens — a truncated write. That check is what lets a reader reject a bad
 segment and fall back to `commit.N-1`, and therefore what makes
 `Durability::Fast` safe.
 
+**Integrity is layered, not global.** The trailer's checksum covers the
+directory alone, because the directory is the part a reader has to trust before
+it can navigate at all, and it is small. Every section then carries its own
+crc32 in its directory entry, so a section can be verified when it is read and
+never otherwise. A single whole-file checksum was the obvious alternative and is
+the wrong one: it makes every `open()` cost the size of the file, which is the
+one thing this format is built to avoid.
+
 ### Local ordinals
 
 Inside a segment, documents are numbered `0 … docCount-1` in write order. Every
@@ -80,84 +105,104 @@ ever depends on it.
 
 ## 2. § terms — the dictionary
 
-Replaces v1's direct-addressed 37³ table. This section is what unlocks Unicode.
+The terms are **words**, in every script that separates them, and n-grams of a
+run in the eight that do not. Keys are stored rather than computed from their
+characters, so there is no alphabet: this is the section that makes the format
+indifferent to writing system.
 
-Three levels:
+### The structure is generic — `BlockDictionaryReader`
 
-### Level 3 — front-coded term blocks
-
-Terms sorted by UTF-8 byte order (which equals codepoint order). Grouped into
-blocks of 64 terms. Inside a block, each term shares a prefix with the previous:
+`§ terms` is not a bespoke layout. It is a **sorted map from string key to
+opaque payload**, and the same structure serves `§ keys` and `§ termgrams`,
+which is why there is one reader and not three. The payload's meaning belongs to
+whoever wrote it; the dictionary only stores bytes and finds them by key.
 
 ```
-per term:  sharedPrefixLen  varint
-           suffixLen        varint
-           suffix           bytes
-           docFreq          varint
-           postingsDelta    varint   (offset relative to previous term's)
-           postingsLen      varint
+HEADER          24 B
+  "BDIC" | version u8 | reserved u8 | blockSize u16
+  entryCount u32 | blockCount u32 | indexOffset u32 | indexLength u32
+
+BLOCKS          groups of blockSize entries, front-coded
+  per entry: sharedLen varint | suffixLen varint | suffix
+             payloadLen varint | payload
+
+BLOCK INDEX     one entry per block
+  offsets:  u32 × blockCount    ← fixed width, so it is binary-searchable
+  entries:  firstKeyLen varint | firstKey
+            blockOffset varint | blockLength varint
 ```
 
-The first term of a block has `sharedPrefixLen = 0`, so **any block decodes on
-its own** without reading the ones before it.
+`blockSize` defaults to **64** entries. The first entry of a block has
+`sharedLen = 0`, so **any block decodes on its own** without reading the ones
+before it.
 
-Front-coding is unusually effective here because terms are n-grams and therefore
-heavily clustered: `cha`, `chb`, `che`, `chi` share two bytes out of three.
+For `§ terms` the payload is a term's `docFreq` and the location of its posting
+list; for `§ keys` it is a local ordinal; for `§ termgrams` it is a front-coded
+list of the vocabulary terms holding that gram.
 
-### Level 2 — block index
+### Front coding
 
-One entry per block: the block's first term in full, plus its file offset.
+Sorted keys share long prefixes, so each records only how many leading bytes it
+borrows from its predecessor:
 
-For 100 000 terms → 1 563 entries → **≈ 25 KB**.
+```
+couteau     →  shared 0, suffix "couteau"
+couteaux    →  shared 7, suffix "x"
+couvercle   →  shared 3, suffix "vercle"
+```
 
-Stored as two flat byte strings (a concatenation of terms + an offsets array),
-read once per request and binary-searched **in place with `substr`/`unpack`**.
-No PHP array of structs is ever built. This is the direct lesson from v1, where
-50 653 associative arrays were allocated on every search.
+How much this earns depends on what the keys are. An inflected vocabulary
+compresses well, because a word and its plural are neighbours. It earns almost
+nothing in `§ termgrams`, for a reason worth knowing: the terms sharing an
+*interior* gram are not alphabetical neighbours — see §4b.
 
-### Level 1 — lookup
+### Lookup
 
 ```
 binary search the in-memory block index   →  block offset
-1 × fseek + fread (~4 KB)                 →  the block
-linear scan over ≤ 64 front-coded terms   →  the entry
+1 × fseek + fread                         →  the block
+linear scan over ≤ 64 front-coded entries →  the entry
 ```
 
-**One seek per term.** A 12-n-gram query over 3 segments is ~36 seeks worst
-case, but n-grams from one query cluster into the same blocks, so 5–8 distinct
-reads is typical. Lookups are sorted by offset and adjacent blocks coalesced
-into a single read.
+The block index is read once per segment and held as flat byte strings — a
+concatenation of first keys plus a fixed-width offsets array — and binary-searched
+**in place with `substr`/`unpack`**. No PHP array of structs is ever built, which
+is the point: a structure loaded at `open()` is paid by every search, so it has
+to be bytes rather than objects.
+
+**One seek per key.** Lookups within a request are sorted by offset and adjacent
+blocks coalesced into a single read, so a multi-word query costs fewer reads than
+it has terms whenever its terms are alphabetically close.
 
 ---
 
-## 3. § postings — and the fix for the recall bug
+## 3. § postings — and why there is no candidate cap
 
 A posting list is the sorted local ordinals of the documents containing a term.
 
 ```
 [ blockCount varint ]
-[ skip table ]                     ← only when count > 1024
+[ skip table ]                     ← whenever there is more than one block
    per block: firstOrdinal varint, byteOffset varint
 [ block 0 ] [ block 1 ] …          ← 128 postings each
    first ordinal absolute, then deltas, all varint
 ```
 
+A skip table is written as soon as the list spans more than one block — so from
+129 postings up. Below that it would cost more than the scan it saves.
+
 Sorted ordinals delta-encoded as varints average ~1.5 bytes instead of a fixed
 4, and there is no capacity padding because the list is written exactly once.
-Expected: **~7.5 MB instead of ~27 MB** on the 20 000-document benchmark.
 
-### Why this kills `maxCandidates`
+### The skip table is what removes the candidate cap
 
-v1 caps each posting list at 5 000 entries and reads them **from the end** —
-silently restricting results to recently-inserted documents once a term exceeds
-that (§1.5 of the audit). It is the worst bug in the engine precisely because it
-never raises an error.
-
-With a skip table, intersection **skips instead of truncating**: advance to the
-block whose `firstOrdinal` ≥ the target, decode only that block. Cost becomes
-proportional to the size of the *result*, not the size of the list.
-
-`maxCandidates` disappears from the public API entirely.
+Intersection **skips instead of truncating**: advance to the block whose
+`firstOrdinal` ≥ the target, decode only that block. Cost becomes proportional
+to the size of the *result*, not the size of the list, so there is no ceiling on
+how long a posting list may be and no parameter asking the caller to guess one.
+`PostingsCursor::advance()` is the operation, and
+`tests/Index/DrivenWalkTest.php` asserts that a walk driven through the skip
+table and a walk that reads everything agree hit for hit and score for score.
 
 ---
 
@@ -174,8 +219,8 @@ documents that reach scoring. Interleaving would have wrecked both compression
 and skipping.
 
 This is what allows BM25F to weight a title match above a description match
-**without re-analysing the document at query time** — v1's single largest CPU
-cost (§4.1: `extractTrigrams()` is re-run on every returned document).
+**without re-analysing the document at query time**, which is the alternative
+and costs a re-tokenisation of every document that reaches scoring.
 
 ### Why a frequency and not a bit
 
@@ -265,10 +310,12 @@ difference between a section and a crash.
 
 ---
 
-## 5. § docvalues — what makes totals and facets possible
+## 5. `§ dv.<field>` — what makes totals and facets possible
 
 One column per field declared filterable / sortable / facetable, addressed by
-local ordinal.
+local ordinal. Each is its own section, named `dv.` plus the field name; a
+`keyword` or `tags` column adds a second one suffixed `.values` holding its
+value dictionary. There is no single `docvalues` section.
 
 | Schema type | Encoding |
 |---|---|
@@ -282,8 +329,9 @@ Dictionary encoding is the key move. Counting a `brand` facet becomes:
 *allocate an int array of size cardinality, walk the matching ordinals,
 increment.* No string comparison, no `json_decode`, no document read.
 
-In v1, faceting requires decoding the JSON of every matching document — which is
-why the demo runs six `limit: 2000` queries to fake it.
+The alternative — reading the matching documents and tallying their values — is
+what makes faceting expensive elsewhere: it turns a sidebar into a decode of
+every match rather than a walk over one column.
 
 ### `tags`: a range instead of a slot
 
@@ -359,34 +407,33 @@ keys       the keys, back to back
 
 A lookup is one `unpack` and a read of exactly the bytes wanted. The offset
 table is read once per segment and the keys are not, which is the same trade
-`§ docstore` makes: a page wants twenty of the payloads and none of the rest.
+`§ docs` makes: a page wants twenty of the payloads and none of the rest.
 
-**This section exists because this document was wrong about it.** It used to
-say the reverse direction was free, because each docstore record stored its own
-key. It does not, and has not since `DocumentStoreWriter` was introduced —
-there the id only names a document that fails to encode. Believing the document
-rather than the code left `SegmentIndex::keyOf()` inverting the whole key
-dictionary on the first hit of every request: **60.7 ms and 5.4 MB on a
-45 000-document segment, to serve the twenty ids of one page**, growing with
-the index rather than with the page. It was the largest single cost in a cold
-request, larger than matching the query.
+**This section is written down rather than derived**, because deriving it is
+expensive in a way that scales with the index instead of the page. Without it,
+`SegmentIndex::keyOf()` inverts the whole key dictionary on the first hit of a
+request: **60.7 ms and 5.4 MB on a 45 000-document segment, to serve the twenty
+ids of one page**, which was the largest single cost in a cold request — larger
+than matching the query. Reading it instead costs 0.13 ms and 0.17 MB, for
+402 928 bytes on a 70.2 MB segment, or **0.56%**.
 
-Measured after: 0.13 ms and 0.17 MB, for 402 928 bytes on a 70.2 MB segment —
-**0.56%**.
+Storing the key in the document record instead would not work: `source(false)`
+writes no record at all, so the key would go with it. The ordinal→key direction
+needs a home that survives storing nothing.
 
-Storing the key in the docstore record, as this document claimed, would not
-have worked either: `source(false)` writes no record at all, so the key would
-have gone with it.
-
-A segment written before this section falls back to inverting the dictionary,
-so old indexes keep answering — slowly enough that reindexing is worth it.
+A segment written before this section existed falls back to inverting the
+dictionary, so such an index keeps answering — slowly enough that reindexing is
+worth it.
 
 ---
 
-## 7. § docstore
+## 7. § docs — the document store
+
+The section is named `docs`; `DocumentStore` is the class that reads it.
 
 ```
-"DSTO" | version u8 | reserved 3 | count u32
+HEADER    12 B
+  "DSTO" | version u8 | reserved 3 | count u32
 offsets   u32 × (count + 1)     ← where each document starts, and the end
 payloads  the documents, back to back
 ```
@@ -438,8 +485,29 @@ never disagree with what was indexed. See `Query\Highlighter`.
 
 ## 8. § meta
 
-Schema (field names, types, flags), document count, per-field length sums for
-BM25F normalisation, `k1` / `b`, creation timestamp, segment id.
+One JSON object, six keys:
+
+| Key | What it is |
+|---|---|
+| `documentCount` | documents in this segment |
+| `termLengthSum` | total term count across the segment, for average length |
+| `schema` | the schema as `Schema::toArray()` writes it — names, types, flags, per-field boost and `b` |
+| `searchableFields` | the indexed fields, **in the bit order** `§ fieldfreq` uses |
+| `fieldLengthSums` | per-field length totals, for BM25F normalisation |
+| `frequencyWidth` | bytes per posting in `§ fieldfreq` — one per searchable field, never below 1 |
+
+`searchableFields` is the one to be careful with: it is not decoration but the
+column order of `§ fieldfreq`, so a reader that reorders it reads another
+field's frequencies. It is also why a segment cannot be reinterpreted under a
+wider schema without permuting every posting — see the note on schema evolution
+in the CHANGELOG.
+
+**What is deliberately not here.** `k1` is not stored: it is a scoring
+parameter, not a property of the bytes, and lives as a `Scorer` default (1.2) so
+that changing it does not invalidate an index. `b` *is* stored, per field, inside
+`schema`, because it is declared per field. There is no creation timestamp and no
+segment id in `§ meta` — the id is in the filename, and nothing reads a
+timestamp.
 
 ---
 
@@ -622,22 +690,23 @@ deletion; the failure is benign and retried on the next commit.
 
 ## 13. Open questions
 
-1. **Block size, now that there are two dictionaries.** 64 entries suits
-   `§ terms`, where a lookup wants the smallest possible decode. `§ termgrams`
-   has different traffic: a handful of gram lookups per query word, each
-   returning a payload read whole. And a smaller block for `§ terms` is what
-   would make the ordinal encoding of `§ termgrams` viable — §4b. Worth
-   measuring as one question rather than inheriting a number chosen for the
-   other structure.
+1. **Block size — 64 for the dictionaries, 128 for the postings.** Both are
+   inherited rather than measured, and the dictionary number now serves three
+   structures with different traffic. `§ terms` and `§ keys` want the smallest
+   possible decode per lookup. `§ termgrams` reads a whole payload per gram, and
+   a smaller block is what would make its ordinal encoding viable at all — see
+   §4b, where 64 is why a candidate costs 18 decoded entries to obtain one. So
+   the two numbers are one question, to be measured on network storage rather
+   than guessed, and `BlockDictionaryFormat` already carries `blockSize` in its
+   header so a change is readable by older code.
 
-   *Settled since this document was written: `§ fieldfreq`'s size is no longer
-   an open question — one byte per field per posting buys the term frequency
-   BM25 was missing, and it is written whatever the schema.*
-2. **Docstore compression** when `ext-zlib` is available — portability trade-off.
-3. **Ordinal width.** `u32` caps a segment at 4 G documents; that is plenty, but
-   it fixes the maximum merge output. Confirm.
-4. **Block size** (64 terms / 128 postings) — to be tuned against a real
-   benchmark on network storage, not guessed.
+2. **The u32 ceilings, and where they actually bind.** Ordinals themselves are
+   varints and unbounded, so the limits come from the fixed-width tables:
+   `§ docs` stores `count` and its offsets as u32, and `§ keyfwd` its offsets as
+   u32. That caps a segment at 4 G documents — not a constraint anyone will
+   meet — but also its **document payloads at 4 GiB total**, and its keys the
+   same, which a segment of very large stored documents could reach before the
+   document count matters. Nothing checks it today.
 
 ---
 
@@ -653,13 +722,6 @@ Agreed and scheduled, but not now:
   ends, empty buckets, whether bounds are inclusive at the top — can be settled
   against something real.
 
-- **Multi-valued columns, and the filters that need them** — `contains`,
-  `containsAny`, `containsAll` over a `tags` field. A tags field is analysed
-  today, so it is searchable; filtering on one needs a column holding several
-  ordinals per document, which the fixed-width layout does not do. Left out of
-  `Filter` entirely rather than added as factories that throw: an operator you
-  can write and cannot run is worse than one that is not there.
-
 - **Segment inspector** — a command that opens a `.fts` and prints its
   structure: sections and sizes, block counts, cost per key, a sample of keys
   with their payloads, checksum status. Makes the format legible instead of
@@ -667,32 +729,23 @@ Agreed and scheduled, but not now:
   premature while there is only a dictionary to look at.
 
 - **Differential test against 1.x** — same corpus, same queries, both engines,
-  compare results. This is the answer to "is it *correct*", which no benchmark
-  can give. Only meaningful once v2 can search.
+  results compared. It is the one check no benchmark can stand in for, and the
+  results are *expected* to differ: the threshold now applies per word instead
+  of to a flat bag of trigrams, so the interesting output is the list of
+  documents the two disagree about and a judgement on each.
 
-- **Parallel-corpus search-quality tests.** The same twenty or so documents
-  translated into French, English, Japanese, Chinese, Russian and Arabic, each
-  with a handful of queries and an expected target document. For every language
-  and query, record three numbers: was the target found, at what rank, and how
-  many results came back in total.
+- **Ranking judged outside French.** `tests/MultilingualRecallTest.php` covers
+  the *reachability* half of this: the same twenty-product catalogue in Latin,
+  Cyrillic, Japanese and Thai, asserting that a query reaches what it names and
+  leaves the rest, that filters and facets work whatever the script, and that
+  highlighting lands on the right bytes in a multi-byte one.
 
-  Two things make this worth doing carefully. The bar is *comparable*, not
-  *identical* — the analyzer is deliberately different per script, so expecting
-  matching output would be expecting two different algorithms to agree. And
-  measuring recall alone is not enough: bigrams are noisier than trigrams by
-  construction, so a language could find the right document and bury it under
-  fifty wrong ones while the test still passed. A workable threshold: the
-  target in the top three, and no language returning an order of magnitude more
-  results than the others.
-
-  This is the closest substitute available for native-speaker review, which
-  remains the thing that would catch a linguistic misunderstanding no test
-  written from the same misunderstanding ever will.
-
-- **Benchmarks on real shared hosting.** Olivier has access to production
-  shared-hosting servers, so the final comparison runs there as well as on
-  Windows, against 1.x on the same machine. One methodological correction is
-  required: `benchmark/benchmark.php` in 1.x opens the engine *outside* the
-  timed loop, so its published medians measure a search over an already-loaded
-  index. Nothing survives between HTTP requests on shared hosting, so the v2
-  benchmark must time **open + search** together.
+  What it deliberately does not assert is **order**, and that is what remains
+  deferred. Whether the best result comes first is a judgement, not a lexical
+  fact, and measuring recall alone would not catch the failure that matters
+  here: n-grams are noisier than words by construction, so a language could
+  find the right document and bury it under fifty wrong ones with every
+  assertion still green. A workable bar would be the target in the top three,
+  and no language returning an order of magnitude more results than the others
+  — but it needs a native reader per language, which is the thing no test
+  written from the same misunderstanding can replace.
