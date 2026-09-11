@@ -8,64 +8,84 @@
 A self-contained full-text search engine written in pure PHP.  
 No extensions. No external services. No dependencies. Just files.
 
+```php
+$engine = SearchEngine::open('./search_data');
+
+$engine->search('lether shoe');   // finds "leather shoe", one edit away
+$engine->search('革靴');           // and finds it in Japanese too
+```
+
 ---
 
 ## Who is this for?
 
-php-fts is designed for projects where deploying a dedicated search service is not an option — shared hosting, small VPS, or simply situations where you want to keep your stack minimal and portable.
+php-fts is for projects where running a dedicated search service is not an
+option — shared hosting, a small VPS, or simply a stack you would rather keep
+portable and boring.
 
-If you have access to Elasticsearch, Meilisearch or Typesense and the infrastructure to run them, use those. They are more powerful and built for high-traffic, large-scale workloads.
+If you have Elasticsearch, Meilisearch or Typesense and the infrastructure to
+run them, **use those**. They are more powerful and built for scale this is not
+built for.
 
-If you don't — or if you'd rather not — php-fts gives you solid full-text search with ranked results, filters, and tolerant matching, with nothing to install and nothing to configure beyond a directory path.
+If you don't — or would rather not — php-fts gives you ranked full-text search,
+typo tolerance, filters, facets and sorting, with nothing to install and nothing
+to configure beyond a directory path.
 
-**It is a good fit if:**
-- You are on shared hosting (OVH, Infomaniak, o2switch, etc.)
-- You want zero infrastructure overhead
-- Your dataset is in the range of hundreds to tens of thousands of documents
-- You index offline or on a schedule, and serve searches at runtime
+**A good fit if:**
+- You are on shared hosting (OVH, Infomaniak, o2switch, …)
+- You want zero infrastructure and zero moving parts
+- Your dataset runs from hundreds to a few tens of thousands of documents
+- You index offline or on a schedule, and serve searches at request time
 
-**It is not a good fit if:**
-- You need real-time indexing under heavy concurrent write load
+**Not a good fit if:**
+- You need real-time indexing under heavy concurrent writes
 - Your dataset is in the millions of documents
 - You need geo search or multi-tenant isolation
 
 ---
 
-## Features
+## What you get
 
-- **Full-text search** with trigram indexing — tolerant to typos and partial matches
-- **BM25 + IDF scoring** — industry-standard relevance ranking (same algorithm as Lucene / Elasticsearch)
-- **Per-document score** — exposed on every result, usable for custom sorting or a relevance threshold
-- **Field boosting** — weight some fields (e.g. title) more than others
-- **Filters** — exact match, comparisons, range, `in`, `not in`, `contains` on array fields
-- **Combined AND / OR filtering** — flexible condition logic
-- **Bulk insertion** — up to 12× faster than individual inserts, single lock for the whole batch, crash-safe
-- **Soft delete** with tombstones — fast deletes, cleaned up on compaction
-- **Atomic update** — soft delete + re-insert in a single lock
-- **Compaction** — rebuilds index files cleanly, removes deleted documents and fragmentation
-- **Fragmentation monitoring** — know when to compact
-- **Binary file storage** — portable across servers, no rebuild needed
-- **O(1) trigram lookup** — fixed-size index (~810 KB), no tree traversal
-- **No extensions required** — runs on any standard PHP 8.1+ installation
+- **Typo tolerance you can reason about** — a query word matches an indexed word
+  within an edit budget (nothing under three characters, one edit up to five,
+  two beyond: the same rule as Elasticsearch's `fuzziness: AUTO`). Edits are
+  counted in **characters, not bytes**, so one mistyped Cyrillic or Arabic
+  letter costs one edit, not two.
+- **Prefix completion** — `leath` finds `leatherman`, `inox` finds `inoxydable`.
+- **BM25F ranking** — per-field term frequencies and per-field length
+  normalisation, with a boost per field.
+- **Filters** — equality, comparisons, ranges, sets, presence, and `and` / `or` /
+  `not` nested as deep as you like.
+- **Facets** — counts and statistics computed over the whole match set, not over
+  the page, and without reading a single document.
+- **Sorting and pagination** — by relevance or by any numeric field, with a real
+  total.
+- **Highlighting** — HTML-escaped by default, with excerpts.
+- **Twenty-six writing systems** — see below.
+- **Crash-safe writes** — an index is a set of immutable segments published by
+  an atomic commit; an interrupted write leaves debris, never damage.
+- **No extensions required** — plain PHP 8.1+. `ext-posix` is used if present,
+  to spot locks left by a dead process, and the library works without it.
 
 ---
 
 ## Requirements
 
 - PHP **8.1** or higher
-- Read/write access to a directory for index files
+- Read/write access to a directory for the index
 
 ---
 
 ## Installation
 
-**Via Composer**
+**With Composer**
 
 ```bash
 composer require ols/php-fts
 ```
 
-**Manual install** — if you are not using Composer, copy the `src/` directory into your project and include the autoloader:
+**Without Composer** — copy `src/` into your project and require the bundled
+autoloader:
 
 ```php
 require '/path/to/php-fts/src/autoload.php';
@@ -78,177 +98,477 @@ require '/path/to/php-fts/src/autoload.php';
 ```php
 use Ols\PhpFts\SearchEngine;
 
-$engine = new SearchEngine();
-$engine->open('./search_data');
+$engine = SearchEngine::open('./search_data');
 
-// Insert a document
-$docId = $engine->insert([
-    'title'       => 'Brown leather shoe',
-    'description' => 'Elegant city shoe in soft leather',
-    'price'       => 129.90,
-    'stock'       => 42,
-    'active'      => true,
-    'category'    => 'Shoes',
-    'brand'       => 'Adidas',
-    'tags'        => ['summer', 'luxury', 'city'],
+// The array key is the document id. Anything else in the array is a field.
+$engine->putMany([
+    'p1' => [
+        'title'       => 'Brown leather shoe',
+        'description' => 'Elegant city shoe in soft leather.',
+        'brand'       => 'Adidas',
+        'category'    => 'Shoes',
+        'price'       => 129.90,
+        'stock'       => 42,
+        'active'      => true,
+        'tags'        => ['city', 'leather'],
+    ],
+    'p2' => [
+        'title'       => 'Black leather boot',
+        'description' => 'Winter boot, full grain leather.',
+        'brand'       => 'Adidas',
+        'category'    => 'Boots',
+        'price'       => 189.00,
+        'stock'       => 7,
+        'active'      => true,
+        'tags'        => ['winter', 'leather'],
+    ],
+    // …
 ]);
 
-// Search
-$results = $engine->search('leather shoe', limit: 20, boosts: [
-    'title'       => 3.0,
-    'description' => 1.0,
-]);
+$result = $engine->search('leather shoe', limit: 20);
 
-foreach ($results as $result) {
-    echo $result['document']['title'] . ' — score: ' . $result['score'] . PHP_EOL;
+echo "$result->total matches in {$result->took} ms\n";
+
+foreach ($result as $hit) {
+    echo "{$hit->id}  {$hit->score}  {$hit->document['title']}\n";
 }
-
-$engine->close();
 ```
+
+```
+3 matches in 4.07 ms
+p1  1.1985  Brown leather shoe
+p5  0.9139  Leather care kit
+p2  0.8293  Black leather boot
+```
+
+There is no `close()`. A request opens the directory, reads what it needs, and
+ends — which is also why it costs about 9 ms on shared hosting to open a
+45 000-document index.
 
 ---
 
-## API Reference
+## Languages and writing systems
 
-### Open / Close
+Most pure-PHP search libraries are ASCII with an accent-stripping table bolted
+on. This one classifies every code point it indexes from Unicode's own data, and
+the tables are **generated** by a committed script rather than written by hand.
+
+**Twenty-six writing systems are indexed.** The split below is not cosmetic — it
+decides whether a word gets typo tolerance:
+
+**Eighteen that separate their words** — indexed as words, and reachable by the
+edit budget and by prefix completion:
+
+> Latin · Cyrillic · Greek · Arabic · Hebrew · Devanagari · Bengali · Gurmukhi ·
+> Gujarati · Oriya · Tamil · Telugu · Kannada · Malayalam · Sinhala · Armenian ·
+> Georgian · Ethiopic
+
+**Eight written continuously** — indexed as n-grams of a run, because finding
+word boundaries there needs a segmentation dictionary this library does not
+ship. They are never expanded: an n-gram one edit away is a different word, not
+a misspelling.
+
+> Han · Hiragana · Katakana · Hangul · Thai · Lao · Khmer · Myanmar
 
 ```php
-$engine->open('./search_data');   // Creates directory and files if they don't exist
-$engine->close();                 // Flushes and closes all file handles
-```
-
-### Insert
-
-```php
-// Single document — returns the doc ID (binary offset, keep it if you need update/delete)
-$docId = $engine->insert([
-    'title'  => 'My product',
-    'price'  => 49.90,
-    'active' => true,
-    'tags'   => ['new', 'sale'],
+$engine->putMany([
+    'ja' => ['title' => '革靴 ブラウン',       'description' => '柔らかい革の街歩き用の靴。'],
+    'ru' => ['title' => 'Кожаные ботинки',     'description' => 'Зимние ботинки из натуральной кожи.'],
+    'ar' => ['title' => 'حذاء جلدي بني',       'description' => 'حذاء جلدي ناعم للمدينة.'],
+    'th' => ['title' => 'รองเท้าหนังสีน้ำตาล', 'description' => 'รองเท้าหนังนุ่มสำหรับเดินในเมือง'],
 ]);
 
-// Bulk insert — one lock for the entire batch, significantly faster
-$docIds = $engine->insertBulk([
-    ['title' => 'Product A', 'price' => 29.90],
-    ['title' => 'Product B', 'price' => 59.90],
-]);
+$engine->search('革靴');     // finds ja
+$engine->search('ботинки');  // finds ru
+$engine->search('ботинок');  // a different form of it — also finds ru
+$engine->search('جلدي');     // finds ar
+$engine->search('รองเท้า');  // finds th
 ```
 
-Supported field types: `string`, `int`, `float`, `bool`, `array` of strings.
+A few consequences worth knowing up front. Arabic harakat, Hebrew niqqud and the
+tatweel are dropped, so `كِتَاب`, `كــتاب` and `كتاب` are one term. Digits fold
+across systems: `٢٠٢٤` and `2024` are the same term, and so are `۱۲۳`, `१२३` and
+`123`. Case folding is done from Unicode's mappings, so Vietnamese `VIỆT` meets
+`việt` — which a hand-written table got wrong for 916 code points.
 
-### Search
+Anything outside the twenty-six is treated as a separator: a language written in
+it finds **nothing** rather than finding it badly. See [Limits](#limits).
+
+---
+
+## Usage
+
+### Documents
 
 ```php
-$results = $engine->search(
-    query:         'leather shoe',
-    limit:         20,
-    maxCandidates: 5000,
-    boosts:        ['title' => 3.0, 'description' => 1.0],
-    filters:       [...],
-);
+$engine->put('p1', ['title' => 'Brown leather shoe', 'price' => 129.90]);
+$id = $engine->insert(['title' => 'Suede boot']);   // generates an id, returns it
+
+$engine->putMany($documents);   // one commit for the whole batch
+$engine->get('p1');             // the document, or null
+$engine->has('p1');             // bool
+$engine->delete('p1');          // bool
+$engine->count();               // live documents
+$engine->clear();               // wipe the index
 ```
 
-Each result:
+`putMany()` takes anything iterable and holds **one segment's worth** of data
+rather than the whole input, so an import is bounded in memory whatever its
+size. Yield straight out of a cursor:
 
 ```php
-[
-    'docId'    => 942222,   // document identifier
-    'score'    => 43.74,    // BM25+IDF relevance score, 0-100
-    'document' => [...],    // original document array
-]
+$engine->putMany((function () use ($pdo) {
+    foreach ($pdo->query('SELECT * FROM products') as $row) {
+        yield $row['sku'] => $row;
+    }
+})());
 ```
 
-The `score` field is available on every result and can be used for custom sorting or relevance thresholds.
+The whole 45 000-product reference catalogue imports in one call at **64 MB
+peak** against a 128 MB limit. The batch is transactional: it lands whole or
+leaves the index exactly as it was.
 
-`search()` returns at most `limit` results and does not report how many documents matched in total. There is no `offset` parameter in 1.x, so it cannot paginate.
+### What a search returns
+
+```php
+$result = $engine->search('leather shoe', limit: 20, offset: 0);
+
+$result->total;     // matches across the whole index, not the page size
+$result->took;      // milliseconds
+$result->hits;      // Hit[]
+$result->facets;    // see below
+$result->unknown;   // typed words the index holds nothing resembling
+$result->isEmpty();
+
+foreach ($result as $hit) {
+    $hit->id;
+    $hit->score;
+    $hit->document;     // the stored document
+    $hit->highlights;   // field => marked text, when highlighting was asked for
+}
+```
+
+`$result->unknown` is what lets you answer the way every search engine answers:
+
+```php
+$result = $engine->search('leather zwilling');
+
+$result->unknown;   // ['zwilling']
+$result->total;     // 3 — the results for 'leather'
+```
+
+Unknown words have to be dropped: keeping one would put its weight in the
+threshold with no way to ever satisfy it, so a single stray keystroke would
+empty the result instead of narrowing it. Dropping them *silently* is how
+`couteau zwilling` quietly becomes `couteau`. Now you can say so.
 
 ### Filters
 
 ```php
-$results = $engine->search('shoe', filters: [
+use Ols\PhpFts\Filter;
 
-    'and' => [
-        ['field' => 'active',   'op' => '=',        'value' => true],
-        ['field' => 'stock',    'op' => '>',         'value' => 0],
-        ['field' => 'price',    'op' => '<=',        'value' => 300],
-        ['field' => 'category', 'op' => 'in',        'value' => ['Shoes', 'Sport']],
-        ['field' => 'tags',     'op' => 'contains',  'value' => 'luxury'],
-    ],
+$result = $engine->search('', filters: Filter::all(
+    Filter::eq('active', true),
+    Filter::gt('stock', 0),
+    Filter::between('price', 50, 200),   // either end may be null
+    Filter::any(
+        Filter::eq('brand', 'Adidas'),
+        Filter::eq('brand', 'Puma'),
+    ),
+));
+```
 
-    'or' => [
-        ['field' => 'brand', 'op' => '=', 'value' => 'Adidas'],
-        ['field' => 'brand', 'op' => '=', 'value' => 'Puma'],
-    ],
+An empty query means *everything*, so the same call doubles as a category page
+with no search box.
 
+| Factory | Meaning |
+|---|---|
+| `eq` `neq` | equal / not equal |
+| `gt` `gte` `lt` `lte` | comparisons |
+| `between($field, $min, $max)` | range, either end optional |
+| `in` `notIn` | value in a set — on a tags field, *holds any of* |
+| `exists` `missing` | the field is present / absent |
+| `all` `any` `not` | and / or / negation, nested freely |
+
+Two distinctions that surprise people once:
+
+```php
+Filter::neq('brand', 'Nike');             // has a brand, and it is not Nike
+Filter::not(Filter::eq('brand', 'Nike')); // is not a Nike — including no brand at all
+```
+
+`neq` follows SQL, where a comparison against a missing value is not true. `not`
+is plain set complement. Both are useful, so both exist. On a catalogue of three
+products where one has no brand at all, the first returns one document and the
+second returns two.
+
+Filtering needs a column, so a field must be **in the schema** to be filtered,
+faceted or sorted on — including by `exists` and `missing`. A field the schema
+does not know is stored and returned, but never filtered, and asking throws
+rather than quietly matching nothing.
+
+Filters also accept an array, validated as a structure before any of it reaches
+the code that reads files — so `Filter::fromArray()` is safe to point at request
+input:
+
+```php
+Filter::fromArray(['op' => 'and', 'filters' => [
+    ['op' => '=', 'field' => 'active', 'value' => true],
+    ['op' => '>', 'field' => 'stock',  'value' => 0],
+]]);
+```
+
+A malformed filter throws `FilterException` rather than silently matching
+nothing. Comparisons are strict: `'42'` does not match `42`. Cast request input
+before you build a filter.
+
+### Facets
+
+```php
+use Ols\PhpFts\Facet;
+
+$result = $engine->search('', filters: Filter::all(
+    Filter::eq('active', true),
+    Filter::in('brand', ['Adidas'])->tag('brand'),
+), facets: [
+    'brand'    => Facet::terms(exclude: 'brand'),
+    'category' => Facet::terms(),
+    'price'    => Facet::stats(),
 ]);
 ```
 
-Both `and` and `or` are optional, but at least one must be present.  
-When both are used: all AND conditions must pass **and** at least one OR condition must pass.  
-A document missing a filtered field is excluded from results.
+```php
+$result->total;   // 2
 
-| Operator                  | Supported types          |
-|---------------------------|--------------------------|
-| `=` `!=`                  | int, float, bool, string |
-| `>` `>=` `<` `<=`         | int, float               |
-| `in` `not in`             | int, float, string       |
-| `contains` `not contains` | array (document field)   |
+$result->facets;
+// [
+//   'brand'    => ['Adidas' => 2, 'Puma' => 2],
+//   'category' => ['Boots' => 1, 'Shoes' => 1],
+//   'price'    => ['count' => 2, 'min' => 129.9, 'max' => 189.0,
+//                  'sum' => 318.9, 'avg' => 159.45],
+// ]
+```
 
-**Comparisons are strict** (since 1.1.4). A value only matches a field of the same
-type — the sole exception being `int` versus `float`, which compare numerically
-because JSON round trips move values between the two. So `'42'` does not match
-`42`, and `true` does not match `'Adidas'`.
+Look closely at that output, because it is the whole point of `tag` and
+`exclude`. The search is filtered to Adidas, so `total` is 2 and the **category**
+facet counts only those two. But the **brand** facet still reports `Puma => 2`,
+because it excludes its own clause — which is what makes a multi-select brand
+list stay usable after the shopper has clicked Adidas. Without it, picking a
+brand makes every other brand vanish and the filter becomes a one-way door.
 
-Cast request input to the right type before building a filter. A malformed filter
-(missing key, unknown operator, `in` without an array) throws
-`Ols\PhpFts\Exception\FilterException` rather than silently failing to match.
+`Facet::stats()` is the same idea for a slider: excluding `price` gives you the
+real bounds of the catalogue rather than of the range already chosen.
+
+Counting happens over bitsets and columns, so **no document is read** to compute
+a facet.
+
+### Sorting and pagination
+
+```php
+use Ols\PhpFts\Sort;
+
+$engine->search('', sort: Sort::asc('price'));
+$engine->search('', sort: [Sort::desc('stock'), Sort::asc('price')]);
+$engine->search('shoe');   // relevance, the default
+
+$page2 = $engine->search('shoe', limit: 20, offset: 20);
+```
+
+Sorting is the engine's job rather than yours, because it is the same problem as
+pagination: twenty hits sorted by price are the twenty best-*scoring* documents
+arranged by price, not the twenty cheapest matches.
 
 ### Highlighting
 
 ```php
-$results = $engine->search('leather', highlight: true, highlightOptions: [
-    'tags'    => ['<mark>', '</mark>'],  // wrapping tags
-    'excerpt' => true,                   // window around the first match
-    'window'  => 5,                      // words of context on each side
-    'escape'  => true,                   // HTML-escape field text (default)
-]);
+use Ols\PhpFts\Highlight;
 
-echo $results[0]['highlights']['title'];  // Brown <mark>leather</mark> shoe
+$result = $engine->search('leather', highlight: Highlight::fields(['title', 'description']));
+
+$result->hits[0]->highlights;
+// ['title'       => 'Brown <mark>leather</mark> shoe',
+//  'description' => 'Elegant city shoe in soft <mark>leather</mark>.']
 ```
-
-Only string fields containing a match appear in `highlights`.
-
-**Field text is HTML-escaped before the tags are inserted** (since 1.1.4), so the
-result is safe to render even when the indexed content came from users. Pass
-`'escape' => false` only if you escape downstream yourself.
-
-Matching is trigram-based: a word is highlighted when any of its trigrams appears
-in the query, which is deliberately generous and will sometimes wrap a word that
-merely shares a fragment with the search term.
-
-### Update / Delete
 
 ```php
-// Atomic update: soft delete + re-insert in a single lock
-$newDocId = $engine->update($docId, ['title' => 'Updated title', 'price' => 149.90]);
-
-// Soft delete (cleaned up on compaction)
-$engine->delete($docId);
+Highlight::fields(['description'])->tags('<b>', '</b>')->excerpt(3);
+// ['description' => '…grain <b>leather</b>.']
 ```
+
+Field text is **HTML-escaped before the tags are inserted**, so the result is
+safe to render even when the indexed content came from users. `->raw()` turns
+that off; only use it if you escape downstream.
+
+If you would rather render the marks yourself, `->positions()` hands you the
+plain text and the spans instead:
+
+```php
+Highlight::fields(['title'])->positions();
+// ['title' => ['text' => 'Black leather boot', 'spans' => [[6, 13]]]]
+```
+
+### Schema
+
+You do not need one. Types are inferred from the first batch you commit:
+
+```php
+$engine = SearchEngine::open('./search_data');   // schema inferred
+```
+
+A string field becomes an exact `keyword` — searchable, filterable **and**
+facetable — when its values are short (≤ 64 bytes) and it has few distinct ones;
+otherwise it stays `text`, searchable only. So on a real catalogue you get this,
+which is what you would have declared anyway:
+
+```
+title         text
+description   text
+brand         keyword
+category      keyword
+price         number
+```
+
+Declare one when you want boosts, or want to stop storing a field:
+
+```php
+use Ols\PhpFts\Schema;
+
+$schema = Schema::make()
+    ->text('title', boost: 3.0)
+    ->text('description')
+    ->keyword('brand')
+    ->tags('tags')
+    ->number('price')
+    ->number('stock')
+    ->boolean('active');
+
+$engine = SearchEngine::open('./search_data', $schema);
+```
+
+Per-query boosts work too, and override the schema's:
+
+```php
+$engine->search('leather shoe', boosts: ['title' => 3.0, 'description' => 1.0]);
+```
+
+One thing to know about the inferred case: a field that first appears **after**
+the first commit is refused loudly rather than silently ignored. Declare a schema
+if your documents are not all the same shape.
 
 ### Maintenance
 
 ```php
-$count = $engine->count();               // Number of live documents
-$rate  = $engine->fragmentationRate();   // Fragmentation percentage (0 = clean, 100 = all deleted)
+$engine->stats();
+// ['documents' => 4, 'deleted' => 1, 'segments' => 1, 'generation' => 2,
+//  'bytes' => 6238, 'fields' => [...], 'needsOptimize' => true, 'schema' => [...]]
 
-if ($engine->fragmentationRate() > 20) {
-    $engine->compact();                  // Rebuild index files, remove deleted documents
+if ($engine->stats()['needsOptimize']) {
+    $engine->optimize();   // merge segments, drop deleted documents
 }
-
-$engine->reset();                        // Wipe all index files and start fresh
 ```
+
+Writes are merged on their own as you go; `optimize()` is the manual version,
+for a cron job after a big import. Deletes are logical until a merge removes
+them, which is why `deleted` and `needsOptimize` exist.
+
+### Errors
+
+Everything thrown descends from `Ols\PhpFts\Exception\FtsException`, so one
+`catch` covers the library:
+
+```php
+use Ols\PhpFts\Exception\FtsException;
+
+try {
+    $result = $engine->search($query, filters: Filter::fromArray($input));
+} catch (FtsException $e) {
+    // FilterException, SortException, HighlightException, StorageException,
+    // CorruptSegmentException, LockException, FieldTypeException, …
+}
+```
+
+---
+
+## Performance
+
+The number that matters is a **cold** one: nothing survives between requests on
+shared hosting, so every visitor pays for opening the index as well as for the
+search. These figures include both.
+
+Measured on an **OVH mutualisé** (`cluster105`, PHP 8.3), 45 000 products, 100
+fresh interpreters, on `acier lame longueur` — three words each present in about
+46% of the catalogue, which is the hardest shape this design has:
+
+| step | p50 | p95 | min | max |
+|---|---|---|---|---|
+| `open()` the index | 8.7 ms | 13.3 | 7.7 | 21.8 |
+| one search | 118.6 ms | 156.0 | 110.8 | 179.6 |
+| **both** | **127.4 ms** | **165.7** | 118.5 | 201.4 |
+
+So the typical request lands inside a 150 ms budget and the tail runs about 10%
+over it, on the worst query. A one- or two-word search — what most people
+actually type — is a fraction of that. Both halves of the pair are given here
+rather than the flattering one.
+
+`open()` costs **8.7 ms**, which is *faster* than on the development machine: an
+index that is only files, with no daemon to reach and no connection to open,
+opens as quickly on a shared host as anywhere.
+
+For the shape of it across queries, cold, on a development machine at the same
+45 000 products:
+
+| query | matches | cold total |
+|---|---|---|
+| `steel` | 1 412 | 23 ms |
+| `stel` (a typo) | 1 379 | 25 ms |
+| `steel cold` | 746 | 29 ms |
+| `couteau de cuisine inox` | 1 013 | 61 ms |
+| `couteau` (38% of the catalogue) | 18 750 | 70 ms |
+| `acier lame longueur` | 20 109 | 109 ms |
+
+At 45 000 products the index is about **70 MB** on disk and imports in one call
+at 64 MB of memory. The full method, and every figure that was wrong before it
+was right, is in the [CHANGELOG](CHANGELOG.md).
+
+---
+
+## Limits
+
+Stated plainly, because finding out later is worse:
+
+- **Ranking is tuned against French.** The analyzer is proven over every script,
+  and recall and precision are asserted end to end in Latin, Cyrillic, Japanese
+  and Thai. What has been judged in one language is **order** — whether the best
+  result comes first. That needs a native reader, not another test.
+- **Outside the twenty-six systems, nothing is indexed.** Tibetan, Mongolian and
+  Cherokee find nothing rather than finding it badly.
+- **A word inside a longer word is not found.** `shoe` does not match
+  `snowshoes`. Deliberate: the alternative returns *Victorinox* for `inox`.
+- **Languages that inflect by prefix are not bridged.** Arabic and Hebrew attach
+  the definite article at the front, so `مطبخ` is a suffix of `المطبخ` and
+  neither the edit budget nor prefix completion reaches it.
+- **Korean gets no typo tolerance.** Hangul is treated as continuous, like
+  Lucene's `CJKBigramFilter` does by default. Bigrams handle its agglutination
+  well, but Korean does put spaces between words, so this one is a trade rather
+  than a necessity.
+- **One writer at a time.** Writes take a directory lock. Reads never block.
+- **Not for millions of documents**, and not for real-time indexing under
+  concurrent writes.
+
+---
+
+## Upgrading from 1.x
+
+**Reindex from your own source data.** There is no migration path and there
+cannot be one: a 1.x index stores the character trigrams of documents, and this
+one stores words. Opening a version-1 index raises `UnsupportedFormatException`
+— deliberately outside the corruption hierarchy, so the rollback machinery
+cannot mistake an old index for a torn commit and quietly present it as empty.
+
+The API changed with it: `SearchEngine::open()` is static and there is no
+`close()`; `insertBulk()` is `putMany()`; results are `Hit` objects rather than
+arrays; filters are built with `Filter` rather than nested arrays; and
+`compact()` is `optimize()`.
 
 ---
 
@@ -256,17 +576,19 @@ $engine->reset();                        // Wipe all index files and start fresh
 
 ```
 search_data/
-  documents.bin    — serialized documents (JSON, binary format)
-  trigrams.bin     — fixed-size trigram index ~810 KB (37^3 entries, O(1) access)
-  postings.bin     — doc_id lists per trigram
-  tombstones.bin   — deleted doc_ids (cleared on compaction)
+  seg_59b50f835f95.fts   — an immutable segment: terms, postings, columns, documents
+  commit.26              — the manifest naming the segments that are live
 ```
 
-Files are fully portable — copy them between servers without rebuilding.
+A commit is one atomic rename of a manifest, so a reader sees either the old set
+of segments or the new one, never a mixture. A segment nobody's manifest names is
+invisible, which is what makes an interrupted write debris rather than damage.
 
-> **Keep this directory outside your web root.** `documents.bin` holds your
-> documents in readable form; if it is served over HTTP, your whole index is
-> downloadable. See [SECURITY.md](SECURITY.md).
+Files are portable — copy the directory between servers, no rebuild.
+
+> **Keep this directory outside your web root.** Documents are stored in it in
+> readable form; served over HTTP, your whole index is downloadable. See
+> [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -274,88 +596,24 @@ Files are fully portable — copy them between servers without rebuilding.
 
 - **Put the index directory outside the web root.** The library cannot enforce it.
 - **Never build filters straight from request input.** Cast and whitelist first.
-  Strict comparisons stop type confusion, but they cannot know which fields a
-  given user is allowed to filter on.
+  Strict comparisons stop type confusion; they cannot know which fields a given
+  user is allowed to filter on.
 - **Highlights are HTML-escaped by default.** Only disable it if you escape later.
-- Index files are opened without following symbolic links, so a link pre-placed
-  in a shared directory cannot redirect a write.
+- Index files are opened without following symbolic links, and the open
+  descriptor is checked against the path, so a link pre-placed in a shared
+  directory cannot redirect a write.
 
 Reporting a vulnerability: see [SECURITY.md](SECURITY.md).
 
 ---
 
-## Scoring
-
-Relevance is computed using **BM25 + IDF**:
-
-- **BM25** — document length normalization, so a long description does not outrank a precise title. Parameters: k1 = 1.5, b = 0.75 (standard Lucene defaults).
-  Note: trigrams are deduplicated per document, so the term frequency is always 1 and the `k1` saturation term has no effect in practice. This is a known limitation of the 1.x scoring model.
-- **IDF** — a trigram present in every document contributes little; a rare trigram contributes a lot.
-- The final score is normalized between 0 and 100.
-
----
-
-## Benchmark
-
-Benchmarks were run on two environments:
-
-- **Windows 11** — local machine, NVMe SSD, PHP 8.3
-- **Linux (OVH shared hosting)** — standard shared plan, PHP 8.3
-
-### Insertion
-
-| Volume  | insert() Win | insert() Linux | insertBulk() Win | insertBulk() Linux | Gain Win | Gain Linux |
-|---------|-------------|----------------|------------------|--------------------|----------|------------|
-| 1 000   | 3.23 s      | 8.58 s         | 274 ms           | 167 ms             | 11.8×    | 51.3×      |
-| 5 000   | 17.43 s     | 38.94 s        | 1.35 s           | 952 ms             | 12.9×    | 40.9×      |
-| 10 000  | 35.72 s     | 66.15 s        | 2.97 s           | 1.62 s             | 12×      | 40.8×      |
-| 20 000  | 72.87 s     | 129.09 s       | 5.78 s           | 3.44 s             | 12.6×    | 37.5×      |
-
-> Always prefer `insertBulk()` over `insert()` in production: it acquires a single lock
-> for the entire batch and is consistently faster — up to **12×** on local NVMe,
-> up to **51×** on shared Linux hosting. Both are designed for offline or scheduled
-> use; keep them out of critical request paths on high-traffic setups.
-
-### Index size
-
-| Volume  | Index size |
-|---------|------------|
-| 1 000   | 2.32 MB    |
-| 5 000   | 8.14 MB    |
-| 10 000  | 18.97 MB   |
-| 20 000  | 36.58 MB   |
-
-### Search
-
-| Volume  | Median Win | Median Linux | P95 Win  | P95 Linux | P99 Win   | P99 Linux |
-|---------|-----------|--------------|----------|-----------|-----------|-----------|
-| 1 000   | 3.51 ms   | 2.06 ms      | 8.21 ms  | 4.41 ms   | 8.66 ms   | 6.64 ms   |
-| 5 000   | 4.52 ms   | 2.99 ms      | 22.79 ms | 8.7 ms    | 23.62 ms  | 16.89 ms  |
-| 10 000  | 5.92 ms   | 4.02 ms      | 41.89 ms | 15.23 ms  | 44.37 ms  | 33.67 ms  |
-| 20 000  | 7.62 ms   | 4.76 ms      | 62.88 ms | 19.76 ms  | 106.67 ms | 21.39 ms  |
-
-> 200 queries, 10 distinct queries in rotation (including typos and out-of-corpus queries).  
-> Measured with `hrtime()`.
-
-### Compaction
-
-| Volume  | Windows  | Linux    |
-|---------|----------|----------|
-| 1 000   | 571.6 ms | 449.3 ms |
-| 5 000   | 1.25 s   | 897.9 ms |
-| 10 000  | 2.12 s   | 1.63 s   |
-| 20 000  | 4.03 s   | 2.68 s   |
-
-> Compaction rewrites the index from scratch — it is an occasional maintenance operation, not a request-time concern.  
-> Run it when `fragmentationRate()` exceeds your threshold (e.g. 20%).
-
----
-
 ## Example application
 
-The gif below shows one possible use of php-fts — a product search interface with filters and ranked results, built on top of a fake shoe catalogue.
-
-It is just an illustration. php-fts is an engine, not an interface. You can use it to power a product search, a documentation search, an admin filter, a CLI tool, or anything else that needs full-text matching over a set of documents.
+The gif below shows one use of php-fts — a product search with facets, filters
+and ranked results, over a fake shoe catalogue. It is an illustration: php-fts is
+an engine, not an interface. Use it for a product search, a documentation
+search, an admin filter, a CLI tool, or anything else that needs full-text
+matching over a set of documents.
 
 To run it locally:
 
@@ -366,7 +624,8 @@ php -S localhost:8000 -t demo
 
 ![Demo](docs/demo.gif)
 
-> No database. No external service. The filters, scores, and result counts are all computed by the engine.
+> No database. No external service. The filters, facet counts, scores and totals
+> on that page are all computed by the engine, in one call per search.
 
 ---
 
