@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased] — 2.0
+## [2.0.0] — 2026-09-11
 
 A rewrite of the index and the query planner. **Segment format version 2:
 existing indexes must be rebuilt by reindexing from your own source data.**
@@ -365,12 +365,54 @@ than repeating.
 
 **Twelve scripts that were being deleted outright** now index: Bengali,
 Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala, Armenian,
-Georgian, Ethiopic. Twenty-six in total.
+Georgian, Ethiopic.
+
+**Twenty-six in total, and here they are**, because the number is quoted
+elsewhere and a reader should be able to check whether their language is in it.
+The split is not cosmetic: it decides whether a word gets typo tolerance.
+
+*Eighteen that separate their words* — indexed as words, and expanded by the
+edit budget and by prefix completion: Latin, Cyrillic, Greek, Arabic, Hebrew,
+Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu, Kannada,
+Malayalam, Sinhala, Armenian, Georgian, Ethiopic.
+
+*Eight written continuously* — indexed as n-grams of a run, and never expanded:
+Han, Hiragana, Katakana, Hangul, Thai, Lao, Khmer, Myanmar.
+
+Anything outside those twenty-six is treated as a separator, which means a
+language written in it finds nothing rather than finding it badly — see
+**Known limits**.
 
 Arabic harakat, Hebrew niqqud and the tatweel are dropped, so a vocalised
 spelling meets the ordinary one — `كِتَاب`, `كــتاب` and `كتاب` are one term.
 Digits fold across writing systems: ٢٠٢٤ and 2024 are one term, and so are ۱۲۳,
 १२३ and 123.
+
+### Added — a search, not just an analyzer, proved outside Latin
+
+Forty-three analyzer tests across fourteen scripts proved that Russian, Greek,
+Arabic, Hebrew, Thai, Korean and Chinese **produce terms**. Nothing proved a
+search could **find** them: the only end-to-end search outside Latin was one
+Japanese document asserting one total, and a four-document Chinese fixture. So
+the analyzer was validated and the query path was not — which is the asymmetry
+both audits kept naming, and the place a defect survives longest, because a
+term correctly produced and never reachable looks exactly like an empty
+catalogue.
+
+`tests/MultilingualRecallTest.php` closes it. The same twenty-product
+catalogue, written in **Latin, Cyrillic, Japanese and Thai**, with five
+properties asserted in each: every document is reachable by its own name; a
+query the catalogue has no word for returns nothing; a query reaches what it
+names and leaves the rest; filters and facets work whatever the script; and
+highlighting marks the text it matched, at the right byte offsets in a
+multi-byte script. Twenty tests, 211 assertions.
+
+**What it deliberately does not assert is order.** Whether the first result is
+the one a Japanese shopper wanted needs a native reader and a real catalogue,
+and this suite has neither. The properties rest on lexical facts a dictionary
+settles instead — that `ножи` is a form of `нож`, that `折りたたみ` is kanji
+followed by okurigana, that Thai writes no space between words. Ranking stays
+asserted in French, in `RelevanceTest`, where the judgement was actually made.
 
 ### Added — `§ keyfwd`, and an import that fits in the host
 
@@ -410,15 +452,19 @@ where that is free.
 
 ### Known limits
 
-- **The relevance work is validated in French only.** The reference catalogue
-  is a French production catalogue, and the ranking was measured against it and
-  against nothing else. The *analyzer* is no longer in that position — its
-  tables are derived from Unicode and asserted closed over every script — but
-  what a good result looks like has been checked in one language.
+- **Ranking is validated in French only.** Three layers, and they are not in
+  the same state, so it is worth being precise about which. The *analyzer* is
+  proven over every script — its tables are derived from Unicode and asserted
+  closed. *Recall and precision* are now proven in four scripts, end to end,
+  by `MultilingualRecallTest`: a search finds what it names and leaves the
+  rest, in Latin, Cyrillic, Japanese and Thai. What is still checked in one
+  language is **order** — the reference catalogue is a French production
+  catalogue, and what a *good* result looks like has been judged against it and
+  against nothing else. That last one needs a native reader, not another test.
 - **Twenty-six scripts, and the rest are separators.** Tibetan, Mongolian,
-  Cherokee and everything else outside the list in the README are not indexed
-  at all: a language written in them finds nothing rather than finding it
-  badly. That is a real limit and stated as one.
+  Cherokee and everything else outside the twenty-six enumerated above are not
+  indexed at all: a language written in them finds nothing rather than finding
+  it badly. That is a real limit and stated as one.
 - **A language that inflects by prefix is not bridged.** Arabic and Hebrew
   attach the definite article at the front, so `مطبخ` is a *suffix* of `المطبخ`
   and neither the edit budget nor prefix completion reaches it. The mirror rule
