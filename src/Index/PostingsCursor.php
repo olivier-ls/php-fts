@@ -47,7 +47,12 @@ final class PostingsCursor
     /** Offset of the blocks region within $bytes. */
     private int $blocksOffset;
 
-    /** Documents of the block currently decoded. @var int[] */
+    /**
+     * Documents of the block currently decoded.
+     *
+     * @var list<int> built by appending gaps onto an absolute first document,
+     *      so it is dense and in ascending order
+     */
     private array $block = [];
     private int $blockNumber = -1;
     private int $positionInBlock = 0;

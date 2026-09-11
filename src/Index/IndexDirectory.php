@@ -585,6 +585,7 @@ final class IndexDirectory
      * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
      *        flat list of clauses, which are ANDed
      * @param array<mixed>        $facets  field names, or name => Facet
+     * @param array<string,float> $boosts  per-field weights, overriding the schema's
      * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
      * @param Sort|array<mixed>   $sort      criteria, in order of precedence
      *

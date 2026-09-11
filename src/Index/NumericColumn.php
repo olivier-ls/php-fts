@@ -272,6 +272,16 @@ final class NumericColumn
         return $found;
     }
 
+    /**
+     * Count, bounds, sum and mean over the documents that hold a value.
+     *
+     * Everything but `count` and `sum` is null on an empty selection: there is
+     * no minimum of nothing, and reporting 0.0 would be a value the column does
+     * not contain.
+     *
+     * @return array{count: int, min: float|null, max: float|null, sum: float, avg: float|null}
+     * @throws CorruptSegmentException
+     */
     public function stats(?Bitset $documents = null): array
     {
         $presence = $this->presence->bytes();

@@ -49,7 +49,12 @@ final class KeywordColumn
     private Bitset $presence;
     private int $ordinalsOffset;
 
-    /** Loaded only when a facet needs to name its values. @var string[]|null */
+    /**
+     * Loaded only when a facet needs to name its values.
+     *
+     * @var array<int, string>|null keyed by the ordinal stored in the payload,
+     *      so neither sequential nor ordered
+     */
     private ?array $valuesByOrdinal = null;
 
     private ?BlockDictionaryReader $dictionary = null;

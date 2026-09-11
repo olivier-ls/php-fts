@@ -98,7 +98,11 @@ final class SegmentIndex
     /** The grams of this segment's vocabulary; absent on segments written before it existed. */
     private ?BlockDictionaryReader $termGrams = null;
 
-    /** Reverse of the key dictionary, built on first use. @var string[]|null */
+    /**
+     * Reverse of the key dictionary, built on first use.
+     *
+     * @var array<int, string>|null keyed by document ordinal
+     */
     private ?array $keysByOrdinal = null;
 
     /**
@@ -264,6 +268,7 @@ final class SegmentIndex
      * @param Filter|array<mixed> $filters a Filter tree, a nested array, or a
      *        flat list of clauses, which are ANDed
      * @param array<mixed>        $facets  field names, or name => Facet
+     * @param array<string,float> $boosts  per-field weights, overriding the schema's
      * @param Highlight|string[]  $highlight fields to highlight, or a Highlight
      * @param Sort|array<mixed>   $sort      criteria, in order of precedence
      *
@@ -370,6 +375,8 @@ final class SegmentIndex
      *        Null makes the segment score against itself, which is right when it
      *        is the whole index and wrong as soon as it is not — see the class.
      *
+     * @param array<string, float> $boosts per-field weights, overriding the schema's
+     *
      * @return array{0: Bitset, 1: array<int, float>} the matches, and their scores
      * @internal
      * @throws CorruptSegmentException
@@ -401,6 +408,8 @@ final class SegmentIndex
      * @param CollectionStatistics|null $statistics index-wide numbers for BM25.
      *        Null makes the segment score against itself, which is right when it
      *        is the whole index and wrong as soon as it is not — see the class.
+     *
+     * @param array<string, float> $boosts per-field weights, overriding the schema's
      *
      * @return array{0: Bitset, 1: array<int, float>} the candidates, and their scores
      * @internal
@@ -948,6 +957,8 @@ final class SegmentIndex
      *
      * An empty query matches everything, which is what makes filters and facets
      * usable on their own — a category page with no search box.
+     *
+     * @param array<string, float> $boosts per-field weights, overriding the schema's
      *
      * @return array{0: Bitset, 1: array<int, float>} the matches, and their BM25 scores
      * @throws CorruptSegmentException

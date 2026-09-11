@@ -50,6 +50,7 @@ final class SearchResult implements \IteratorAggregate, \Countable
     ) {
     }
 
+    /** @return \ArrayIterator<int, Hit> */
     public function getIterator(): \ArrayIterator
     {
         return new \ArrayIterator($this->hits);
